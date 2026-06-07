@@ -349,16 +349,21 @@ class BaseBuilder(commands.Cog):
             pass
 
         dev_view = discord.ui.View(timeout=None)
-        dev_view.add_item(discord.ui.Button(
-            label="Instagram",
-            url="https://instagram.com/anonymous.istiack",
-            style=discord.ButtonStyle.link,
-        ))
-        dev_view.add_item(discord.ui.Button(
-            label="Donate",
-            url="https://istiack.pages.dev/#donate",
-            style=discord.ButtonStyle.link,
-        ))
+dev_view.add_item(discord.ui.Button(
+    label="Instagram",
+    url="https://instagram.com/anonymous.istiack",
+    style=discord.ButtonStyle.link,
+))
+dev_view.add_item(discord.ui.Button(
+    label="Donate",
+    url="https://istiack.pages.dev/#donate",
+    style=discord.ButtonStyle.link,
+))
+dev_view.add_item(discord.ui.Button(
+    label="Create Your Own Server",
+    url="https://discord.com/oauth2/authorize?client_id=1512754379474862261&permissions=8&integration_type=0&scope=bot",
+    style=discord.ButtonStyle.link,
+))
 
         try:
             dev_file = discord.File("m.png")
