@@ -2,22 +2,30 @@
 KAMLABot — base_builder.py
 Cog: BaseBuilder
 
-Handles creation of:
-  • Global Audit Log channel (#server-audit-logs)
-  • General Assets (welcome, get-role, assign, how-to-use)
-  • Fundraiser Assets (if tournament_type == 2)
-  • Information Hub category
-  • Grand Auditorium category  (with #ga-logs button UI)
-  • OrgCom Control Center category
+Creates global infrastructure after /startb nuke:
+    • 👋︱meet-the-developer       (top, read-only, Instagram + Donate buttons)
+    • #server-audit-logs           (high command only)
+    • General Assets               (welcome, get-role, assign, how-to-use)
+    • Fundraiser Assets            (only if tournament_type == 2)
+    • Information Hub category
+    • Grand Auditorium category    (with ga-logs + See Who view)
+    • OrgCom Control Center        (with 🖥️︱settings dashboard)
+
+The Settings dashboard exposes 4 buttons:
+    ➕ Add Room       — RoomEngine.add_room()
+    ➖ Remove Room    — RoomEngine.remove_room()
+    🔄 Switch Format  — RoomEngine.swap_format() (AP ⇄ BP, hot)
+    💸 Enable Fundraiser — one-way toggle, builds Transparency category
 """
 
 import asyncio
-from datetime import datetime, timezone
 import discord
 from discord.ext import commands
 
 
-# ── Reaction-role mappings ────────────────────────────────────────────────────
+RATE_SLEEP = 1.2
+HC_KEYS = ("ORG", "CAP", "Tabby", "Equity Officer")
+
 REACTION_ROLE_MAP = {
     "🟢": "Invited Adj",
     "🔴": "Independent Adj",
@@ -25,519 +33,355 @@ REACTION_ROLE_MAP = {
     "⚪": "Visitor",
 }
 
-HIGH_COMMAND_KEYS = ["ORG", "CAP", "Tabby", "Equity Officer"]
+INSTAGRAM_URL = "https://instagram.com/"
+DONATE_URL = "https://example.com/donate"
 
 
-def _get_role(guild: discord.Guild, state: dict, key: str) -> discord.Role | None:
-    """Look up a role by internal key via the state dict."""
-    role_id = state["roles"].get(key)
-    return guild.get_role(role_id) if role_id else None
+def _hc_overwrites(guild, state):
+    """View-only for everyone else, RW for high command."""
+    everyone = guild.default_role
+    ow = {everyone: discord.PermissionOverwrite(view_channel=False)}
+    for k in HC_KEYS:
+        rid = state["roles"].get(k)
+        r = guild.get_role(rid) if rid else None
+        if r:
+            ow[r] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+    return ow
 
 
-def _allow(*roles: discord.Role | None) -> list[tuple]:
-    """Return (role, overwrite) pairs that grant basic read+send access."""
-    overwrite = discord.PermissionOverwrite(
-        view_channel=True,
-        send_messages=True,
-        read_message_history=True,
-    )
-    return [(r, overwrite) for r in roles if r]
+def _read_only_public(guild):
+    everyone = guild.default_role
+    return {everyone: discord.PermissionOverwrite(
+        view_channel=True, send_messages=False, read_message_history=True, add_reactions=True
+    )}
 
 
-def _read_only(*roles: discord.Role | None) -> list[tuple]:
-    """Return (role, overwrite) pairs that grant read-only access."""
-    overwrite = discord.PermissionOverwrite(
-        view_channel=True,
-        send_messages=False,
-        read_message_history=True,
-    )
-    return [(r, overwrite) for r in roles if r]
+# ── Persistent views ─────────────────────────────────────────────────────────
+class MeetDevView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(label="📸 Instagram", url=INSTAGRAM_URL, style=discord.ButtonStyle.link))
+        self.add_item(discord.ui.Button(label="💖 Donate", url=DONATE_URL, style=discord.ButtonStyle.link))
 
 
-def _deny(role: discord.Role | None) -> tuple | None:
-    """Return an overwrite that hides a channel from a role."""
-    if not role:
-        return None
-    return (role, discord.PermissionOverwrite(view_channel=False))
-
-
-# ── "See Who" ephemeral view for GA logs ──────────────────────────────────────
 class SeeWhoView(discord.ui.View):
-    """Persistent button attached to GA session embeds."""
-
+    """Ephemeral 'See Who' button for GA / room session logs."""
     def __init__(self, bot: commands.Bot, category_id: int | None = None):
         super().__init__(timeout=None)
         self.bot = bot
-        self.category_id = category_id  # None = GA, int = room category
+        self.category_id = category_id
 
     @discord.ui.button(label="👥 See Who", style=discord.ButtonStyle.secondary, custom_id="see_who")
-    async def see_who(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def see_who(self, interaction: discord.Interaction, _btn: discord.ui.Button):
+        state = self.bot.state
         if self.category_id is None:
-            sessions = self.bot.state.get("ga_sessions", {})
+            sessions = state.get("ga_sessions", {})
         else:
-            sessions = self.bot.state.get("room_sessions", {}).get(self.category_id, {})
-
+            sessions = state.get("room_sessions", {}).get(self.category_id, {})
         if not sessions:
-            await interaction.response.send_message(
-                "No session data recorded yet.", ephemeral=True
-            )
+            await interaction.response.send_message("No sessions recorded yet.", ephemeral=True)
             return
-
         lines = []
         for uid, data in sessions.items():
-            join_str = data["join"].strftime("%H:%M:%S") if data.get("join") else "?"
-            exit_str = data["exit"].strftime("%H:%M:%S") if data.get("exit") else "still in"
-            if data.get("join") and data.get("exit"):
-                duration = data["exit"] - data["join"]
-                dur_str = str(duration).split(".")[0]
-            elif data.get("join"):
-                dur_str = "ongoing"
-            else:
-                dur_str = "?"
-            lines.append(f"<@{uid}> — joined {join_str} | left {exit_str} | {dur_str}")
-
-        embed = discord.Embed(
-            title="Session Participants",
-            description="\n".join(lines) or "None",
-            color=discord.Color.blurple(),
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+            mem = interaction.guild.get_member(uid)
+            who = mem.mention if mem else f"<@{uid}>"
+            join = data.get("join")
+            exit_ = data.get("exit")
+            lines.append(f"• {who} — joined {discord.utils.format_dt(join, 'T') if join else '?'}"
+                         f"{' • left ' + discord.utils.format_dt(exit_, 'T') if exit_ else ' • still in'}")
+        await interaction.response.send_message("\n".join(lines)[:1900], ephemeral=True)
 
 
+class SettingsDashboardView(discord.ui.View):
+    """🖥️ Restricted Settings panel — ORG / CAP / Tabby only."""
+    def __init__(self, bot: commands.Bot):
+        super().__init__(timeout=None)
+        self.bot = bot
+
+    async def _gate(self, interaction: discord.Interaction) -> bool:
+        state = self.bot.state
+        allowed_ids = {state["roles"].get(k) for k in ("ORG", "CAP", "Tabby")}
+        allowed_ids.discard(None)
+        if not any(r.id in allowed_ids for r in interaction.user.roles):
+            await interaction.response.send_message("❌ Restricted to ORG / CAP / Tabby.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="➕ Add Room", style=discord.ButtonStyle.success, custom_id="dash_add")
+    async def add_room(self, interaction: discord.Interaction, _btn):
+        if not await self._gate(interaction):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        engine = self.bot.get_cog("RoomEngine")
+        if not engine:
+            await interaction.followup.send("RoomEngine missing.", ephemeral=True); return
+        idx = await engine.add_room(interaction.guild)
+        await interaction.followup.send(f"✅ Spawned **Room {idx}**.", ephemeral=True)
+
+    @discord.ui.button(label="➖ Remove Room", style=discord.ButtonStyle.danger, custom_id="dash_remove")
+    async def remove_room(self, interaction: discord.Interaction, _btn):
+        if not await self._gate(interaction):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        engine = self.bot.get_cog("RoomEngine")
+        if not engine:
+            await interaction.followup.send("RoomEngine missing.", ephemeral=True); return
+        idx = await engine.remove_room(interaction.guild)
+        if idx is None:
+            await interaction.followup.send("⚠️ No rooms left.", ephemeral=True)
+        else:
+            await interaction.followup.send(f"🗑️ Removed **Room {idx}**.", ephemeral=True)
+
+    @discord.ui.button(label="🔄 Switch Format", style=discord.ButtonStyle.primary, custom_id="dash_swap")
+    async def swap_format(self, interaction: discord.Interaction, _btn):
+        if not await self._gate(interaction):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        engine = self.bot.get_cog("RoomEngine")
+        if not engine:
+            await interaction.followup.send("RoomEngine missing.", ephemeral=True); return
+        current = self.bot.state.get("format") or 1
+        new_fmt = 2 if current == 1 else 1
+        await engine.swap_format(interaction.guild, new_fmt)
+        label = "BP" if new_fmt == 2 else "AP"
+        await interaction.followup.send(f"🔄 All rooms migrated to **{label}**.", ephemeral=True)
+
+    @discord.ui.button(label="💸 Enable Fundraiser", style=discord.ButtonStyle.secondary, custom_id="dash_fund")
+    async def fundraiser(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        if not await self._gate(interaction):
+            return
+        if self.bot.state.get("fundraiser_enabled"):
+            await interaction.response.send_message("Already enabled.", ephemeral=True); return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        base = self.bot.get_cog("BaseBuilder")
+        await base.build_fundraiser_category(interaction.guild)
+        self.bot.state["fundraiser_enabled"] = True
+        btn.disabled = True
+        btn.label = "💸 Fundraiser Enabled"
+        try:
+            await interaction.message.edit(view=self)
+        except discord.HTTPException:
+            pass
+        await interaction.followup.send("💸 Transparency category injected.", ephemeral=True)
+
+
+# ── Cog ──────────────────────────────────────────────────────────────────────
 class BaseBuilder(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self._views_registered = False
 
-    # ── Rate-limited channel creation helper ──────────────────────────────────
-    async def _make_channel(
-        self,
-        guild: discord.Guild,
-        name: str,
-        category: discord.CategoryChannel | None,
-        overwrites: dict,
-        channel_type: str = "text",
-        **kwargs,
-    ) -> discord.abc.GuildChannel:
-        """
-        Creates a text or voice channel with rate-limit evasion (1.5 s sleep).
-        """
-        await asyncio.sleep(1.5)  # Rate-limit evasion — prevents HTTP 429
-        if channel_type == "voice":
-            return await guild.create_voice_channel(
-                name, category=category, overwrites=overwrites, **kwargs
-            )
-        return await guild.create_text_channel(
-            name, category=category, overwrites=overwrites, **kwargs
-        )
+    async def cog_load(self):
+        if not self._views_registered:
+            self.bot.add_view(MeetDevView())
+            self.bot.add_view(SettingsDashboardView(self.bot))
+            self.bot.add_view(SeeWhoView(self.bot))
+            self._views_registered = True
 
-    async def _make_category(
-        self,
-        guild: discord.Guild,
-        name: str,
-        overwrites: dict,
-    ) -> discord.CategoryChannel:
-        await asyncio.sleep(1.5)  # Rate-limit evasion
-        return await guild.create_category(name, overwrites=overwrites)
+    # ── helpers ──────────────────────────────────────────────────────────────
+    async def _sleep(self):
+        await asyncio.sleep(RATE_SLEEP)
 
-    # ── Build entry point ─────────────────────────────────────────────────────
-    async def build_base(self, guild: discord.Guild, roles: dict):
-        """Called by SetupNuke after roles are created."""
+    def _roles(self, guild):
         state = self.bot.state
+        return {k: guild.get_role(rid) for k, rid in state["roles"].items()}
 
-        # Convenience role lookups
-        everyone = guild.default_role
-        org = roles.get("ORG")
-        cap = roles.get("CAP")
-        tabby = roles.get("Tabby")
-        equity = roles.get("Equity Officer")
-        invited_adj = roles.get("Invited Adj")
-        indep_adj = roles.get("Independent Adj")
-        debater = roles.get("Debater")
-        visitor = roles.get("Visitor")
+    # ── public entry point called by SetupNuke ───────────────────────────────
+    async def build_all(self, guild: discord.Guild, roles: dict, term=None):
+        async def tlog(line, level="build"):
+            if term:
+                await term.log(line, level)
 
-        high_command = [r for r in [org, cap, tabby, equity] if r]
-        staff = [r for r in [org, cap, tabby, equity, invited_adj, indep_adj, debater] if r]
+        # 1) audit logs
+        ow = _hc_overwrites(guild, self.bot.state)
+        await self._sleep()
+        audit = await guild.create_text_channel("server-audit-logs", overwrites=ow)
+        self.bot.state["channels"]["audit_logs"] = audit.id
+        await tlog("[BUILD] #server-audit-logs")
 
-        # ── Audit log channel (no category, high-command only) ────────────────
-        audit_overwrites = {everyone: discord.PermissionOverwrite(view_channel=False)}
-        for r in high_command:
-            audit_overwrites[r] = discord.PermissionOverwrite(
-                view_channel=True, send_messages=False, read_message_history=True
-            )
-        audit_ch = await self._make_channel(
-            guild, "server-audit-logs", None, audit_overwrites
+        # 2) meet-the-developer (top, position 0, read-only)
+        meet_ow = _read_only_public(guild)
+        await self._sleep()
+        meet = await guild.create_text_channel("👋︱meet-the-developer", overwrites=meet_ow, position=0)
+        self.bot.state["channels"]["meet_dev"] = meet.id
+        try:
+            kwargs = {"view": MeetDevView(),
+                      "content": "## 👋 Meet the Developer\nBuilt by KAMLABot. Links below."}
+            try:
+                f = discord.File("m.png")
+                kwargs["file"] = f
+            except FileNotFoundError:
+                pass
+            await meet.send(**kwargs)
+        except discord.HTTPException:
+            pass
+        await tlog("[BUILD] 👋︱meet-the-developer")
+
+        # 3) General Assets category
+        await self._sleep()
+        gen = await guild.create_category("📂 General Assets")
+        self.bot.state["channels"]["general_cat"] = gen.id
+
+        await self._sleep()
+        welcome = await guild.create_text_channel("👋︱welcome", category=gen,
+                                                  overwrites=_read_only_public(guild))
+        self.bot.state["channels"]["welcome"] = welcome.id
+
+        await self._sleep()
+        get_role = await guild.create_text_channel("🙉︱get-role", category=gen,
+                                                   overwrites=_read_only_public(guild))
+        self.bot.state["channels"]["get_role"] = get_role.id
+
+        role_msg = await get_role.send(
+            "## 🎭 Pick your role\n"
+            "🟢 Invited Adj\n🔴 Independent Adj\n⚫ Debater\n⚪ Visitor"
         )
-        state["channels"]["audit_logs"] = audit_ch.id
-
-        # ── General Assets ────────────────────────────────────────────────────
-        general_ow = {everyone: discord.PermissionOverwrite(view_channel=True, send_messages=False)}
-
-        # Welcome (read-only for everyone; bot can send)
-        welcome_ch = await self._make_channel(guild, "👐🏻︱welcome", None, general_ow)
-        state["channels"]["welcome"] = welcome_ch.id
-
-        # Get-role (read-only for everyone; bot posts the reaction embed)
-        get_role_ch = await self._make_channel(guild, "🙉︱get-role", None, general_ow)
-        state["channels"]["get_role"] = get_role_ch.id
-
-        # Post reaction-role message
-        reaction_embed = discord.Embed(
-            title="🎭 Get Your Role",
-            description=(
-                "React with the emoji that matches your role in this tournament:\n\n"
-                "🟢 — Invited Adjudicator\n"
-                "🔴 — Independent Adjudicator\n"
-                "⚫ — Debater\n"
-                "⚪ — Visitor (read-only)\n\n"
-                "**ORG / CAP / Equity Officer / Tabby:** Do NOT react here — "
-                "wait for manual `/ass` assignment."
-            ),
-            color=discord.Color.gold(),
-        )
-        rr_msg = await get_role_ch.send(embed=reaction_embed)
-        state["channels"]["get_role_msg"] = rr_msg.id
         for emoji in REACTION_ROLE_MAP:
-            await rr_msg.add_reaction(emoji)
+            try:
+                await role_msg.add_reaction(emoji)
+            except discord.HTTPException:
+                pass
+        self.bot.state["channels"]["get_role_msg"] = role_msg.id
 
-        # Assign (restricted: only ORG, CAP, Tabby visible)
-        assign_ow = {everyone: discord.PermissionOverwrite(view_channel=False)}
-        for r in [org, cap, tabby]:
+        await self._sleep()
+        assign = await guild.create_text_channel("📝︱assign", category=gen,
+                                                 overwrites=_hc_overwrites(guild, self.bot.state))
+        self.bot.state["channels"]["assign"] = assign.id
+
+        await self._sleep()
+        how = await guild.create_text_channel("📘︱how-to-use", category=gen,
+                                              overwrites=_read_only_public(guild))
+        self.bot.state["channels"]["how_to_use"] = how.id
+        await how.send("## 📘 How to use\nUse `/ass`, `/rate`, `/allin`, and `.7m` timers.")
+
+        await tlog("[BUILD] General Assets")
+
+        # 4) Fundraiser
+        if self.bot.state.get("tournament_type") == 2:
+            await self.build_fundraiser_category(guild)
+            self.bot.state["fundraiser_enabled"] = True
+            await tlog("[BUILD] Fundraiser (Transparency)")
+
+        # 5) Information Hub
+        await self._sleep()
+        info = await guild.create_category("📚 Information Hub")
+        self.bot.state["channels"]["info_cat"] = info.id
+        for name in ("📜︱rules", "📅︱schedule", "🎯︱motions-archive", "🏆︱results"):
+            await self._sleep()
+            await guild.create_text_channel(name, category=info, overwrites=_read_only_public(guild))
+
+        # 6) Grand Auditorium
+        ga_ow = {guild.default_role: discord.PermissionOverwrite(view_channel=True)}
+        await self._sleep()
+        ga_cat = await guild.create_category("🎭 Grand Auditorium", overwrites=ga_ow)
+        self.bot.state["channels"]["ga_cat"] = ga_cat.id
+        await self._sleep()
+        ga_stage = await guild.create_voice_channel("🎤 GA Stage", category=ga_cat)
+        self.bot.state["channels"]["ga_stage"] = ga_stage.id
+        await self._sleep()
+        ga_motion = await guild.create_text_channel("🎯︱motion", category=ga_cat,
+                                                    overwrites=_read_only_public(guild))
+        self.bot.state["channels"]["motion"] = ga_motion.id
+        await self._sleep()
+        ga_logs = await guild.create_text_channel("📊︱ga-logs", category=ga_cat,
+                                                  overwrites=_hc_overwrites(guild, self.bot.state))
+        self.bot.state["channels"]["ga_logs"] = ga_logs.id
+        await ga_logs.send("## 📊 GA Session Log", view=SeeWhoView(self.bot, None))
+
+        await tlog("[BUILD] Grand Auditorium")
+
+        # 7) OrgCom Control Center
+        await self._sleep()
+        org_cat = await guild.create_category("⚜️︱orgcom", overwrites=_hc_overwrites(guild, self.bot.state))
+        self.bot.state["channels"]["org_cat"] = org_cat.id
+
+        await self._sleep()
+        chat = await guild.create_text_channel("💬︱orgcom-chat", category=org_cat,
+                                               overwrites=_hc_overwrites(guild, self.bot.state))
+        self.bot.state["channels"]["orgcom_chat"] = chat.id
+
+        # 🖥️ Settings — restricted to ORG / CAP / Tabby
+        settings_ow = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
+        for k in ("ORG", "CAP", "Tabby"):
+            rid = self.bot.state["roles"].get(k)
+            r = guild.get_role(rid) if rid else None
             if r:
-                assign_ow[r] = discord.PermissionOverwrite(
+                settings_ow[r] = discord.PermissionOverwrite(
                     view_channel=True, send_messages=True, read_message_history=True
                 )
-        assign_ch = await self._make_channel(guild, "😭︱assign", None, assign_ow)
-        state["channels"]["assign"] = assign_ch.id
+        await self._sleep()
+        settings = await guild.create_text_channel("🖥️︱settings", category=org_cat, overwrites=settings_ow)
+        self.bot.state["channels"]["settings"] = settings.id
 
-        # How-to-use (global read-only)
-        howto_ch = await self._make_channel(guild, "❓︱how-to-use-this-server", None, general_ow)
-        state["channels"]["how_to_use"] = howto_ch.id
-        await self._post_how_to_use(howto_ch)
-
-        # ── Fundraiser Assets ─────────────────────────────────────────────────
-        if state.get("tournament_type") == 2:
-            trans_ow = {everyone: discord.PermissionOverwrite(view_channel=True, send_messages=False)}
-            trans_cat = await self._make_category(guild, "Transparency of Transaction", trans_ow)
-            for ch_name in [
-                "how-we-keep-transparency",
-                "donation-transaction-data",
-                "spend-in-event",
-                "donate",
-            ]:
-                await self._make_channel(guild, ch_name, trans_cat, trans_ow)
-
-        # ── Information Hub ───────────────────────────────────────────────────
-        info_ow = {everyone: discord.PermissionOverwrite(view_channel=True, send_messages=False)}
-        info_cat = await self._make_category(guild, "🤷🏻‍♂️︱INFORMATION", info_ow)
-
-        # Read-only channels; ORG/CAP can send
-        send_ow = {everyone: discord.PermissionOverwrite(view_channel=True, send_messages=False)}
-        for r in [org, cap]:
-            if r:
-                send_ow[r] = discord.PermissionOverwrite(
-                    view_channel=True, send_messages=True, read_message_history=True
-                )
-        for ch_name in ["schedule", "important-forms", "debater-briffing", "equity-briffing", "judge-briffing"]:
-            await self._make_channel(guild, ch_name, info_cat, send_ow)
-
-        # Live Update Engine — see-* channels
-        see_channels = {
-            "see-org":                     "ORG",
-            "see-cap":                     "CAP",
-            "see-invited-adjudicators":    "Invited Adj",
-            "see-independent-adjudicators":"Independent Adj",
-            "see-debaters":                "Debater",
-        }
-        for ch_name, role_key in see_channels.items():
-            ch = await self._make_channel(guild, ch_name, info_cat, info_ow)
-            state["channels"][ch_name.replace("-", "_")] = ch.id
-            # Post an initial embed that the bot will edit on role assignment
-            embed = discord.Embed(
-                title=f"Members — {ch_name.replace('see-', '').replace('-', ' ').title()}",
-                description="_No members assigned yet._",
-                color=discord.Color.blue(),
-            )
-            msg = await ch.send(embed=embed)
-            state["channels"][f"{ch_name.replace('-', '_')}_msg"] = msg.id
-
-        # ── Grand Auditorium ──────────────────────────────────────────────────
-        ga_ow = {everyone: discord.PermissionOverwrite(view_channel=True, send_messages=False)}
-        ga_cat = await self._make_category(guild, "🏟️︱Grand Auditorium", ga_ow)
-
-        # ga-chat: all except Visitors can send
-        ga_chat_ow = {everyone: discord.PermissionOverwrite(view_channel=True, send_messages=True)}
-        if visitor:
-            ga_chat_ow[visitor] = discord.PermissionOverwrite(
-                view_channel=True, send_messages=False
-            )
-        await self._make_channel(guild, "ga-chat", ga_cat, ga_chat_ow)
-
-        # Read-only; ORG/CAP/Tabby can send
-        ga_send_ow = {everyone: discord.PermissionOverwrite(view_channel=True, send_messages=False)}
-        for r in [org, cap, tabby]:
-            if r:
-                ga_send_ow[r] = discord.PermissionOverwrite(
-                    view_channel=True, send_messages=True, read_message_history=True
-                )
-        for ch_name in ["motion", "announcement", "break-announcement", "matchup", "ballot"]:
-            ch = await self._make_channel(guild, ch_name, ga_cat, ga_send_ow)
-            state["channels"][ch_name.replace("-", "_")] = ch.id
-
-        # Grand Auditorium voice: open to all; Visitors are muted + no soundboard
-        ga_voice_ow = {
-            everyone: discord.PermissionOverwrite(view_channel=True, connect=True, speak=True),
-        }
-        if visitor:
-            ga_voice_ow[visitor] = discord.PermissionOverwrite(
-                view_channel=True, connect=True, speak=False,
-                use_soundboard=False,
-            )
-        ga_vc = await self._make_channel(
-            guild, "Grand Auditorium", ga_cat, ga_voice_ow, channel_type="voice"
-        )
-        state["channels"]["ga_voice"] = ga_vc.id
-
-        # ga-logs: ORG/Tabby only
-        ga_logs_ow = {everyone: discord.PermissionOverwrite(view_channel=False)}
-        for r in [org, tabby]:
-            if r:
-                ga_logs_ow[r] = discord.PermissionOverwrite(
-                    view_channel=True, send_messages=True, read_message_history=True
-                )
-        ga_logs_ch = await self._make_channel(guild, "ga-logs", ga_cat, ga_logs_ow)
-        state["channels"]["ga_logs"] = ga_logs_ch.id
-
-        # Post initial session embed with "See Who" button
-        session_embed = discord.Embed(
-            title="🎙️ Grand Auditorium — Session Log",
-            description="No active session yet. This embed updates when the VC becomes active.",
-            color=discord.Color.og_blurple(),
-        )
-        view = SeeWhoView(self.bot, category_id=None)
-        session_msg = await ga_logs_ch.send(embed=session_embed, view=view)
-        state["channels"]["ga_logs_msg"] = session_msg.id
-
-        # ── OrgCom Control Center ─────────────────────────────────────────────
-        orgcom_ow = {everyone: discord.PermissionOverwrite(view_channel=False)}
-        for r in high_command:
-            orgcom_ow[r] = discord.PermissionOverwrite(
-                view_channel=True, send_messages=True, read_message_history=True,
-                connect=True, speak=True,
-            )
-        orgcom_cat = await self._make_category(guild, "⚜️︱orgcom", orgcom_ow)
-        await self._make_channel(guild, "➡️︱general", orgcom_cat, orgcom_ow)
-        await self._make_channel(guild, "📂︱documents", orgcom_cat, orgcom_ow)
-        await self._make_channel(guild, "👨🏻‍💻︱org", orgcom_cat, orgcom_ow, channel_type="voice")
-        await self._make_channel(guild, "👨🏻‍💻︱control-room", orgcom_cat, orgcom_ow, channel_type="voice")
-
-    # ── How-to-use content ────────────────────────────────────────────────────
-    async def _post_how_to_use(self, channel: discord.TextChannel):
         embed = discord.Embed(
-            title="❓ How to Use This Server",
-            color=discord.Color.teal(),
-        )
-        embed.add_field(
-            name="📌 Getting Your Role",
-            value=(
-                "Go to <#> `🙉︱get-role` and react with the emoji that matches you:\n"
-                "🟢 Invited Adj · 🔴 Independent Adj · ⚫ Debater · ⚪ Visitor\n"
-                "**Staff roles** are assigned manually by the organisers."
+            title="🖥️  KAMLABot Control Dashboard",
+            description=(
+                "Live runtime morphing. Restricted to **ORG · CAP · Tabby**.\n\n"
+                "**➕ Add Room** — spawn a new room category\n"
+                "**➖ Remove Room** — delete the highest numbered room\n"
+                "**🔄 Switch Format** — hot-swap AP ⇄ BP across all rooms\n"
+                "**💸 Enable Fundraiser** — one-way Transparency injection"
             ),
-            inline=False,
+            color=0x00E5FF,
         )
-        embed.add_field(
-            name="🗂️ Slash Commands",
-            value=(
-                "`/startb` — (Admin) Initialise/reset the server\n"
-                "`/ass @user as:@role` — Assign a role (use in #assign)\n"
-                "`/rate` — Add reactions to the latest motion (use in #motion)\n"
-                "`/allin [time]` — Move everyone into debate VC (use in room's #poi)"
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="⏱️ Visual Timer",
-            value=(
-                "In any room's `#timer` channel, send a message like:\n"
-                "`.7m` — 7-minute timer\n"
-                "`.7m30s` — 7 minutes 30 seconds\n"
-                "The bot will post and update an ASCII progress bar every 5 seconds."
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="🏟️ Grand Auditorium",
-            value=(
-                "Join the **Grand Auditorium** voice channel for plenary sessions.\n"
-                "Visitors are in listen-only mode. #ga-logs tracks session activity."
-            ),
-            inline=False,
-        )
-        embed.set_footer(text="KAMLABot — Tournament Management System")
-        await channel.send(embed=embed)
+        await settings.send(embed=embed, view=SettingsDashboardView(self.bot))
 
-    # ── Reaction-role listener ────────────────────────────────────────────────
+        await tlog("[BUILD] OrgCom + Settings Dashboard")
+
+    # ── Fundraiser (one-way) ─────────────────────────────────────────────────
+    async def build_fundraiser_category(self, guild: discord.Guild):
+        await self._sleep()
+        cat = await guild.create_category("💸 Transparency",
+                                          overwrites=_read_only_public(guild))
+        self.bot.state["channels"]["fundraiser_cat"] = cat.id
+        for name in ("💰︱donations", "📊︱ledger", "🧾︱receipts", "🙏︱thank-you"):
+            await self._sleep()
+            await guild.create_text_channel(name, category=cat, overwrites=_read_only_public(guild))
+
+    # ── Ghost Auto-Assign: reaction roles + assign-channel echo ──────────────
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
-        state = self.bot.state
-        if payload.message_id != state["channels"].get("get_role_msg"):
-            return
-        if payload.user_id == self.bot.user.id:
-            return
-
-        guild = self.bot.get_guild(payload.guild_id)
-        if not guild:
-            return
-        member = guild.get_member(payload.user_id)
-        if not member:
-            return
-
-        emoji = str(payload.emoji)
-        role_display = REACTION_ROLE_MAP.get(emoji)
-        if not role_display:
-            return
-
-        # Find the role by display name
-        role = discord.utils.find(lambda r: r.name == role_display, guild.roles)
-        if role:
-            await member.add_roles(role, reason="KAMLABot reaction role")
+        await self._handle_reaction(payload, add=True)
 
     @commands.Cog.listener()
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
-        state = self.bot.state
-        if payload.message_id != state["channels"].get("get_role_msg"):
-            return
+        await self._handle_reaction(payload, add=False)
 
-        guild = self.bot.get_guild(payload.guild_id)
+    async def _handle_reaction(self, payload, *, add: bool):
+        if self.bot.state.get("is_setup_active"):
+            return
+        if payload.message_id != self.bot.state["channels"].get("get_role_msg"):
+            return
+        emoji = str(payload.emoji)
+        role_key = REACTION_ROLE_MAP.get(emoji)
+        if not role_key:
+            return
+        guild = self.bot.get_guild(payload.guild_id) if payload.guild_id else None
         if not guild:
             return
+        role_id = self.bot.state["roles"].get(role_key)
+        role = guild.get_role(role_id) if role_id else None
+        if not role:
+            return
         member = guild.get_member(payload.user_id)
-        if not member:
+        if not member or member.bot:
             return
-
-        emoji = str(payload.emoji)
-        role_display = REACTION_ROLE_MAP.get(emoji)
-        if not role_display:
-            return
-
-        role = discord.utils.find(lambda r: r.name == role_display, guild.roles)
-        if role and role in member.roles:
-            await member.remove_roles(role, reason="KAMLABot reaction role removal")
-
-    # ── Live Update Engine ────────────────────────────────────────────────────
-    async def update_see_channel(self, guild: discord.Guild, role: discord.Role):
-        """
-        Appended to the relevant see-* channel embed when a role is assigned.
-        Fetches the pinned embed message, appends the new user, and edits it.
-        Called from commands.py after /ass.
-        """
-        state = self.bot.state
-        role_to_channel = {
-            "ORG":           ("see_org", "see_org_msg"),
-            "CAP":           ("see_cap", "see_cap_msg"),
-            "Invited Adj":   ("see_invited_adjudicators", "see_invited_adjudicators_msg"),
-            "Independent Adj": ("see_independent_adjudicators", "see_independent_adjudicators_msg"),
-            "Debater":       ("see_debaters", "see_debaters_msg"),
-        }
-        # Match by role name prefix
-        mapping = None
-        for key, val in role_to_channel.items():
-            if role.name.startswith(key):
-                mapping = val
-                break
-        if not mapping:
-            return
-
-        ch_key, msg_key = mapping
-        ch_id = state["channels"].get(ch_key)
-        msg_id = state["channels"].get(msg_key)
-        if not ch_id or not msg_id:
-            return
-
-        ch = guild.get_channel(ch_id)
-        if not ch:
-            return
-
         try:
-            msg = await ch.fetch_message(msg_id)
-        except discord.NotFound:
+            if add:
+                await member.add_roles(role, reason="Ghost Auto-Assign")
+            else:
+                await member.remove_roles(role, reason="Ghost Auto-Assign")
+        except discord.HTTPException:
             return
 
-        existing_embed = msg.embeds[0] if msg.embeds else discord.Embed(title=role.name)
-        old_desc = existing_embed.description or ""
-        if old_desc == "_No members assigned yet._":
-            old_desc = ""
-
-        timestamp = discord.utils.utcnow().strftime("%d-%m-%Y-%H:%M:%S")
-        # Find members with this role and rebuild description (no pings, just mentions)
-        members_with_role = [m for m in guild.members if role in m.roles]
-        lines = [f"<@{m.id}> — {timestamp}" for m in members_with_role]
-        new_desc = "\n".join(lines) if lines else "_No members assigned yet._"
-
-        new_embed = discord.Embed(
-            title=existing_embed.title,
-            description=new_desc,
-            color=existing_embed.color or discord.Color.blue(),
-        )
-        await msg.edit(embed=new_embed)
-
-    # ── GA voice session tracking ─────────────────────────────────────────────
-    @commands.Cog.listener()
-    async def on_voice_state_update(
-        self,
-        member: discord.Member,
-        before: discord.VoiceState,
-        after: discord.VoiceState,
-    ):
-        state = self.bot.state
-        ga_vc_id = state["channels"].get("ga_voice")
-
-        # GA join
-        if after.channel and after.channel.id == ga_vc_id:
-            state["ga_sessions"][member.id] = {
-                "join": discord.utils.utcnow(),
-                "exit": None,
-            }
-            await self._refresh_ga_logs_embed(member.guild)
-
-        # GA leave
-        elif before.channel and before.channel.id == ga_vc_id:
-            if member.id in state["ga_sessions"]:
-                state["ga_sessions"][member.id]["exit"] = discord.utils.utcnow()
-            await self._refresh_ga_logs_embed(member.guild)
-
-    async def _refresh_ga_logs_embed(self, guild: discord.Guild):
-        """Update the ga-logs session embed with current participant count."""
-        state = self.bot.state
-        ch_id = state["channels"].get("ga_logs")
-        msg_id = state["channels"].get("ga_logs_msg")
-        if not ch_id or not msg_id:
-            return
-
-        ch = guild.get_channel(ch_id)
-        if not ch:
-            return
-
-        try:
-            msg = await ch.fetch_message(msg_id)
-        except discord.NotFound:
-            return
-
-        active = sum(
-            1 for s in state["ga_sessions"].values() if s["exit"] is None
-        )
-        embed = discord.Embed(
-            title="🎙️ Grand Auditorium — Session Log",
-            description=(
-                f"**Currently active:** {active} participant(s)\n"
-                f"**Total tracked:** {len(state['ga_sessions'])}\n\n"
-                "Press **👥 See Who** for detailed entry/exit/duration data."
-            ),
-            color=discord.Color.og_blurple(),
-            timestamp=discord.utils.utcnow(),
-        )
-        view = SeeWhoView(self.bot, category_id=None)
-        await msg.edit(embed=embed, view=view)
+        assign_id = self.bot.state["channels"].get("assign")
+        ch = guild.get_channel(assign_id) if assign_id else None
+        if ch:
+            verb = "" if add else " (removed)"
+            try:
+                await ch.send(f"🤖 [Auto Sync] /ass to:{member.mention} as:{role.mention}{verb}")
+            except discord.HTTPException:
+                pass
 
 
 async def setup(bot: commands.Bot):

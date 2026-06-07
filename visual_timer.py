@@ -2,19 +2,27 @@
 KAMLABot — visual_timer.py
 Cog: VisualTimer
 
-Listens to timer channels for messages matching regex patterns like:
-  .7m        → 7-minute timer
-  .7m30s     → 7 min 30 sec timer
-  .1m30s     → 1 min 30 sec timer
+Ultra-Pro H1 + ANSI timer with auto-destruct.
 
-Generates a live ASCII progress bar in the message itself:
-  [██████████░░░░░░░░░░] 3m 45s left
+Trigger regex (in any room #timer channel):
+    .7m            → 7 minute timer
+    .7m30s         → 7 min 30 sec timer
+    .90s           → 90 seconds
+    .1m            → 1 minute
 
-Rate-limit protocol:
-  The timer update loop uses asyncio to edit the message EXACTLY every 5 seconds.
-  This prevents API abuse while keeping the display live and readable.
-  Active timers are tracked in bot.state["timers"] so duplicate timers
-  on the same message can be cancelled.
+Layout:
+    # ⏱️ 06:45 / 07:00
+    ```ansi
+    [🟢 FREE SPEECH - POIs OPEN]
+    [██████████░░░░░░░░░░] 64%
+    ```
+
+States (ANSI colored):
+    0:00 → 1:00            🔴 PROTECTED TIME - POIs CLOSED
+    1:00 → (total - 1:00)  🟢 FREE SPEECH - POIs OPEN
+    last 1:00 of speech    🔴 PROTECTED TIME - POIs CLOSED
+    +20s grace after end   ⚠️ GRACE PERIOD - WRAP UP SPEECH
+    after grace            message is deleted + standalone ping
 """
 
 import asyncio
@@ -23,148 +31,151 @@ import discord
 from discord.ext import commands
 
 
-# Regex: matches .Xm, .Xms, .XmYs, .Xs
-TIMER_PATTERN = re.compile(
-    r"^\.(?:(\d+)m)?(?:(\d+)s)?$",
-    re.IGNORECASE,
-)
+TIMER_PATTERN = re.compile(r"^\.(?:(\d+)m)?(?:(\d+)s)?$", re.IGNORECASE)
+BAR_LENGTH = 20
+TICK_SECONDS = 1.0
+GRACE_SECONDS = 20
+PROTECTED_HEAD = 60   # first minute
+PROTECTED_TAIL = 60   # last minute
 
-BAR_LENGTH = 20  # Number of characters in the ASCII progress bar
+# ANSI color codes (Discord ansi codeblock)
+ANSI_RESET = "\u001b[0m"
+ANSI_RED = "\u001b[1;31m"
+ANSI_GREEN = "\u001b[1;32m"
+ANSI_YELLOW = "\u001b[1;33m"
+ANSI_CYAN = "\u001b[1;36m"
 
 
 def _parse_duration(content: str) -> int | None:
-    """
-    Parse a timer string into total seconds.
-    Returns None if the pattern doesn't match or duration is zero.
-    Examples:
-      .7m    → 420
-      .7m30s → 450
-      .90s   → 90
-    """
-    match = TIMER_PATTERN.match(content.strip())
-    if not match:
+    m = TIMER_PATTERN.match(content.strip())
+    if not m:
         return None
-    minutes = int(match.group(1) or 0)
-    seconds = int(match.group(2) or 0)
+    minutes = int(m.group(1) or 0)
+    seconds = int(m.group(2) or 0)
     total = minutes * 60 + seconds
-    return total if total > 0 else None
+    return total if 0 < total <= 60 * 60 else None
 
 
-def _render_bar(elapsed: int, total: int) -> str:
-    """
-    Build an ASCII progress bar showing time remaining.
-    [██████░░░░░░░░░░░░░░] 4m 12s left
-    """
-    remaining = max(0, total - elapsed)
-    filled = int((elapsed / total) * BAR_LENGTH) if total > 0 else BAR_LENGTH
-    filled = min(filled, BAR_LENGTH)
-    empty = BAR_LENGTH - filled
-
-    bar = "█" * filled + "░" * empty
-    mins, secs = divmod(remaining, 60)
-
-    if mins > 0:
-        time_str = f"{mins}m {secs:02d}s left"
-    else:
-        time_str = f"{secs}s left"
-
-    return f"```\n[{bar}] {time_str}\n```"
+def _fmt(t: int) -> str:
+    t = max(0, t)
+    return f"{t // 60:02d}:{t % 60:02d}"
 
 
-def _render_done() -> str:
-    bar = "█" * BAR_LENGTH
-    return f"```\n[{bar}] ⏰ Time's up!\n```"
+def _state_banner(elapsed: int, total: int) -> tuple[str, str]:
+    """Return (ansi_banner_line, accent_color)."""
+    if elapsed >= total:
+        return f"{ANSI_YELLOW}[⚠️ GRACE PERIOD - WRAP UP SPEECH]{ANSI_RESET}", ANSI_YELLOW
+    if elapsed < PROTECTED_HEAD or (total - elapsed) <= PROTECTED_TAIL:
+        return f"{ANSI_RED}[🔴 PROTECTED TIME - POIs CLOSED]{ANSI_RESET}", ANSI_RED
+    return f"{ANSI_GREEN}[🟢 FREE SPEECH - POIs OPEN]{ANSI_RESET}", ANSI_GREEN
+
+
+def _render(elapsed: int, total: int) -> str:
+    """Render the full message body (H1 + ansi block)."""
+    shown_elapsed = min(elapsed, total)
+    pct = shown_elapsed / total if total else 1
+    filled = min(BAR_LENGTH, int(pct * BAR_LENGTH))
+    bar = "█" * filled + "░" * (BAR_LENGTH - filled)
+
+    banner, color = _state_banner(elapsed, total)
+    header = f"# ⏱️ {_fmt(shown_elapsed)} / {_fmt(total)}"
+
+    body = (
+        "```ansi\n"
+        f"{banner}\n"
+        f"{color}[{bar}] {int(pct * 100):3d}%{ANSI_RESET}\n"
+        "```"
+    )
+    return f"{header}\n{body}"
 
 
 class VisualTimer(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
+    # ── Channel scope check ──────────────────────────────────────────────────
     def _is_timer_channel(self, channel: discord.TextChannel) -> bool:
-        """Return True if this channel is any room's #timer channel."""
         state = self.bot.state
         room_map = state.get("room_channel_map", {})
         for data in room_map.values():
-            if channel.id == data.get("timer"):
+            if data.get("timer") == channel.id:
                 return True
         return False
 
+    # ── Message listener ─────────────────────────────────────────────────────
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        if message.author.bot:
+        if message.author.bot or not message.guild:
             return
         if not isinstance(message.channel, discord.TextChannel):
             return
         if not self._is_timer_channel(message.channel):
             return
 
-        total_seconds = _parse_duration(message.content)
-        if total_seconds is None:
+        total = _parse_duration(message.content)
+        if total is None:
             return
 
-        # Cancel any existing timer running on this channel to avoid conflicts
-        state = self.bot.state
-        existing = state["timers"].get(message.channel.id)
-        if existing and not existing.done():
-            existing.cancel()
-
-        # Post the initial timer message
-        initial_bar = _render_bar(0, total_seconds)
-        mins, secs = divmod(total_seconds, 60)
-        header = f"⏱️ **Timer started:** {mins}m {secs:02d}s" if mins else f"⏱️ **Timer started:** {secs}s"
+        # Send the live message
         try:
-            timer_msg = await message.channel.send(f"{header}\n{initial_bar}")
+            timer_msg = await message.channel.send(_render(0, total))
         except discord.HTTPException:
             return
 
-        # Launch the background update task
-        task = asyncio.create_task(
-            self._run_timer(timer_msg, total_seconds, message.channel.id)
-        )
-        state["timers"][message.channel.id] = task
+        # Cancel any prior timer attached to the same author in the same channel
+        timers: dict = self.bot.state.setdefault("timers", {})
+        key = (message.channel.id, message.author.id)
+        old = timers.get(key)
+        if old and not old.done():
+            old.cancel()
 
+        task = asyncio.create_task(
+            self._run_timer(timer_msg, total, message.author)
+        )
+        timers[key] = task
+
+    # ── Live loop ────────────────────────────────────────────────────────────
     async def _run_timer(
         self,
-        timer_msg: discord.Message,
-        total_seconds: int,
-        channel_id: int,
+        msg: discord.Message,
+        total: int,
+        author: discord.abc.User,
     ):
-        """
-        Background loop: edits the timer message every 5 seconds.
-        Rate-limit safe — one edit per 5 s is well within Discord's limits.
-        """
         elapsed = 0
-        update_interval = 5  # seconds between edits — DO NOT reduce below 3
+        end_total = total + GRACE_SECONDS
 
         try:
-            while elapsed < total_seconds:
-                await asyncio.sleep(update_interval)
-                elapsed = min(elapsed + update_interval, total_seconds)
+            last_edit_text = None
+            while elapsed <= end_total:
+                text = _render(elapsed, total)
+                if text != last_edit_text:
+                    try:
+                        await msg.edit(content=text)
+                        last_edit_text = text
+                    except discord.NotFound:
+                        return
+                    except discord.HTTPException:
+                        pass
+                await asyncio.sleep(TICK_SECONDS)
+                elapsed += int(TICK_SECONDS)
 
-                if elapsed >= total_seconds:
-                    break
-
-                bar = _render_bar(elapsed, total_seconds)
-                try:
-                    await timer_msg.edit(content=bar)
-                except (discord.NotFound, discord.HTTPException):
-                    return  # Message deleted; abort silently
-
-            # Timer complete
+            # Self-destruct + ping
+            channel = msg.channel
             try:
-                await timer_msg.edit(content=_render_done())
-                await timer_msg.channel.send("⏰ **Time's up!**")
-            except (discord.NotFound, discord.HTTPException):
+                await msg.delete()
+            except discord.HTTPException:
+                pass
+            try:
+                await channel.send(f"⏰ {author.mention} Time's up! Time end.")
+            except discord.HTTPException:
                 pass
 
         except asyncio.CancelledError:
-            # Another timer was started in the same channel; clean up quietly
-            pass
-        finally:
-            # Remove from active timers
-            state = self.bot.state
-            if state["timers"].get(channel_id) is asyncio.current_task():
-                state["timers"].pop(channel_id, None)
+            try:
+                await msg.delete()
+            except discord.HTTPException:
+                pass
+            raise
 
 
 async def setup(bot: commands.Bot):
