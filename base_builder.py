@@ -541,6 +541,12 @@ class BaseBuilder(commands.Cog):
 
         await self._post_settings_dashboard(settings_ch)
 
+        # ── Initial Role Sync (Syncs Admin/Executor role right after setup) ───
+        for role_key in ["ORG", "CAP", "Invited Adj", "Independent Adj", "Debater"]:
+            role = roles.get(role_key)
+            if role:
+                await self.update_see_channel(guild, role)
+
     # ── Settings Dashboard Post ───────────────────────────────────────────────
     async def _post_settings_dashboard(self, channel: discord.TextChannel):
         embed = discord.Embed(
@@ -625,14 +631,17 @@ class BaseBuilder(commands.Cog):
         if not member:
             return
 
-        emoji = str(payload.emoji)
+        emoji = payload.emoji.name
         role_display = REACTION_ROLE_MAP.get(emoji)
         if not role_display:
             return
 
-        role = discord.utils.find(lambda r: r.name == role_display, guild.roles)
+        role = discord.utils.find(lambda r: r.name.startswith(role_display), guild.roles)
         if role:
             await member.add_roles(role, reason="KAMLABot reaction role")
+
+            # Delay to allow Discord's internal members cache to reflect new role assignment
+            await asyncio.sleep(0.5)
 
             # ── Ghost Auto-Assign Sync: log to #assign ────────────────────────
             await self._auto_sync_log(guild, member, role)
@@ -653,14 +662,17 @@ class BaseBuilder(commands.Cog):
         if not member:
             return
 
-        emoji = str(payload.emoji)
+        emoji = payload.emoji.name
         role_display = REACTION_ROLE_MAP.get(emoji)
         if not role_display:
             return
 
-        role = discord.utils.find(lambda r: r.name == role_display, guild.roles)
+        role = discord.utils.find(lambda r: r.name.startswith(role_display), guild.roles)
         if role and role in member.roles:
             await member.remove_roles(role, reason="KAMLABot reaction role removal")
+
+            # Delay to allow Discord's internal members cache to reflect role removal
+            await asyncio.sleep(0.5)
 
             # ── Ghost Auto-Assign Sync: log to #assign ────────────────────────
             await self._auto_sync_log(guild, member, role, removed=True)
