@@ -2,27 +2,27 @@
 KAMLABot — visual_timer.py
 Cog: VisualTimer
 
-Ultra-Pro H1 + ANSI timer with auto-destruct.
+Listens to timer channels for messages matching regex patterns like:
+  .7m        → 7-minute timer
+  .7m30s     → 7 min 30 sec timer
+  .1m30s     → 1 min 30 sec timer
 
-Trigger regex (in any room #timer channel):
-    .7m            → 7 minute timer
-    .7m30s         → 7 min 30 sec timer
-    .90s           → 90 seconds
-    .1m            → 1 minute
+God-Tier Live Markdown & ANSI Interface:
+  - Top line: Discord H1 markdown header displaying the live clock:
+      # ⏱️ MM:SS / MM:SS
+  - Below: cyberpunk ANSI console card with dynamic speech phase coloring.
 
-Layout:
-    # ⏱️ 06:45 / 07:00
-    ```ansi
-    [🟢 FREE SPEECH - POIs OPEN]
-    [██████████░░░░░░░░░░] 64%
-    ```
+Dynamic Speech Mapping Matrix (ANSI Progression):
+  0m → 1m            (Protected)   Bold Red    — POIs CLOSED
+  1m → (end - 1m)   (Free Speech)  Bold Green  — POIs OPEN
+  (end - 1m) → end  (Protected)   Bold Red    — POIs CLOSED
+  end → end + 20s   (Grace Period) Yellow/Cyan — WRAP UP
 
-States (ANSI colored):
-    0:00 → 1:00            🔴 PROTECTED TIME - POIs CLOSED
-    1:00 → (total - 1:00)  🟢 FREE SPEECH - POIs OPEN
-    last 1:00 of speech    🔴 PROTECTED TIME - POIs CLOSED
-    +20s grace after end   ⚠️ GRACE PERIOD - WRAP UP SPEECH
-    after grace            message is deleted + standalone ping
+Auto-Destruct:
+  Grace countdown ends → delete live timer message → post standalone mention.
+
+Rate-limit protocol:
+  Timer update loop edits the message exactly every 5 seconds.
 """
 
 import asyncio
@@ -31,151 +31,208 @@ import discord
 from discord.ext import commands
 
 
-TIMER_PATTERN = re.compile(r"^\.(?:(\d+)m)?(?:(\d+)s)?$", re.IGNORECASE)
-BAR_LENGTH = 20
-TICK_SECONDS = 1.0
-GRACE_SECONDS = 20
-PROTECTED_HEAD = 60   # first minute
-PROTECTED_TAIL = 60   # last minute
+TIMER_PATTERN = re.compile(
+    r"^\.(?:(\d+)m)?(?:(\d+)s)?$",
+    re.IGNORECASE,
+)
 
-# ANSI color codes (Discord ansi codeblock)
-ANSI_RESET = "\u001b[0m"
-ANSI_RED = "\u001b[1;31m"
-ANSI_GREEN = "\u001b[1;32m"
-ANSI_YELLOW = "\u001b[1;33m"
-ANSI_CYAN = "\u001b[1;36m"
+BAR_LENGTH = 20
+GRACE_PERIOD = 20  # seconds after end time
 
 
 def _parse_duration(content: str) -> int | None:
-    m = TIMER_PATTERN.match(content.strip())
-    if not m:
+    match = TIMER_PATTERN.match(content.strip())
+    if not match:
         return None
-    minutes = int(m.group(1) or 0)
-    seconds = int(m.group(2) or 0)
+    minutes = int(match.group(1) or 0)
+    seconds = int(match.group(2) or 0)
     total = minutes * 60 + seconds
-    return total if 0 < total <= 60 * 60 else None
+    return total if total > 0 else None
 
 
-def _fmt(t: int) -> str:
-    t = max(0, t)
-    return f"{t // 60:02d}:{t % 60:02d}"
+def _fmt_clock(seconds: int) -> str:
+    m, s = divmod(max(0, seconds), 60)
+    return f"{m:02d}:{s:02d}"
 
 
-def _state_banner(elapsed: int, total: int) -> tuple[str, str]:
-    """Return (ansi_banner_line, accent_color)."""
-    if elapsed >= total:
-        return f"{ANSI_YELLOW}[⚠️ GRACE PERIOD - WRAP UP SPEECH]{ANSI_RESET}", ANSI_YELLOW
-    if elapsed < PROTECTED_HEAD or (total - elapsed) <= PROTECTED_TAIL:
-        return f"{ANSI_RED}[🔴 PROTECTED TIME - POIs CLOSED]{ANSI_RESET}", ANSI_RED
-    return f"{ANSI_GREEN}[🟢 FREE SPEECH - POIs OPEN]{ANSI_RESET}", ANSI_GREEN
+def _render_bar(elapsed: int, total: int) -> str:
+    filled = int((elapsed / total) * BAR_LENGTH) if total > 0 else BAR_LENGTH
+    filled = min(filled, BAR_LENGTH)
+    empty = BAR_LENGTH - filled
+    return "█" * filled + "░" * empty
 
 
-def _render(elapsed: int, total: int) -> str:
-    """Render the full message body (H1 + ansi block)."""
-    shown_elapsed = min(elapsed, total)
-    pct = shown_elapsed / total if total else 1
-    filled = min(BAR_LENGTH, int(pct * BAR_LENGTH))
-    bar = "█" * filled + "░" * (BAR_LENGTH - filled)
+def _get_phase(elapsed: int, total: int) -> str:
+    """Return the current speech phase label."""
+    if elapsed < 60:
+        return "protected_start"
+    elif elapsed < total - 60:
+        return "free_speech"
+    else:
+        return "protected_end"
 
-    banner, color = _state_banner(elapsed, total)
-    header = f"# ⏱️ {_fmt(shown_elapsed)} / {_fmt(total)}"
 
-    body = (
+def _build_timer_content(elapsed: int, total: int) -> str:
+    """
+    Build the full timer message content with H1 header and ANSI console card.
+    """
+    remaining = max(0, total - elapsed)
+    current_clock = _fmt_clock(remaining)
+    total_clock = _fmt_clock(total)
+    bar = _render_bar(elapsed, total)
+    percent = int((elapsed / total) * 100) if total > 0 else 100
+
+    phase = _get_phase(elapsed, total)
+
+    if phase == "free_speech":
+        ansi_color = "\u001b[1;32m"
+        phase_label = "\u001b[1;32m🟢 FREE SPEECH - POIs OPEN\u001b[0m"
+    else:
+        ansi_color = "\u001b[1;31m"
+        phase_label = "\u001b[1;31m🔴 PROTECTED TIME - POIs CLOSED\u001b[0m"
+
+    h1_header = f"# ⏱️ {current_clock} / {total_clock}"
+
+    ansi_block = (
         "```ansi\n"
-        f"{banner}\n"
-        f"{color}[{bar}] {int(pct * 100):3d}%{ANSI_RESET}\n"
+        f"{ansi_color}┌─────────────────────────────────────┐\u001b[0m\n"
+        f"{ansi_color}│  KAMLA DEBATE TIMER SYSTEM           │\u001b[0m\n"
+        f"{ansi_color}├─────────────────────────────────────┤\u001b[0m\n"
+        f"{ansi_color}│  [{bar}] {percent:3d}%   │\u001b[0m\n"
+        f"{ansi_color}│                                     │\u001b[0m\n"
+        f"│  {phase_label:<44}\u001b[0m │\n"
+        f"{ansi_color}└─────────────────────────────────────┘\u001b[0m\n"
         "```"
     )
-    return f"{header}\n{body}"
+
+    return f"{h1_header}\n{ansi_block}"
+
+
+def _build_grace_content(grace_elapsed: int) -> str:
+    """Build the grace period display with Yellow/Cyan ANSI styling."""
+    remaining = max(0, GRACE_PERIOD - grace_elapsed)
+    grace_clock = _fmt_clock(remaining)
+
+    h1_header = f"# ⏱️ 00:00 / GRACE +{grace_clock}"
+
+    ansi_block = (
+        "```ansi\n"
+        "\u001b[1;33m┌─────────────────────────────────────┐\u001b[0m\n"
+        "\u001b[1;33m│  KAMLA DEBATE TIMER SYSTEM           │\u001b[0m\n"
+        "\u001b[1;33m├─────────────────────────────────────┤\u001b[0m\n"
+        f"\u001b[1;36m│  ⚠️  GRACE PERIOD - WRAP UP SPEECH   │\u001b[0m\n"
+        f"\u001b[1;33m│  Grace time remaining: {grace_clock:<13}│\u001b[0m\n"
+        "\u001b[1;33m└─────────────────────────────────────┘\u001b[0m\n"
+        "```"
+    )
+
+    return f"{h1_header}\n{ansi_block}"
 
 
 class VisualTimer(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    # ── Channel scope check ──────────────────────────────────────────────────
     def _is_timer_channel(self, channel: discord.TextChannel) -> bool:
+        """Return True if this channel is any room's #timer channel."""
         state = self.bot.state
         room_map = state.get("room_channel_map", {})
         for data in room_map.values():
-            if data.get("timer") == channel.id:
+            if channel.id == data.get("timer"):
                 return True
         return False
 
-    # ── Message listener ─────────────────────────────────────────────────────
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        if message.author.bot or not message.guild:
+        if message.author.bot:
             return
         if not isinstance(message.channel, discord.TextChannel):
             return
         if not self._is_timer_channel(message.channel):
             return
 
-        total = _parse_duration(message.content)
-        if total is None:
+        total_seconds = _parse_duration(message.content)
+        if total_seconds is None:
             return
 
-        # Send the live message
+        state = self.bot.state
+        existing = state["timers"].get(message.channel.id)
+        if existing and not existing.done():
+            existing.cancel()
+
+        initial_content = _build_timer_content(0, total_seconds)
         try:
-            timer_msg = await message.channel.send(_render(0, total))
+            timer_msg = await message.channel.send(initial_content)
         except discord.HTTPException:
             return
 
-        # Cancel any prior timer attached to the same author in the same channel
-        timers: dict = self.bot.state.setdefault("timers", {})
-        key = (message.channel.id, message.author.id)
-        old = timers.get(key)
-        if old and not old.done():
-            old.cancel()
-
         task = asyncio.create_task(
-            self._run_timer(timer_msg, total, message.author)
+            self._run_timer(timer_msg, total_seconds, message.channel.id, message.author)
         )
-        timers[key] = task
+        state["timers"][message.channel.id] = task
 
-    # ── Live loop ────────────────────────────────────────────────────────────
     async def _run_timer(
         self,
-        msg: discord.Message,
-        total: int,
-        author: discord.abc.User,
+        timer_msg: discord.Message,
+        total_seconds: int,
+        channel_id: int,
+        author: discord.Member,
     ):
+        """
+        Background loop: edits the timer message every 5 seconds.
+        Implements the full speech phase ANSI progression and grace period.
+        """
         elapsed = 0
-        end_total = total + GRACE_SECONDS
+        update_interval = 5
 
         try:
-            last_edit_text = None
-            while elapsed <= end_total:
-                text = _render(elapsed, total)
-                if text != last_edit_text:
-                    try:
-                        await msg.edit(content=text)
-                        last_edit_text = text
-                    except discord.NotFound:
-                        return
-                    except discord.HTTPException:
-                        pass
-                await asyncio.sleep(TICK_SECONDS)
-                elapsed += int(TICK_SECONDS)
+            # ── Main countdown ────────────────────────────────────────────────
+            while elapsed < total_seconds:
+                await asyncio.sleep(update_interval)
+                elapsed = min(elapsed + update_interval, total_seconds)
 
-            # Self-destruct + ping
-            channel = msg.channel
+                if elapsed >= total_seconds:
+                    break
+
+                content = _build_timer_content(elapsed, total_seconds)
+                try:
+                    await timer_msg.edit(content=content)
+                except (discord.NotFound, discord.HTTPException):
+                    return
+
+            # ── Grace period ──────────────────────────────────────────────────
+            grace_elapsed = 0
+            while grace_elapsed < GRACE_PERIOD:
+                grace_content = _build_grace_content(grace_elapsed)
+                try:
+                    await timer_msg.edit(content=grace_content)
+                except (discord.NotFound, discord.HTTPException):
+                    return
+
+                await asyncio.sleep(update_interval)
+                grace_elapsed = min(grace_elapsed + update_interval, GRACE_PERIOD)
+
+            # ── Auto-Destruct: delete the live timer message ───────────────────
             try:
-                await msg.delete()
-            except discord.HTTPException:
+                await timer_msg.delete()
+            except (discord.NotFound, discord.HTTPException):
                 pass
+
+            # ── Post standalone time's up mention ─────────────────────────────
             try:
-                await channel.send(f"⏰ {author.mention} Time's up! Time end.")
-            except discord.HTTPException:
+                channel = timer_msg.channel
+                await channel.send(
+                    f"⏰ {author.mention} Time's up! Time end."
+                )
+            except (discord.NotFound, discord.HTTPException):
                 pass
 
         except asyncio.CancelledError:
-            try:
-                await msg.delete()
-            except discord.HTTPException:
-                pass
-            raise
+            pass
+        finally:
+            state = self.bot.state
+            if state["timers"].get(channel_id) is asyncio.current_task():
+                state["timers"].pop(channel_id, None)
 
 
 async def setup(bot: commands.Bot):
