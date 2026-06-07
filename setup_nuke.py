@@ -410,7 +410,7 @@ class SetupNuke(commands.Cog):
         # Rough estimate: deletions (channels + roles) + role creation + base channels + rooms
         estimated_steps = 30 + (len(ROLE_DEFINITIONS)) + 40 + (num_rooms * 8)
 
-        # CRITICAL FIX: Ensure bot state structures exist fully before starting
+        # Ensure bot state structures exist fully before starting
         if not hasattr(self.bot, "state"):
             self.bot.state = {}
         self.bot.state.setdefault("channels", {})

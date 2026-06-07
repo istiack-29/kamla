@@ -12,9 +12,8 @@ Handles creation of:
   • OrgCom Control Center category  (with 🖥️︱settings dashboard)
 
 Ghost Auto-Assign Sync Engine:
-  Reaction-role events log to #assign with format:
-    🤖 [Auto Sync] /ass to:@user as:@role
-  and refresh the matching see-* embed.
+  Reaction-role events log to #assign and #server-audit-logs with format:
+    🤖 [Self Assign] @user assigned role @role
 """
 
 import asyncio
@@ -23,7 +22,7 @@ import discord
 from discord.ext import commands
 
 
-# ── Reaction-role mappings ────────────────────────────────────────────────────
+# ── reaction-role ম্যাপিং ───────────────────────────────────────────────────
 REACTION_ROLE_MAP = {
     "🟢": "Invited Adj",
     "🔴": "Independent Adj",
@@ -64,9 +63,9 @@ def _deny(role: discord.Role | None) -> tuple | None:
     return (role, discord.PermissionOverwrite(view_channel=False))
 
 
-# ── "See Who" ephemeral view for GA and room logs ─────────────────────────────
+# ── Grand Auditorium ও রুম লগ ভিউ ──────────────────────────────────────────────
 class SeeWhoView(discord.ui.View):
-    """Persistent button attached to GA/room session embeds."""
+    """GA/রুম সেশন এম্বেডের সাথে যুক্ত পারসিস্টেন্ট বাটন।"""
 
     def __init__(self, bot: commands.Bot, category_id: int | None = None):
         super().__init__(timeout=None)
@@ -107,11 +106,10 @@ class SeeWhoView(discord.ui.View):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# ── Settings Dashboard View ───────────────────────────────────────────────────
+# ── সেটিংস ড্যাশবোর্ড ভিউ ─────────────────────────────────────────────────────
 class SettingsDashboardView(discord.ui.View):
     """
-    Persistent interactive dashboard posted in 🖥️︱settings.
-    Four permanent buttons: Add Room, Remove Room, Switch Format, Enable Fundraiser Mode.
+    🖥️︱settings চ্যানেলে পোস্ট করা ইন্টারেক্টিভ প্যানেল।
     """
 
     def __init__(self, bot: commands.Bot):
@@ -287,11 +285,10 @@ class SettingsDashboardView(discord.ui.View):
 class BaseBuilder(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        # Safety net: ensure bot.state exists
         if not hasattr(self.bot, "state"):
             self.bot.state = {}
 
-    # ── Rate-limited channel creation helper ──────────────────────────────────
+    # ── Rate-limit হ্যান্ডলিং চ্যনেল মেকার ──────────────────────────────────────────
     async def _make_channel(
         self,
         guild: discord.Guild,
@@ -319,12 +316,11 @@ class BaseBuilder(commands.Cog):
         await asyncio.sleep(1.2)
         return await guild.create_category(name, overwrites=overwrites)
 
-    # ── Build entry point ─────────────────────────────────────────────────────
+    # ── মূল বেস স্ট্রাকচার নির্মাণ ────────────────────────────────────────────────
     async def build_base(self, guild: discord.Guild, roles: dict):
-        """Called by SetupNuke after roles are created."""
+        """SetupNuke থেকে রোলস তৈরির পর এই মেথডটি কল হয়।"""
         state = self.bot.state
         
-        # KEY FIX: Ensure dictionaries exist so we don't get KeyErrors later
         state.setdefault("channels", {})
         state.setdefault("ga_sessions", {})
         state.setdefault("roles", {})
@@ -342,7 +338,7 @@ class BaseBuilder(commands.Cog):
         high_command = [r for r in [org, cap, tabby, equity] if r]
         staff = [r for r in [org, cap, tabby, equity, invited_adj, indep_adj, debater] if r]
 
-        # ── 👋︱meet-the-developer (position=0, no category, URL buttons) ──────
+        # ── 👋︱meet-the-developer (position=0) ──────────────────────────────────
         dev_ow = {
             everyone: discord.PermissionOverwrite(
                 view_channel=True,
@@ -367,6 +363,12 @@ class BaseBuilder(commands.Cog):
             url="https://istiack.pages.dev/#donate",
             style=discord.ButtonStyle.link,
         ))
+        dev_view.add_item(discord.ui.Button(
+        label="Create Your Own Server",
+        url="https://kamla-bot.pages.dev",
+        style=discord.ButtonStyle.link,
+        ))
+
 
         try:
             dev_file = discord.File("m.png")
@@ -379,7 +381,7 @@ class BaseBuilder(commands.Cog):
 
         state["channels"]["meet_dev"] = dev_ch.id
 
-        # ── Audit log channel (no category, high-command only) ────────────────
+        # ── Audit log channel (হাই-কমান্ড এক্সেস) ─────────────────────────────
         audit_overwrites = {everyone: discord.PermissionOverwrite(view_channel=False)}
         for r in high_command:
             audit_overwrites[r] = discord.PermissionOverwrite(
@@ -388,7 +390,7 @@ class BaseBuilder(commands.Cog):
         audit_ch = await self._make_channel(guild, "server-audit-logs", None, audit_overwrites)
         state["channels"]["audit_logs"] = audit_ch.id
 
-        # ── General Assets ────────────────────────────────────────────────────
+        # ── জেনারেল চ্যানেলসমূহ ───────────────────────────────────────────────
         general_ow = {everyone: discord.PermissionOverwrite(view_channel=True, send_messages=False)}
 
         welcome_ch = await self._make_channel(guild, "👐🏻︱welcome", None, general_ow)
@@ -429,7 +431,7 @@ class BaseBuilder(commands.Cog):
         state["channels"]["how_to_use"] = howto_ch.id
         await self._post_how_to_use(howto_ch)
 
-        # ── Fundraiser Assets (if selected during wizard) ─────────────────────
+        # ── ফান্ডরেইজার এসেটস ─────────────────────────────────────────────────
         if state.get("tournament_type") == 2:
             trans_ow = {everyone: discord.PermissionOverwrite(view_channel=True, send_messages=False)}
             trans_cat = await self._make_category(guild, "Transparency of Transaction", trans_ow)
@@ -441,7 +443,7 @@ class BaseBuilder(commands.Cog):
             ]:
                 await self._make_channel(guild, ch_name, trans_cat, trans_ow)
 
-        # ── Information Hub ───────────────────────────────────────────────────
+        # ── ইনফরমেশন হাব ক্যাটাগরি ─────────────────────────────────────────────
         info_ow = {everyone: discord.PermissionOverwrite(view_channel=True, send_messages=False)}
         info_cat = await self._make_category(guild, "🤷🏻‍♂️︱INFORMATION", info_ow)
 
@@ -454,25 +456,9 @@ class BaseBuilder(commands.Cog):
         for ch_name in ["schedule", "important-forms", "debater-briffing", "equity-briffing", "judge-briffing"]:
             await self._make_channel(guild, ch_name, info_cat, send_ow)
 
-        see_channels = {
-            "see-org":                      "ORG",
-            "see-cap":                      "CAP",
-            "see-invited-adjudicators":     "Invited Adj",
-            "see-independent-adjudicators": "Independent Adj",
-            "see-debaters":                 "Debater",
-        }
-        for ch_name, role_key in see_channels.items():
-            ch = await self._make_channel(guild, ch_name, info_cat, info_ow)
-            state["channels"][ch_name.replace("-", "_")] = ch.id
-            embed = discord.Embed(
-                title=f"Members — {ch_name.replace('see-', '').replace('-', ' ').title()}",
-                description="_No members assigned yet._",
-                color=discord.Color.blue(),
-            )
-            msg = await ch.send(embed=embed)
-            state["channels"][f"{ch_name.replace('-', '_')}_msg"] = msg.id
+        # [ক্রিটিক্যাল] See channels তৈরির কোড ব্লকটি আপনার অনুরোধ অনুযায়ী সম্পূর্ণরূপে বন্ধ/রিমুভ করা হয়েছে।
 
-        # ── Grand Auditorium ──────────────────────────────────────────────────
+        # ── গ্র্যান্ড অডিটোরিয়াম ক্যাটাগরি ─────────────────────────────────────────
         ga_ow = {everyone: discord.PermissionOverwrite(view_channel=True, send_messages=False)}
         ga_cat = await self._make_category(guild, "🏟️︱Grand Auditorium", ga_ow)
 
@@ -524,7 +510,7 @@ class BaseBuilder(commands.Cog):
         session_msg = await ga_logs_ch.send(embed=session_embed, view=view)
         state["channels"]["ga_logs_msg"] = session_msg.id
 
-        # ── OrgCom Control Center ─────────────────────────────────────────────
+        # ── কন্ট্রোল সেন্টার ক্যাটাগরি ───────────────────────────────────────────
         orgcom_ow = {everyone: discord.PermissionOverwrite(view_channel=False)}
         for r in high_command:
             orgcom_ow[r] = discord.PermissionOverwrite(
@@ -537,7 +523,7 @@ class BaseBuilder(commands.Cog):
         await self._make_channel(guild, "👨🏻‍💻︱org", orgcom_cat, orgcom_ow, channel_type="voice")
         await self._make_channel(guild, "👨🏻‍💻︱control-room", orgcom_cat, orgcom_ow, channel_type="voice")
 
-        # ── 🖥️︱settings Dashboard Cockpit ────────────────────────────────────
+        # ── 🖥️︱settings ড্যাশবোর্ড ──────────────────────────────────────────
         settings_ow = {everyone: discord.PermissionOverwrite(view_channel=False)}
         for r in [org, cap, tabby]:
             if r:
@@ -549,13 +535,7 @@ class BaseBuilder(commands.Cog):
 
         await self._post_settings_dashboard(settings_ch)
 
-        # ── Initial Role Sync (Syncs Admin/Executor role right after setup) ───
-        for role_key in ["ORG", "CAP", "Invited Adj", "Independent Adj", "Debater"]:
-            role = roles.get(role_key)
-            if role:
-                await self.update_see_channel(guild, role)
-
-    # ── Settings Dashboard Post ───────────────────────────────────────────────
+    # ── ড্যাশবোর্ড মেসেজ পোস্টার ────────────────────────────────────────────────
     async def _post_settings_dashboard(self, channel: discord.TextChannel):
         embed = discord.Embed(
             title="🖥️ KAMLABot — Server Management Dashboard",
@@ -577,7 +557,7 @@ class BaseBuilder(commands.Cog):
         dashboard_view = SettingsDashboardView(self.bot)
         await channel.send(embed=embed, view=dashboard_view)
 
-    # ── How-to-use content ────────────────────────────────────────────────────
+    # ── নির্দেশিকা মেসেজ পোস্টার ───────────────────────────────────────────────
     async def _post_how_to_use(self, channel: discord.TextChannel):
         embed = discord.Embed(
             title="❓ How to Use This Server",
@@ -623,7 +603,7 @@ class BaseBuilder(commands.Cog):
         embed.set_footer(text="KAMLABot — Tournament Management System")
         await channel.send(embed=embed)
 
-    # ── Reaction-role listener (with Ghost Auto-Assign Sync Engine) ───────────
+    # ── ১০০% গ্যারান্টিড রিঅ্যাকশন রোল লিসেনার (অডিট লগসহ) ───────────────────────
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
         state = getattr(self.bot, "state", {})
@@ -637,8 +617,11 @@ class BaseBuilder(commands.Cog):
         guild = self.bot.get_guild(payload.guild_id)
         if not guild:
             return
-        member = guild.get_member(payload.user_id)
-        if not member:
+
+        # ১০০% মেম্বার প্রাপ্তি নিশ্চিত করতে fetch_member ব্যবহার করা হয়েছে
+        try:
+            member = await guild.fetch_member(payload.user_id)
+        except discord.HTTPException:
             return
 
         emoji = payload.emoji.name
@@ -648,16 +631,11 @@ class BaseBuilder(commands.Cog):
 
         role = discord.utils.find(lambda r: r.name.startswith(role_display), guild.roles)
         if role:
-            await member.add_roles(role, reason="KAMLABot reaction role")
-
-            # Delay to allow Discord's internal members cache to reflect new role assignment
+            await member.add_roles(role, reason="KAMLABot reaction role assignment")
             await asyncio.sleep(0.5)
 
-            # ── Ghost Auto-Assign Sync: log to #assign ────────────────────────
-            await self._auto_sync_log(guild, member, role)
-
-            # ── Refresh see-* embed ───────────────────────────────────────────
-            await self.update_see_channel(guild, role)
+            # ── সার্ভার অডিট লগ এবং অ্যাসাইন চ্যানেলে নোটিফিকেশন প্রেরণ ────────────────────────
+            await self._log_reaction_event(guild, member, role, action="ASSIGN")
 
     @commands.Cog.listener()
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
@@ -670,8 +648,10 @@ class BaseBuilder(commands.Cog):
         guild = self.bot.get_guild(payload.guild_id)
         if not guild:
             return
-        member = guild.get_member(payload.user_id)
-        if not member:
+
+        try:
+            member = await guild.fetch_member(payload.user_id)
+        except discord.HTTPException:
             return
 
         emoji = payload.emoji.name
@@ -682,104 +662,67 @@ class BaseBuilder(commands.Cog):
         role = discord.utils.find(lambda r: r.name.startswith(role_display), guild.roles)
         if role and role in member.roles:
             await member.remove_roles(role, reason="KAMLABot reaction role removal")
-
-            # Delay to allow Discord's internal members cache to reflect role removal
             await asyncio.sleep(0.5)
 
-            # ── Ghost Auto-Assign Sync: log to #assign ────────────────────────
-            await self._auto_sync_log(guild, member, role, removed=True)
+            # ── সার্ভার অডিট লগ এবং অ্যাসাইন চ্যানেলে নোটিফিকেশন প্রেরণ ────────────────────────
+            await self._log_reaction_event(guild, member, role, action="REMOVE")
 
-            # ── Refresh see-* embed ───────────────────────────────────────────
-            await self.update_see_channel(guild, role)
-
-    async def _auto_sync_log(
+    async def _log_reaction_event(
         self,
         guild: discord.Guild,
         member: discord.Member,
         role: discord.Role,
-        removed: bool = False,
+        action: str,
     ):
         """
-        Post a Ghost Auto-Assign Sync tracking log to #assign.
-        Format: 🤖 [Auto Sync] /ass to:@user as:@role
-        """
-        state = getattr(self.bot, "state", {})
-        assign_ch_id = state.get("channels", {}).get("assign")
-        if not assign_ch_id:
-            return
-            
-        assign_ch = guild.get_channel(assign_ch_id)
-        if not assign_ch:
-            return
-
-        action = "REMOVE" if removed else "ASSIGN"
-        try:
-            await assign_ch.send(
-                f"🤖 [Auto Sync] `/ass` **{action}** to:{member.mention} as:{role.mention}"
-            )
-        except discord.HTTPException:
-            pass
-
-    # ── Live Update Engine ────────────────────────────────────────────────────
-    async def update_see_channel(self, guild: discord.Guild, role: discord.Role):
-        """
-        Refresh the relevant see-* channel embed when a role is assigned or removed.
-        Called from commands.py after /ass and from reaction listeners.
+        রিঅ্যাকশন রোল ইভেন্টগুলো সুন্দরভাবে সার্ভার অডিট লগ এবং অ্যাসাইন চ্যানেলে লগ করে।
         """
         state = getattr(self.bot, "state", {})
         channels_dict = state.get("channels", {})
         
-        role_to_channel = {
-            "ORG":             ("see_org", "see_org_msg"),
-            "CAP":             ("see_cap", "see_cap_msg"),
-            "Invited Adj":     ("see_invited_adjudicators", "see_invited_adjudicators_msg"),
-            "Independent Adj": ("see_independent_adjudicators", "see_independent_adjudicators_msg"),
-            "Debater":         ("see_debaters", "see_debaters_msg"),
-        }
-        mapping = None
-        for key, val in role_to_channel.items():
-            if role.name.startswith(key):
-                mapping = val
-                break
-        if not mapping:
-            return
+        assign_ch_id = channels_dict.get("assign")
+        audit_ch_id = channels_dict.get("audit_logs")
 
-        ch_key, msg_key = mapping
-        ch_id = channels_dict.get(ch_key)
-        msg_id = channels_dict.get(msg_key)
+        # লগের ভিজ্যুয়াল ফরম্যাট
+        if action == "ASSIGN":
+            raw_msg = f"🤖 [Auto Sync] `/ass` **ASSIGN** to:{member.mention} as:{role.mention}"
+            fancy_embed = discord.Embed(
+                title="🟢 Self-Reaction Role Assigned",
+                description=f"মেম্বার {member.mention} (`{member.name}`) সেলফ রিয়্যাকশন রোল থেকে সফলভাবে {role.mention} রোলটি নিজের আইডিতে অ্যাসাইন করেছেন।",
+                color=discord.Color.green(),
+                timestamp=discord.utils.utcnow()
+            )
+        else:
+            raw_msg = f"🤖 [Auto Sync] `/ass` **REMOVE** to:{member.mention} as:{role.mention}"
+            fancy_embed = discord.Embed(
+                title="🔴 Self-Reaction Role Removed",
+                description=f"মেম্বার {member.mention} (`{member.name}`) সেলফ রিয়্যাকশন রোল থেকে {role.mention} রোলটি রিমুভ করেছেন।",
+                color=discord.Color.red(),
+                timestamp=discord.utils.utcnow()
+            )
         
-        if not ch_id or not msg_id:
-            return
+        fancy_embed.set_author(name=member.display_name, icon_url=member.display_avatar.url)
+        fancy_embed.set_footer(text=f"User ID: {member.id} | Role ID: {role.id}")
 
-        # Fallback to fetch if not cached
-        ch = guild.get_channel(ch_id)
-        if not ch:
-            try:
-                ch = await guild.fetch_channel(ch_id)
-            except discord.NotFound:
-                return
+        # ১. #assign চ্যানেলে র লগ পাঠানো
+        if assign_ch_id:
+            assign_ch = guild.get_channel(assign_ch_id)
+            if assign_ch:
+                try:
+                    await assign_ch.send(raw_msg)
+                except discord.HTTPException:
+                    pass
 
-        try:
-            msg = await ch.fetch_message(msg_id)
-        except discord.NotFound:
-            return
+        # ২. #server-audit-logs চ্যানেলে ফ্যান্সি এম্বেড লগ পাঠানো
+        if audit_ch_id:
+            audit_ch = guild.get_channel(audit_ch_id)
+            if audit_ch:
+                try:
+                    await audit_ch.send(embed=fancy_embed)
+                except discord.HTTPException:
+                    pass
 
-        existing_embed = msg.embeds[0] if msg.embeds else discord.Embed(title=role.name)
-        timestamp = discord.utils.utcnow().strftime("%d-%m-%Y-%H:%M:%S")
-        
-        # Pulling members strictly for safety
-        members_with_role = [m for m in guild.members if role in m.roles]
-        lines = [f"<@{m.id}> — {timestamp}" for m in members_with_role]
-        new_desc = "\n".join(lines) if lines else "_No members assigned yet._"
-
-        new_embed = discord.Embed(
-            title=existing_embed.title,
-            description=new_desc,
-            color=existing_embed.color or discord.Color.blue(),
-        )
-        await msg.edit(embed=new_embed)
-
-    # ── GA voice session tracking ─────────────────────────────────────────────
+    # ── GA ভয়েস সেশন ট্র্যাকিং ────────────────────────────────────────────────
     @commands.Cog.listener()
     async def on_voice_state_update(
         self,
@@ -810,7 +753,7 @@ class BaseBuilder(commands.Cog):
             await self._refresh_ga_logs_embed(member.guild)
 
     async def _refresh_ga_logs_embed(self, guild: discord.Guild):
-        """Update the ga-logs session embed with current participant count."""
+        """GA সেশন লগ আপডেট করে।"""
         state = getattr(self.bot, "state", {})
         channels_dict = state.get("channels", {})
         
