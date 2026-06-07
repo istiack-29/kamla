@@ -172,6 +172,9 @@ class LiveProgressTracker:
 class SetupNuke(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        if not hasattr(self.bot, "state"):
+            self.bot.state = {}
+            
         # Shared tracker accessible to BaseBuilder and RoomEngine via bot.state
         self.bot.state["_progress_tracker"] = None
 
@@ -406,6 +409,15 @@ class SetupNuke(commands.Cog):
         num_rooms = settings["num_rooms"]
         # Rough estimate: deletions (channels + roles) + role creation + base channels + rooms
         estimated_steps = 30 + (len(ROLE_DEFINITIONS)) + 40 + (num_rooms * 8)
+
+        # CRITICAL FIX: Ensure bot state structures exist fully before starting
+        if not hasattr(self.bot, "state"):
+            self.bot.state = {}
+        self.bot.state.setdefault("channels", {})
+        self.bot.state.setdefault("ga_sessions", {})
+        self.bot.state.setdefault("roles", {})
+        self.bot.state.setdefault("room_sessions", {})
+        self.bot.state.setdefault("room_channel_map", {})
 
         tracker = LiveProgressTracker(dm, settings["server_name"], estimated_steps)
         self.bot.state["_progress_tracker"] = tracker

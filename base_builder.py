@@ -35,7 +35,8 @@ HIGH_COMMAND_KEYS = ["ORG", "CAP", "Tabby", "Equity Officer"]
 
 
 def _get_role(guild: discord.Guild, state: dict, key: str) -> discord.Role | None:
-    role_id = state["roles"].get(key)
+    roles_dict = state.get("roles", {})
+    role_id = roles_dict.get(key)
     return guild.get_role(role_id) if role_id else None
 
 
@@ -75,9 +76,9 @@ class SeeWhoView(discord.ui.View):
     @discord.ui.button(label="👥 See Who", style=discord.ButtonStyle.secondary, custom_id="see_who")
     async def see_who(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.category_id is None:
-            sessions = self.bot.state.get("ga_sessions", {})
+            sessions = getattr(self.bot, "state", {}).get("ga_sessions", {})
         else:
-            sessions = self.bot.state.get("room_sessions", {}).get(self.category_id, {})
+            sessions = getattr(self.bot, "state", {}).get("room_sessions", {}).get(self.category_id, {})
 
         if not sessions:
             await interaction.response.send_message(
@@ -139,7 +140,7 @@ class SettingsDashboardView(discord.ui.View):
 
         success = await room_cog.spawn_room(interaction.guild)
         if success:
-            state = self.bot.state
+            state = getattr(self.bot, "state", {})
             room_map = state.get("room_channel_map", {})
             new_num = max((v.get("room_num", 0) for v in room_map.values()), default=0)
             await interaction.followup.send(
@@ -167,7 +168,7 @@ class SettingsDashboardView(discord.ui.View):
             await interaction.followup.send("❌ RoomEngine cog not loaded.", ephemeral=True)
             return
 
-        state = self.bot.state
+        state = getattr(self.bot, "state", {})
         room_map = state.get("room_channel_map", {})
         if not room_map:
             await interaction.followup.send("❌ No active rooms to remove.", ephemeral=True)
@@ -201,7 +202,7 @@ class SettingsDashboardView(discord.ui.View):
             await interaction.followup.send("❌ RoomEngine cog not loaded.", ephemeral=True)
             return
 
-        state = self.bot.state
+        state = getattr(self.bot, "state", {})
         old_format = state.get("format", 1)
         old_name = "AP" if old_format == 1 else "BP"
         new_name = "BP" if old_format == 1 else "AP"
@@ -238,8 +239,6 @@ class SettingsDashboardView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
 
         guild = interaction.guild
-        state = self.bot.state
-
         everyone = guild.default_role
         trans_ow = {everyone: discord.PermissionOverwrite(view_channel=True, send_messages=False)}
 
@@ -274,11 +273,12 @@ class SettingsDashboardView(discord.ui.View):
             )
 
     def _has_dashboard_access(self, interaction: discord.Interaction) -> bool:
-        state = self.bot.state
+        state = getattr(self.bot, "state", {})
+        roles_dict = state.get("roles", {})
         restricted_role_keys = ["ORG", "CAP", "Tabby"]
         user_role_ids = {r.id for r in interaction.user.roles}
         for key in restricted_role_keys:
-            role_id = state["roles"].get(key)
+            role_id = roles_dict.get(key)
             if role_id and role_id in user_role_ids:
                 return True
         return False
@@ -287,6 +287,9 @@ class SettingsDashboardView(discord.ui.View):
 class BaseBuilder(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        # Safety net: ensure bot.state exists
+        if not hasattr(self.bot, "state"):
+            self.bot.state = {}
 
     # ── Rate-limited channel creation helper ──────────────────────────────────
     async def _make_channel(
@@ -320,6 +323,11 @@ class BaseBuilder(commands.Cog):
     async def build_base(self, guild: discord.Guild, roles: dict):
         """Called by SetupNuke after roles are created."""
         state = self.bot.state
+        
+        # KEY FIX: Ensure dictionaries exist so we don't get KeyErrors later
+        state.setdefault("channels", {})
+        state.setdefault("ga_sessions", {})
+        state.setdefault("roles", {})
 
         everyone = guild.default_role
         org = roles.get("ORG")
@@ -349,21 +357,16 @@ class BaseBuilder(commands.Cog):
             pass
 
         dev_view = discord.ui.View(timeout=None)
-dev_view.add_item(discord.ui.Button(
-    label="Instagram",
-    url="https://instagram.com/anonymous.istiack",
-    style=discord.ButtonStyle.link,
-))
-dev_view.add_item(discord.ui.Button(
-    label="Donate",
-    url="https://istiack.pages.dev/#donate",
-    style=discord.ButtonStyle.link,
-))
-dev_view.add_item(discord.ui.Button(
-    label="Create Your Own Server",
-    url="https://discord.com/oauth2/authorize?client_id=1512754379474862261&permissions=8&integration_type=0&scope=bot",
-    style=discord.ButtonStyle.link,
-))
+        dev_view.add_item(discord.ui.Button(
+            label="Instagram",
+            url="https://instagram.com/anonymous.istiack",
+            style=discord.ButtonStyle.link,
+        ))
+        dev_view.add_item(discord.ui.Button(
+            label="Donate",
+            url="https://istiack.pages.dev/#donate",
+            style=discord.ButtonStyle.link,
+        ))
 
         try:
             dev_file = discord.File("m.png")
@@ -623,8 +626,10 @@ dev_view.add_item(discord.ui.Button(
     # ── Reaction-role listener (with Ghost Auto-Assign Sync Engine) ───────────
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
-        state = self.bot.state
-        if payload.message_id != state["channels"].get("get_role_msg"):
+        state = getattr(self.bot, "state", {})
+        channels_dict = state.get("channels", {})
+        
+        if payload.message_id != channels_dict.get("get_role_msg"):
             return
         if payload.user_id == self.bot.user.id:
             return
@@ -656,8 +661,10 @@ dev_view.add_item(discord.ui.Button(
 
     @commands.Cog.listener()
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
-        state = self.bot.state
-        if payload.message_id != state["channels"].get("get_role_msg"):
+        state = getattr(self.bot, "state", {})
+        channels_dict = state.get("channels", {})
+        
+        if payload.message_id != channels_dict.get("get_role_msg"):
             return
 
         guild = self.bot.get_guild(payload.guild_id)
@@ -696,10 +703,11 @@ dev_view.add_item(discord.ui.Button(
         Post a Ghost Auto-Assign Sync tracking log to #assign.
         Format: 🤖 [Auto Sync] /ass to:@user as:@role
         """
-        state = self.bot.state
-        assign_ch_id = state["channels"].get("assign")
+        state = getattr(self.bot, "state", {})
+        assign_ch_id = state.get("channels", {}).get("assign")
         if not assign_ch_id:
             return
+            
         assign_ch = guild.get_channel(assign_ch_id)
         if not assign_ch:
             return
@@ -718,7 +726,9 @@ dev_view.add_item(discord.ui.Button(
         Refresh the relevant see-* channel embed when a role is assigned or removed.
         Called from commands.py after /ass and from reaction listeners.
         """
-        state = self.bot.state
+        state = getattr(self.bot, "state", {})
+        channels_dict = state.get("channels", {})
+        
         role_to_channel = {
             "ORG":             ("see_org", "see_org_msg"),
             "CAP":             ("see_cap", "see_cap_msg"),
@@ -735,14 +745,19 @@ dev_view.add_item(discord.ui.Button(
             return
 
         ch_key, msg_key = mapping
-        ch_id = state["channels"].get(ch_key)
-        msg_id = state["channels"].get(msg_key)
+        ch_id = channels_dict.get(ch_key)
+        msg_id = channels_dict.get(msg_key)
+        
         if not ch_id or not msg_id:
             return
 
+        # Fallback to fetch if not cached
         ch = guild.get_channel(ch_id)
         if not ch:
-            return
+            try:
+                ch = await guild.fetch_channel(ch_id)
+            except discord.NotFound:
+                return
 
         try:
             msg = await ch.fetch_message(msg_id)
@@ -751,6 +766,8 @@ dev_view.add_item(discord.ui.Button(
 
         existing_embed = msg.embeds[0] if msg.embeds else discord.Embed(title=role.name)
         timestamp = discord.utils.utcnow().strftime("%d-%m-%Y-%H:%M:%S")
+        
+        # Pulling members strictly for safety
         members_with_role = [m for m in guild.members if role in m.roles]
         lines = [f"<@{m.id}> — {timestamp}" for m in members_with_role]
         new_desc = "\n".join(lines) if lines else "_No members assigned yet._"
@@ -770,26 +787,35 @@ dev_view.add_item(discord.ui.Button(
         before: discord.VoiceState,
         after: discord.VoiceState,
     ):
-        state = self.bot.state
-        ga_vc_id = state["channels"].get("ga_voice")
+        state = getattr(self.bot, "state", {})
+        ga_vc_id = state.get("channels", {}).get("ga_voice")
+
+        if not ga_vc_id:
+            return
+
+        sessions = state.get("ga_sessions", {})
 
         if after.channel and after.channel.id == ga_vc_id:
-            state["ga_sessions"][member.id] = {
+            sessions[member.id] = {
                 "join": discord.utils.utcnow(),
                 "exit": None,
             }
+            state["ga_sessions"] = sessions
             await self._refresh_ga_logs_embed(member.guild)
 
         elif before.channel and before.channel.id == ga_vc_id:
-            if member.id in state["ga_sessions"]:
-                state["ga_sessions"][member.id]["exit"] = discord.utils.utcnow()
+            if member.id in sessions:
+                sessions[member.id]["exit"] = discord.utils.utcnow()
+                state["ga_sessions"] = sessions
             await self._refresh_ga_logs_embed(member.guild)
 
     async def _refresh_ga_logs_embed(self, guild: discord.Guild):
         """Update the ga-logs session embed with current participant count."""
-        state = self.bot.state
-        ch_id = state["channels"].get("ga_logs")
-        msg_id = state["channels"].get("ga_logs_msg")
+        state = getattr(self.bot, "state", {})
+        channels_dict = state.get("channels", {})
+        
+        ch_id = channels_dict.get("ga_logs")
+        msg_id = channels_dict.get("ga_logs_msg")
         if not ch_id or not msg_id:
             return
 
@@ -802,12 +828,13 @@ dev_view.add_item(discord.ui.Button(
         except discord.NotFound:
             return
 
-        active = sum(1 for s in state["ga_sessions"].values() if s["exit"] is None)
+        sessions = state.get("ga_sessions", {})
+        active = sum(1 for s in sessions.values() if s["exit"] is None)
         embed = discord.Embed(
             title="🎙️ Grand Auditorium — Session Log",
             description=(
                 f"**Currently active:** {active} participant(s)\n"
-                f"**Total tracked:** {len(state['ga_sessions'])}\n\n"
+                f"**Total tracked:** {len(sessions)}\n\n"
                 "Press **👥 See Who** for detailed entry/exit/duration data."
             ),
             color=discord.Color.og_blurple(),
