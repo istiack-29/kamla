@@ -23,6 +23,7 @@ Setup Silence Protocol:
 """
 
 import asyncio
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -170,6 +171,9 @@ class LiveProgressTracker:
 
 
 class SetupNuke(commands.Cog):
+    # আপনার দেওয়া ওয়েবহুক লিংকটি এখানে সেট করা হলো
+    WEBHOOK_URL = "https://discord.com/api/webhooks/1513366584951967895/xF6aZV3N0sHbZKp683tJ-zz60dyywqbpcMdkjeJ9K9uMVBP15apvxf9J6jjsTtT3cx83"
+
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         if not hasattr(self.bot, "state"):
@@ -177,6 +181,77 @@ class SetupNuke(commands.Cog):
             
         # Shared tracker accessible to BaseBuilder and RoomEngine via bot.state
         self.bot.state["_progress_tracker"] = None
+        # ইনভাইট লিংকের ব্যবহার ট্র্যাক করার জন্য ক্যাশ
+        self.invite_cache = {}
+
+    # ── [ইভেন্ট ১] বট সার্ভারে জয়েন করলে ওয়েবহুক অ্যালার্ট ──────────────────
+    @commands.Cog.listener()
+    async def on_guild_join(self, guild: discord.Guild):
+        adder_user = "Unknown / Authorized via Link"
+        try:
+            async for entry in guild.audit_logs(action=discord.AuditLogAction.bot_add, limit=1):
+                if entry.target.id == self.bot.user.id:
+                    adder_user = f"{entry.user.mention} (`{entry.user.name}`)"
+                    break
+        except discord.Forbidden:
+            adder_user = "⚠️ Missing 'Read Audit Logs' Permission"
+
+        # বর্তমান ইনভাইটগুলো ক্যাশ করা
+        try:
+            invites = await guild.invites()
+            self.invite_cache[guild.id] = {inv.code: inv.uses for inv in invites}
+        except discord.Forbidden:
+            pass
+
+        embed = discord.Embed(
+            title="📥 KAMLABot Added to a New Server!",
+            description="বটটি সফলভাবে একটি ডিসকর্ড সার্ভারে যুক্ত করা হয়েছে। এখনো সার্ভার কনফিগার করা হয়নি।",
+            color=discord.Color.blue(),
+            timestamp=discord.utils.utcnow()
+        )
+        if guild.icon:
+            embed.set_thumbnail(url=guild.icon.url)
+
+        embed.add_field(name="🏰 Server Name", value=f"**{guild.name}**", inline=True)
+        embed.add_field(name="🆔 Server ID", value=f"`{guild.id}`", inline=True)
+        embed.add_field(name="👑 Server Owner", value=f"{guild.owner.mention} (`{guild.owner.name}`)" if guild.owner else "Unknown", inline=True)
+        embed.add_field(name="👥 Member Count", value=f"`{guild.member_count}` members", inline=True)
+        embed.add_field(name="👤 Invited By", value=adder_user, inline=True)
+        embed.set_footer(text="KAMLABot Global Network Monitoring")
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                webhook = discord.Webhook.from_url(self.WEBHOOK_URL, session=session)
+                await webhook.send(embed=embed)
+        except Exception as e:
+            print(f"[Webhook Error] Guild join log failed: {e}")
+
+    # ── [ইভেন্ট ২] ইনভাইট ট্র্যাকার (মেম্বার জয়েন করলে ডিবেটর রোল দেওয়া) ──────
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member):
+        guild = member.guild
+        debater_code = self.bot.state.get(f"debater_invite_{guild.id}")
+        
+        if not debater_code:
+            return
+
+        try:
+            new_invites = await guild.invites()
+            for invite in new_invites:
+                if invite.code == debater_code:
+                    old_uses = self.invite_cache.get(guild.id, {}).get(invite.code, 0)
+                    # লিংকের ব্যবহার বাড়লে রোল দেওয়া হবে
+                    if invite.uses > old_uses:
+                        if guild.id not in self.invite_cache:
+                            self.invite_cache[guild.id] = {}
+                        self.invite_cache[guild.id][invite.code] = invite.uses
+                        
+                        debater_role = discord.utils.get(guild.roles, name="Debater ⚫")
+                        if debater_role:
+                            await member.add_roles(debater_role, reason="KAMLABot Tracker — Joined via Debater Link")
+                        break
+        except discord.HTTPException:
+            pass
 
     # ── Helper: rate-limited deletion ─────────────────────────────────────────
     async def _delete_all_channels(self, guild: discord.Guild):
@@ -507,6 +582,56 @@ class SetupNuke(commands.Cog):
             tracker.push_log(
                 f"\u001b[1;32mBUILD\u001b[0m] All {num_rooms} room(s) provisioned… SUCCESS"
             )
+
+        # ── [WEBHOOK AUTO UPDATE & DEBATER INVITE GENERATOR] ──────────────────
+        invite_link = "লিংক তৈরি করা যায়নি (পারমিশন এরর)"
+        welcome_ch_id = self.bot.state.get("channels", {}).get("welcome")
+        
+        if welcome_ch_id:
+            welcome_ch = guild.get_channel(welcome_ch_id)
+            if welcome_ch:
+                try:
+                    # Never expire ও Unlimited ইউজ লিংক তৈরি
+                    invite = await welcome_ch.create_invite(max_age=0, max_uses=0, reason="KAMLABot Debater Invite Link")
+                    invite_link = invite.url
+                    
+                    # ট্র্যাক করার জন্য বট স্টেট এবং ক্যাশে সেভ করা
+                    self.bot.state[f"debater_invite_{guild.id}"] = invite.code
+                    if guild.id not in self.invite_cache:
+                        self.invite_cache[guild.id] = {}
+                    self.invite_cache[guild.id][invite.code] = invite.uses
+                except discord.HTTPException:
+                    pass
+
+        # ওয়েবহুক এম্বেড (অনলি ডিবেটর ইনভাইটেশন লিংক ফিল্ড সহ)
+        embed = discord.Embed(
+            title="🚀 Tournament Server Fully Configured & Deployed!",
+            description="**KAMLABot Nuke & Build Protocol** সফলভাবে সম্পন্ন হয়েছে। সার্ভারটি এখন ব্যবহারের জন্য প্রস্তুত।",
+            color=discord.Color.brand_green(),
+            timestamp=discord.utils.utcnow()
+        )
+        if guild.icon:
+            embed.set_thumbnail(url=guild.icon.url)
+
+        embed.add_field(name="📌 Configured Server", value=f"**{guild.name}**", inline=True)
+        embed.add_field(name="🆔 Server ID", value=f"`{guild.id}`", inline=True)
+        embed.add_field(name="🛠️ Setup Executed By", value=f"{executor.mention} (`{executor.name}`)", inline=True)
+        embed.add_field(name="🎭 Assigned Admin Role", value=f"`{executor_role_key}`", inline=True)
+        embed.add_field(name="🏟️ Debate Format", value=f"`{'BP (British)' if settings['debate_format'] == 2 else 'AP (Asian)'}`", inline=True)
+        embed.add_field(name="🚪 Total Active Rooms", value=f"`{num_rooms} Rooms`", inline=True)
+        embed.add_field(name="💸 Fundraiser Mode", value=f"`{'ACTIVE' if settings['tournament_type'] == 2 else 'DISABLED'}`", inline=True)
+        embed.add_field(name="🔗 Debater Invitation Link", value=f"[Click Here to Enter Server]({invite_link})\n`{invite_link}`", inline=False)
+        
+        embed.set_footer(text="KAMLABot Central Deployment System", icon_url=self.bot.user.display_avatar.url if self.bot.user.display_avatar else None)
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                webhook = discord.Webhook.from_url(self.WEBHOOK_URL, session=session)
+                await webhook.send(embed=embed)
+            if tracker:
+                tracker.push_log("\u001b[1;32mTRACKER\u001b[0m] Full setup logs synced with Central Webhook… SUCCESS")
+        except Exception as e:
+            print(f"[Webhook Error] Setup update log failed: {e}")
 
         # ── 12. Lift silence protocol ─────────────────────────────────────────
         self.bot.state["is_setup_active"] = False
