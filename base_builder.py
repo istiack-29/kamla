@@ -806,4 +806,4 @@ class BaseBuilder(commands.Cog):
 
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(BaseBuilder(bot))v
+    await bot.add_cog(BaseBuilder(bot))

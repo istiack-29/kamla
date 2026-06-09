@@ -59,7 +59,7 @@ bot.state = {
 
 # ── Cog loader ────────────────────────────────────────────────────────────────
 COGS = [
-    "logger",        # Must load first — audit log channel used by others
+    "logger",
     "setup_nuke",
     "base_builder",
     "room_engine",
