@@ -14,6 +14,10 @@ Handles creation of:
 Ghost Auto-Assign Sync Engine:
   Reaction-role events log to #assign and #server-audit-logs with format:
     🤖 [Self Assign] @user assigned role @role
+
+Single-Role Enforcement:
+  একজন মেম্বার একসাথে শুধুমাত্র একটিই reaction role রাখতে পারবেন।
+  নতুন role react করলে আগের reaction role স্বয়ংক্রিয়ভাবে সরে যাবে।
 """
 
 import asyncio
@@ -288,7 +292,7 @@ class BaseBuilder(commands.Cog):
         if not hasattr(self.bot, "state"):
             self.bot.state = {}
 
-    # ── Rate-limit হ্যান্ডলিং চ্যনেল মেকার ──────────────────────────────────────────
+    # ── Rate-limit হ্যান্ডলিং চ্যানেল মেকার ──────────────────────────────────────────
     async def _make_channel(
         self,
         guild: discord.Guild,
@@ -318,9 +322,9 @@ class BaseBuilder(commands.Cog):
 
     # ── মূল বেস স্ট্রাকচার নির্মাণ ────────────────────────────────────────────────
     async def build_base(self, guild: discord.Guild, roles: dict):
-        """SetupNuke থেকে রোলস তৈরির পর এই মেথডটি কল হয়।"""
+        """SetupNuke থেকে রোলস তৈরির পর এই মেথডটি কল হয়।"""
         state = self.bot.state
-        
+
         state.setdefault("channels", {})
         state.setdefault("ga_sessions", {})
         state.setdefault("roles", {})
@@ -364,11 +368,10 @@ class BaseBuilder(commands.Cog):
             style=discord.ButtonStyle.link,
         ))
         dev_view.add_item(discord.ui.Button(
-        label="Create Your Own Server",
-        url="https://kamla-bot.pages.dev",
-        style=discord.ButtonStyle.link,
+            label="Create Your Own Server",
+            url="https://kamla-bot.pages.dev",
+            style=discord.ButtonStyle.link,
         ))
-
 
         try:
             dev_file = discord.File("m.png")
@@ -456,8 +459,6 @@ class BaseBuilder(commands.Cog):
         for ch_name in ["schedule", "important-forms", "debater-briffing", "equity-briffing", "judge-briffing"]:
             await self._make_channel(guild, ch_name, info_cat, send_ow)
 
-        # [ক্রিটিক্যাল] See channels তৈরির কোড ব্লকটি আপনার অনুরোধ অনুযায়ী সম্পূর্ণরূপে বন্ধ/রিমুভ করা হয়েছে।
-
         # ── গ্র্যান্ড অডিটোরিয়াম ক্যাটাগরি ─────────────────────────────────────────
         ga_ow = {everyone: discord.PermissionOverwrite(view_channel=True, send_messages=False)}
         ga_cat = await self._make_category(guild, "🏟️︱Grand Auditorium", ga_ow)
@@ -479,14 +480,11 @@ class BaseBuilder(commands.Cog):
             ch = await self._make_channel(guild, ch_name, ga_cat, ga_send_ow)
             state["channels"][ch_name.replace("-", "_")] = ch.id
 
+        # ── Grand Auditorium ভয়েস চ্যানেল — কোনো রোলেরই আলাদা restriction নেই ──
+        # everyone-এর ডিফল্ট পার্মিশনই সবার জন্য প্রযোজ্য।
         ga_voice_ow = {
             everyone: discord.PermissionOverwrite(view_channel=True, connect=True, speak=True),
         }
-        if visitor:
-            ga_voice_ow[visitor] = discord.PermissionOverwrite(
-                view_channel=True, connect=True, speak=False,
-                use_soundboard=False,
-            )
         ga_vc = await self._make_channel(
             guild, "Grand Auditorium", ga_cat, ga_voice_ow, channel_type="voice"
         )
@@ -596,19 +594,19 @@ class BaseBuilder(commands.Cog):
             name="🏟️ Grand Auditorium",
             value=(
                 "Join the **Grand Auditorium** voice channel for plenary sessions.\n"
-                "Visitors are in listen-only mode. #ga-logs tracks session activity."
+                "#ga-logs tracks session activity."
             ),
             inline=False,
         )
         embed.set_footer(text="KAMLABot — Tournament Management System")
         await channel.send(embed=embed)
 
-    # ── ১০০% গ্যারান্টিড রিঅ্যাকশন রোল লিসেনার (অডিট লগসহ) ───────────────────────
+    # ── Reaction Role: Single-Role Enforcement সহ ────────────────────────────────
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
         state = getattr(self.bot, "state", {})
         channels_dict = state.get("channels", {})
-        
+
         if payload.message_id != channels_dict.get("get_role_msg"):
             return
         if payload.user_id == self.bot.user.id:
@@ -618,7 +616,7 @@ class BaseBuilder(commands.Cog):
         if not guild:
             return
 
-        # ১০০% মেম্বার প্রাপ্তি নিশ্চিত করতে fetch_member ব্যবহার করা হয়েছে
+        # ১০০% মেম্বার প্রাপ্তি নিশ্চিত করতে fetch_member ব্যবহার
         try:
             member = await guild.fetch_member(payload.user_id)
         except discord.HTTPException:
@@ -629,19 +627,35 @@ class BaseBuilder(commands.Cog):
         if not role_display:
             return
 
-        role = discord.utils.find(lambda r: r.name.startswith(role_display), guild.roles)
-        if role:
-            await member.add_roles(role, reason="KAMLABot reaction role assignment")
-            await asyncio.sleep(0.5)
+        new_role = discord.utils.find(lambda r: r.name.startswith(role_display), guild.roles)
+        if not new_role:
+            return
 
-            # ── সার্ভার অডিট লগ এবং অ্যাসাইন চ্যানেলে নোটিফিকেশন প্রেরণ ────────────────────────
-            await self._log_reaction_event(guild, member, role, action="ASSIGN")
+        # ── Single-Role Enforcement ─────────────────────────────────────────────
+        # নতুন রোল দেওয়ার আগে মেম্বারের কাছে থাকা যেকোনো reaction role সরানো হচ্ছে।
+        for prev_role_prefix in REACTION_ROLE_MAP.values():
+            prev_role = discord.utils.find(
+                lambda r: r.name.startswith(prev_role_prefix), guild.roles
+            )
+            if prev_role and prev_role in member.roles and prev_role != new_role:
+                await member.remove_roles(
+                    prev_role,
+                    reason="KAMLABot: single-role enforcement — replacing with new reaction role",
+                )
+                await asyncio.sleep(0.5)
+                await self._log_reaction_event(guild, member, prev_role, action="REMOVE")
+
+        # ── নতুন রোল অ্যাসাইন ─────────────────────────────────────────────────
+        await member.add_roles(new_role, reason="KAMLABot reaction role assignment")
+        await asyncio.sleep(0.5)
+
+        await self._log_reaction_event(guild, member, new_role, action="ASSIGN")
 
     @commands.Cog.listener()
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
         state = getattr(self.bot, "state", {})
         channels_dict = state.get("channels", {})
-        
+
         if payload.message_id != channels_dict.get("get_role_msg"):
             return
 
@@ -664,7 +678,6 @@ class BaseBuilder(commands.Cog):
             await member.remove_roles(role, reason="KAMLABot reaction role removal")
             await asyncio.sleep(0.5)
 
-            # ── সার্ভার অডিট লগ এবং অ্যাসাইন চ্যানেলে নোটিফিকেশন প্রেরণ ────────────────────────
             await self._log_reaction_event(guild, member, role, action="REMOVE")
 
     async def _log_reaction_event(
@@ -675,36 +688,41 @@ class BaseBuilder(commands.Cog):
         action: str,
     ):
         """
-        রিঅ্যাকশন রোল ইভেন্টগুলো সুন্দরভাবে সার্ভার অডিট লগ এবং অ্যাসাইন চ্যানেলে লগ করে।
+        রিঅ্যাকশন রোল ইভেন্টগুলো #assign ও #server-audit-logs চ্যানেলে লগ করে।
         """
         state = getattr(self.bot, "state", {})
         channels_dict = state.get("channels", {})
-        
+
         assign_ch_id = channels_dict.get("assign")
         audit_ch_id = channels_dict.get("audit_logs")
 
-        # লগের ভিজ্যুয়াল ফরম্যাট
         if action == "ASSIGN":
             raw_msg = f"🤖 [Auto Sync] `/ass` **ASSIGN** to:{member.mention} as:{role.mention}"
             fancy_embed = discord.Embed(
                 title="🟢 Self-Reaction Role Assigned",
-                description=f"মেম্বার {member.mention} (`{member.name}`) সেলফ রিয়্যাকশন রোল থেকে সফলভাবে {role.mention} রোলটি নিজের আইডিতে অ্যাসাইন করেছেন।",
+                description=(
+                    f"মেম্বার {member.mention} (`{member.name}`) সেলফ রিয়্যাকশন রোল থেকে "
+                    f"সফলভাবে {role.mention} রোলটি নিজের আইডিতে অ্যাসাইন করেছেন।"
+                ),
                 color=discord.Color.green(),
-                timestamp=discord.utils.utcnow()
+                timestamp=discord.utils.utcnow(),
             )
         else:
             raw_msg = f"🤖 [Auto Sync] `/ass` **REMOVE** to:{member.mention} as:{role.mention}"
             fancy_embed = discord.Embed(
                 title="🔴 Self-Reaction Role Removed",
-                description=f"মেম্বার {member.mention} (`{member.name}`) সেলফ রিয়্যাকশন রোল থেকে {role.mention} রোলটি রিমুভ করেছেন।",
+                description=(
+                    f"মেম্বার {member.mention} (`{member.name}`) সেলফ রিয়্যাকশন রোল থেকে "
+                    f"{role.mention} রোলটি রিমুভ করেছেন।"
+                ),
                 color=discord.Color.red(),
-                timestamp=discord.utils.utcnow()
+                timestamp=discord.utils.utcnow(),
             )
-        
+
         fancy_embed.set_author(name=member.display_name, icon_url=member.display_avatar.url)
         fancy_embed.set_footer(text=f"User ID: {member.id} | Role ID: {role.id}")
 
-        # ১. #assign চ্যানেলে র লগ পাঠানো
+        # ১. #assign চ্যানেলে র লগ
         if assign_ch_id:
             assign_ch = guild.get_channel(assign_ch_id)
             if assign_ch:
@@ -713,7 +731,7 @@ class BaseBuilder(commands.Cog):
                 except discord.HTTPException:
                     pass
 
-        # ২. #server-audit-logs চ্যানেলে ফ্যান্সি এম্বেড লগ পাঠানো
+        # ২. #server-audit-logs চ্যানেলে ফ্যান্সি এম্বেড লগ
         if audit_ch_id:
             audit_ch = guild.get_channel(audit_ch_id)
             if audit_ch:
@@ -756,7 +774,7 @@ class BaseBuilder(commands.Cog):
         """GA সেশন লগ আপডেট করে।"""
         state = getattr(self.bot, "state", {})
         channels_dict = state.get("channels", {})
-        
+
         ch_id = channels_dict.get("ga_logs")
         msg_id = channels_dict.get("ga_logs_msg")
         if not ch_id or not msg_id:
@@ -788,4 +806,4 @@ class BaseBuilder(commands.Cog):
 
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(BaseBuilder(bot))
+    await bot.add_cog(BaseBuilder(bot))v
