@@ -273,6 +273,13 @@ async def st_cmd(interaction: discord.Interaction):
         return
     await start_wizard(interaction)
 
+    async def patch_owner_webhook(guild: discord.Guild):
+    try:
+        async with aiohttp.ClientSession() as session:
+            webhook = discord.Webhook.from_url(OWNER_WEBHOOK, session=session)
+            await webhook.send(f"🚀 KAMLA Bot configured successfully on server: {guild.name}")
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     keep_alive()
