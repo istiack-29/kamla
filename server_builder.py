@@ -172,7 +172,7 @@ def _room_text_ow(guild, roles):
 
 
 async def build_server(guild: discord.Guild, fmt: str, rooms: int, timezone: str,
-                       tournament_name: str, creator_id: int, logo_url: str | None = None) -> None:
+                       tournament_name: str, creator_id: int) -> None:
     roles = await _create_roles(guild)
 
     # ── Public channels (top, no category) ──────────────────────────────────
@@ -244,7 +244,6 @@ async def build_server(guild: discord.Guild, fmt: str, rooms: int, timezone: str
         "tournament_name": tournament_name,
         "created_by": creator_id,
         "created_at": discord.utils.utcnow().isoformat(),
-        "logo_url": logo_url or "",
         "settings_channel_id": settings_ch.id,
     }
     await config_manager.set_config(guild, cfg_data)

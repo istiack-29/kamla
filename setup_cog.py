@@ -1,7 +1,6 @@
 import discord
 from discord import app_commands
 from discord.ext import commands
-import asyncio
 from config import config_manager, ADMIN_ROLE_NAMES
 
 
@@ -32,42 +31,26 @@ class OnJoinView(discord.ui.View):
         )
 
 
-class LogoUploadModal(discord.ui.Modal, title="Upload Tournament Logo URL"):
-    logo_url = discord.ui.TextInput(
-        label="Image URL (must end in .png/.jpg/.gif)",
-        placeholder="https://example.com/logo.png",
-        required=True,
-        max_length=512,
-    )
-
+class ConfirmBuildView(discord.ui.View):
     def __init__(self, setup_data: dict):
-        super().__init__()
+        super().__init__(timeout=180)
         self.setup_data = setup_data
 
-    async def on_submit(self, interaction: discord.Interaction):
-        url = self.logo_url.value.strip()
-        await interaction.response.defer(thinking=True, ephemeral=True)
-        await _do_build(interaction, self.setup_data, logo_url=url)
-
-
-class LogoChoiceView(discord.ui.View):
-    def __init__(self, setup_data: dict):
-        super().__init__(timeout=300)
-        self.setup_data = setup_data
-
-    @discord.ui.button(label="Upload Logo", style=discord.ButtonStyle.primary, emoji="🖼️")
-    async def upload_logo(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(LogoUploadModal(self.setup_data))
+    @discord.ui.button(label="Confirm & Build", style=discord.ButtonStyle.success, emoji="🚀")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.stop()
-
-    @discord.ui.button(label="Skip", style=discord.ButtonStyle.secondary, emoji="⏭️")
-    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(thinking=True, ephemeral=True)
-        await _do_build(interaction, self.setup_data, logo_url=None)
+        await _do_build(interaction, self.setup_data)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="✖️")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.stop()
+        await interaction.response.edit_message(
+            content="❌ Setup cancelled.", embed=None, view=None
+        )
 
 
-async def _do_build(interaction: discord.Interaction, setup_data: dict, logo_url: str | None) -> None:
+async def _do_build(interaction: discord.Interaction, setup_data: dict) -> None:
     guild = interaction.guild
     fmt = setup_data["format"]
     rooms = setup_data["rooms"]
@@ -102,18 +85,15 @@ async def _do_build(interaction: discord.Interaction, setup_data: dict, logo_url
             timezone=timezone,
             tournament_name=tournament_name,
             creator_id=creator_id,
-            logo_url=logo_url,
         )
 
-        # Assign the requested role to the creator
         role = discord.utils.get(guild.roles, name=role_name.upper())
         if role:
             try:
-                await interaction.user.add_roles(role, reason="KAMLA setup — creator role assignment")
+                await interaction.user.add_roles(role, reason="KAMLA setup — creator role")
             except Exception:
                 pass
 
-        # Generate permanent invite
         invite_url = ""
         try:
             for ch in guild.text_channels:
@@ -124,7 +104,6 @@ async def _do_build(interaction: discord.Interaction, setup_data: dict, logo_url
         except Exception:
             pass
 
-        # Edit webhook log
         from webhook import edit_join_log
         cfg = await config_manager.get_config(guild)
         await edit_join_log(guild, cfg, invite_url)
@@ -150,7 +129,10 @@ async def _do_build(interaction: discord.Interaction, setup_data: dict, logo_url
     except Exception as e:
         err_embed = discord.Embed(
             title="❌ Build Failed",
-            description=f"An error occurred during server setup:\n```{e}```\nPlease ensure KAMLA has **Administrator** permission and try again.",
+            description=(
+                f"An error occurred during server setup:\n```{e}```\n"
+                "Please ensure KAMLA has **Administrator** permission and try again."
+            ),
             color=discord.Color.red(),
         )
         try:
@@ -200,14 +182,16 @@ class SetupCog(commands.Cog):
     ):
         guild = interaction.guild
         if guild is None:
-            await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+            await interaction.response.send_message(
+                "This command must be used in a server.", ephemeral=True
+            )
             return
 
         if not interaction.user.guild_permissions.administrator:
             has_admin_role = any(r.name in ADMIN_ROLE_NAMES for r in interaction.user.roles)
             if not has_admin_role:
                 await interaction.response.send_message(
-                    "⛔ You need an admin role (ORG/CAP/TABBY/EQUITY) or Administrator permission to use this command.",
+                    "⛔ You need an admin role (ORG/CAP/TABBY/EQUITY) or Administrator permission.",
                     ephemeral=True,
                 )
                 return
@@ -221,19 +205,20 @@ class SetupCog(commands.Cog):
         }
 
         confirm_embed = discord.Embed(
-            title="🏆 Tournament Setup",
+            title="🏆 Tournament Setup — Confirm",
             description=(
                 f"**Tournament:** {tournamentname}\n"
                 f"**Format:** {format.name}\n"
                 f"**Rooms:** {room}\n"
                 f"**Your Role:** {as_role.value}\n\n"
-                "Would you like to upload a tournament logo? (Recommended)"
+                "⚠️ This will **wipe all existing channels and roles** and rebuild the server.\n"
+                "Press **Confirm & Build** to proceed."
             ),
             color=discord.Color.blurple(),
         )
         await interaction.response.send_message(
             embed=confirm_embed,
-            view=LogoChoiceView(setup_data),
+            view=ConfirmBuildView(setup_data),
             ephemeral=True,
         )
 
@@ -243,7 +228,8 @@ class SetupCog(commands.Cog):
         cfg = await config_manager.get_config(interaction.guild)
         if not cfg:
             await interaction.response.send_message(
-                "⛔ No tournament configuration found. Use `/st` to set one up first.", ephemeral=True
+                "⛔ No tournament configuration found. Use `/st` to set one up first.",
+                ephemeral=True,
             )
             return
         setup_data = {
@@ -254,8 +240,16 @@ class SetupCog(commands.Cog):
             "role_name": "ORG",
         }
         await interaction.response.send_message(
-            "⚠️ Rebuilding the server will wipe and recreate all channels. Proceed?",
-            view=LogoChoiceView(setup_data),
+            embed=discord.Embed(
+                title="🔨 Rebuild Server",
+                description=(
+                    "⚠️ This will **wipe and rebuild** the entire server.\n"
+                    "All channels and roles will be recreated from the saved configuration.\n\n"
+                    "Press **Confirm & Build** to proceed."
+                ),
+                color=discord.Color.orange(),
+            ),
+            view=ConfirmBuildView(setup_data),
             ephemeral=True,
         )
 

@@ -166,7 +166,6 @@ class RebuildConfirmView(discord.ui.View):
             timezone=cfg.get("timezone", "+06:00"),
             tournament_name=cfg.get("tournament_name", "Tournament"),
             creator_id=cfg.get("created_by", interaction.user.id),
-            logo_url=cfg.get("logo_url") or None,
         )
         await interaction.followup.send("✅ Server has been rebuilt.", ephemeral=True)
 
@@ -230,13 +229,6 @@ class SettingsView(discord.ui.View):
         if not await self._guard(interaction):
             return
         await interaction.response.send_modal(RenameModal())
-
-    @discord.ui.button(label="Update Logo", style=discord.ButtonStyle.secondary,
-                       custom_id="kamla:settings:logo", emoji="🖼️", row=1)
-    async def update_logo(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self._guard(interaction):
-            return
-        await interaction.response.send_modal(LogoModal())
 
     @discord.ui.button(label="Rebuild Server", style=discord.ButtonStyle.danger,
                        custom_id="kamla:settings:rebuild", emoji="🔨", row=2)
