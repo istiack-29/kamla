@@ -259,6 +259,47 @@ async def _build_server_inner(
     await _create_rooms(guild, roles, fmt, rooms, start_index=1)
 
 
+AP_PREP_NAMES = {"GOVT PREP", "OPP PREP"}
+BP_PREP_NAMES = {"OG PREP", "OO PREP", "CG PREP", "CO PREP"}
+
+
+async def switch_format_rooms(guild: discord.Guild, new_fmt: str, rooms: int) -> None:
+    """Delete old prep rooms + ADJUDICATION in every ROOM XX category, rebuild for new format."""
+    roles = {r.name: r for r in guild.roles}
+    voice_ow = _build_all_role_overwrites(guild, roles)
+    all_prep = AP_PREP_NAMES | BP_PREP_NAMES
+
+    for i in range(1, rooms + 1):
+        cat = discord.utils.get(guild.categories, name=f"ROOM {i:02d}")
+        if not cat:
+            continue
+
+        # Delete prep rooms + ADJUDICATION (will be recreated at the bottom)
+        for ch in list(cat.voice_channels):
+            if ch.name in all_prep or ch.name == "ADJUDICATION":
+                try:
+                    await ch.delete(reason="KAMLA format switch")
+                    await asyncio.sleep(0.2)
+                except Exception:
+                    pass
+
+        # Create new prep rooms
+        if new_fmt.lower() == "bp":
+            for prep in ["OG PREP", "OO PREP", "CG PREP", "CO PREP"]:
+                await guild.create_voice_channel(prep, category=cat,
+                                                 overwrites=voice_ow, user_limit=2)
+                await asyncio.sleep(0.15)
+        else:
+            await guild.create_voice_channel("GOVT PREP", category=cat,
+                                             overwrites=voice_ow, user_limit=3)
+            await guild.create_voice_channel("OPP PREP",  category=cat,
+                                             overwrites=voice_ow, user_limit=3)
+
+        # ADJUDICATION always last
+        await guild.create_voice_channel("ADJUDICATION", category=cat, overwrites=voice_ow)
+        await asyncio.sleep(0.2)
+
+
 async def _create_rooms(
     guild: discord.Guild,
     roles: dict,

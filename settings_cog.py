@@ -118,11 +118,25 @@ class SettingsView(discord.ui.View):
     async def switch_format(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._guard(interaction):
             return
-        cfg = await config_manager.get_config(interaction.guild)
+        await interaction.response.defer(thinking=True, ephemeral=True)
+
+        guild = interaction.guild
+        cfg = await config_manager.get_config(guild)
         current = cfg.get("format", "ap").lower()
         new_fmt = "bp" if current == "ap" else "ap"
-        cfg = await config_manager.update_config(interaction.guild, format=new_fmt)
-        await _refresh_panel(interaction, cfg, f"✅ Format switched to **{new_fmt.upper()}**.")
+        rooms = cfg.get("rooms", 0)
+
+        from server_builder import switch_format_rooms
+        await switch_format_rooms(guild, new_fmt, rooms)
+
+        cfg = await config_manager.update_config(guild, format=new_fmt)
+
+        prep_info = "4 prep rooms × 2 max" if new_fmt == "bp" else "2 prep rooms × 3 max"
+        await _refresh_panel(
+            interaction, cfg,
+            f"✅ Switched to **{new_fmt.upper()}** ({prep_info}). "
+            "All rooms rebuilt with new prep channels."
+        )
 
     # ── Row 1 ──────────────────────────────────────────────────────────────────
 
