@@ -4,6 +4,9 @@ from config import (
     KAMLA_ROLE_NAMES, ADMIN_ROLE_NAMES, config_manager
 )
 
+# Guilds currently undergoing a build — lock auto-delete must skip these
+_building_guilds: set[int] = set()
+
 ROLE_CONFIG = [
     {"name": "ORG",                    "color": discord.Color.red(),        "administrator": True,  "hoist": True},
     {"name": "CAP",                    "color": discord.Color.orange(),     "administrator": True,  "hoist": True},
@@ -150,6 +153,21 @@ async def build_server(
     tournament_name: str,
     creator_id: int,
 ) -> None:
+    _building_guilds.add(guild.id)
+    try:
+        await _build_server_inner(guild, fmt, rooms, timezone, tournament_name, creator_id)
+    finally:
+        _building_guilds.discard(guild.id)
+
+
+async def _build_server_inner(
+    guild: discord.Guild,
+    fmt: str,
+    rooms: int,
+    timezone: str,
+    tournament_name: str,
+    creator_id: int,
+) -> None:
     roles = await _create_roles(guild)
 
     # ── Rename server and bot nickname to tournament name ─────────────────────
@@ -217,27 +235,28 @@ async def build_server(
         await guild.create_text_channel(ch_name, category=info_cat, overwrites=info_send_ow)
         await asyncio.sleep(0.2)
 
-    # ── ROOMS ────────────────────────────────────────────────────────────────
-    await _create_rooms(guild, roles, fmt, rooms, start_index=1)
+    # ── Persist config FIRST so settings panel can read it ───────────────────
+    cfg_data = {
+        "format":              fmt,
+        "rooms":               rooms,
+        "timezone":            timezone,
+        "tournament_name":     tournament_name,
+        "created_by":          creator_id,
+        "created_at":          discord.utils.utcnow().isoformat(),
+        "settings_channel_id": settings_ch.id,
+        "locked":              False,
+    }
+    await config_manager.set_config(guild, cfg_data)
 
-    # ── Populate static channels ─────────────────────────────────────────────
+    # ── Populate static channels BEFORE slow room creation ────────────────────
     await _post_meet_developer(meet_ch)
     await _post_welcome(guild)
     await _post_get_role(guild)
     await _post_how_to_use(guild)
-    await _post_settings_panel(settings_ch, fmt, rooms, timezone, tournament_name, creator_id)
+    await _post_settings_panel(settings_ch, cfg_data)
 
-    # ── Persist config ────────────────────────────────────────────────────────
-    cfg_data = {
-        "format":           fmt,
-        "rooms":            rooms,
-        "timezone":         timezone,
-        "tournament_name":  tournament_name,
-        "created_by":       creator_id,
-        "created_at":       discord.utils.utcnow().isoformat(),
-        "settings_channel_id": settings_ch.id,
-    }
-    await config_manager.set_config(guild, cfg_data)
+    # ── ROOMS (slow — done last so panel always appears) ─────────────────────
+    await _create_rooms(guild, roles, fmt, rooms, start_index=1)
 
 
 async def _create_rooms(
@@ -398,21 +417,7 @@ async def _post_how_to_use(guild: discord.Guild) -> None:
     await channel.send(embed=embed)
 
 
-async def _post_settings_panel(
-    channel: discord.TextChannel,
-    fmt: str,
-    rooms: int,
-    timezone: str,
-    tournament_name: str,
-    creator_id: int,
-) -> None:
+async def _post_settings_panel(channel: discord.TextChannel, cfg: dict) -> None:
     from settings_cog import build_settings_embed, SettingsView
-    embed = build_settings_embed(
-        tournament_name=tournament_name,
-        fmt=fmt,
-        rooms=rooms,
-        timezone=timezone,
-        creator_id=creator_id,
-        created_at=discord.utils.utcnow().isoformat(),
-    )
+    embed = build_settings_embed(cfg)
     await channel.send(embed=embed, view=SettingsView())

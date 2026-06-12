@@ -9,158 +9,182 @@ _active_timers: dict[int, asyncio.Task] = {}
 
 
 def parse_time(text: str) -> int | None:
-    """Parse strings like 1h10m30s into total seconds. Returns None if invalid."""
     text = text.strip().lower()
-    pattern = re.compile(r'^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$')
-    m = pattern.fullmatch(text)
+    m = re.fullmatch(r'(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?', text)
     if not m or not any(m.groups()):
         return None
-    hours = int(m.group(1) or 0)
-    minutes = int(m.group(2) or 0)
-    seconds = int(m.group(3) or 0)
-    total = hours * 3600 + minutes * 60 + seconds
+    total = int(m.group(1) or 0) * 3600 + int(m.group(2) or 0) * 60 + int(m.group(3) or 0)
     return total if total > 0 else None
 
 
-def fmt_duration(seconds: int) -> str:
+def fmt_clock(seconds: int) -> str:
+    """Format seconds as H:MM:SS or M:SS."""
+    seconds = max(0, seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def fmt_human(seconds: int) -> str:
+    """Format as 1h 30m 00s."""
     h, rem = divmod(abs(seconds), 3600)
     m, s = divmod(rem, 60)
     parts = []
     if h:
         parts.append(f"{h}h")
-    if m:
+    if m or h:
         parts.append(f"{m}m")
     parts.append(f"{s:02d}s")
     return " ".join(parts)
 
 
-def _get_tz_offset(tz_str: str) -> int:
-    """Parse '+06:00' -> 360 (minutes offset). Returns 0 on error."""
+def _tz_offset_mins(tz_str: str) -> int:
     try:
-        sign = 1 if "+" in tz_str else -1
+        sign = -1 if tz_str.lstrip().startswith("-") else 1
         tz_str = tz_str.replace("+", "").replace("-", "")
-        parts = tz_str.split(":")
-        hours = int(parts[0])
-        mins = int(parts[1]) if len(parts) > 1 else 0
-        return sign * (hours * 60 + mins)
+        h, *rest = tz_str.split(":")
+        mins = int(rest[0]) if rest else 0
+        return sign * (int(h) * 60 + mins)
     except Exception:
         return 0
 
 
-async def _run_countdown(message: discord.Message, total_seconds: int, tz_offset_mins: int):
-    end_time = datetime.now(timezone.utc) + timedelta(seconds=total_seconds)
-    tz = timezone(timedelta(minutes=tz_offset_mins))
+def _tz_label(tz_str: str) -> str:
+    tz_str = tz_str.strip()
+    if not tz_str.startswith("-"):
+        tz_str = "+" + tz_str.lstrip("+")
+    return f"GMT {tz_str}"
 
+
+async def _run_countdown(
+    channel: discord.TextChannel,
+    starter: discord.Member,
+    total_seconds: int,
+    tz_offset_mins: int,
+    tz_str: str,
+) -> None:
+    tz = timezone(timedelta(minutes=tz_offset_mins))
+    started_at = datetime.now(tz)
+    end_dt = datetime.now(timezone.utc) + timedelta(seconds=total_seconds)
+
+    started_fmt = started_at.strftime("%d-%m-%Y %H:%M:%S")
+    tz_label = _tz_label(tz_str)
+    duration_human = fmt_human(total_seconds)
+
+    # ── Initial message ───────────────────────────────────────────────────────
+    embed = discord.Embed(
+        title=f"⏱  {fmt_clock(total_seconds)}",
+        color=discord.Color.green(),
+    )
+    embed.set_footer(text=f"Started by {starter.display_name}  •  {started_fmt} ({tz_label})")
+    msg = await channel.send(embed=embed)
+
+    # ── Live countdown loop ───────────────────────────────────────────────────
     while True:
-        now = datetime.now(timezone.utc)
-        remaining = int((end_time - now).total_seconds())
+        remaining = int((end_dt - datetime.now(timezone.utc)).total_seconds())
 
         if remaining <= 0:
-            finish_str = end_time.astimezone(tz).strftime("%H:%M:%S")
-            try:
-                await message.edit(
-                    content=None,
-                    embed=discord.Embed(
-                        title="⏱️ Time's Up!",
-                        description=f"**00s** — Timer ended at {finish_str}",
-                        color=discord.Color.red(),
-                    ),
-                )
-            except Exception:
-                pass
-            _active_timers.pop(message.channel.id, None)
-            return
+            break
 
-        bar_total = 20
-        bar_filled = max(0, int((remaining / total_seconds) * bar_total))
-        bar = "█" * bar_filled + "░" * (bar_total - bar_filled)
-        pct = int((remaining / total_seconds) * 100)
-
+        pct = remaining / total_seconds
         color = (
-            discord.Color.green() if pct > 50
-            else discord.Color.yellow() if pct > 25
-            else discord.Color.red()
+            discord.Color.green()  if pct > 0.50 else
+            discord.Color.yellow() if pct > 0.25 else
+            discord.Color.red()
         )
 
-        embed = discord.Embed(
-            title="⏱️ Timer Running",
-            description=f"**{fmt_duration(remaining)}** remaining",
-            color=color,
-        )
-        embed.add_field(name="Progress", value=f"`[{bar}]` {pct}%", inline=False)
-        embed.set_footer(text=f"Ends at {end_time.astimezone(tz).strftime('%H:%M:%S')}")
+        embed = discord.Embed(title=f"⏱  {fmt_clock(remaining)}", color=color)
+        embed.set_footer(text=f"Started by {starter.display_name}  •  {started_fmt} ({tz_label})")
 
         try:
-            await message.edit(content=None, embed=embed)
+            await msg.edit(embed=embed)
         except discord.NotFound:
-            _active_timers.pop(message.channel.id, None)
+            _active_timers.pop(channel.id, None)
             return
         except Exception:
             pass
 
-        await asyncio.sleep(1)
+        # Smart sleep: update every 1s when ≤60s left, every 5s otherwise
+        sleep = 1 if remaining <= 60 else 5
+        await asyncio.sleep(sleep)
+
+    # ── Timer finished ────────────────────────────────────────────────────────
+    ended_at = datetime.now(tz)
+    ended_fmt = ended_at.strftime("%d-%m-%Y %H:%M:%S")
+
+    # Edit the live message to show DONE
+    done_embed = discord.Embed(title="✅  0:00", color=discord.Color.dark_grey())
+    done_embed.set_footer(text=f"Ended  •  {ended_fmt} ({tz_label})")
+    try:
+        await msg.edit(embed=done_embed)
+    except Exception:
+        pass
+
+    # Send the professional summary
+    summary = discord.Embed(
+        title="⏰  Time's Up!",
+        color=discord.Color.red(),
+    )
+    summary.add_field(name="⏱  Duration", value=f"**{duration_human}**", inline=False)
+    summary.add_field(
+        name="🟢  Started",
+        value=f"{started_fmt} ({tz_label})",
+        inline=True,
+    )
+    summary.add_field(
+        name="🔴  Ended",
+        value=f"{ended_fmt} ({tz_label})",
+        inline=True,
+    )
+    summary.set_footer(text=f"Timer started by {starter.display_name}")
+
+    await channel.send(content=starter.mention, embed=summary)
+
+    _active_timers.pop(channel.id, None)
 
 
 class TimerCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    def _in_timer_channel(self, channel: discord.abc.GuildChannel) -> bool:
-        if not isinstance(channel, discord.TextChannel):
-            return False
-        return channel.name.lower() == "timer"
-
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        if message.author.bot:
+        if message.author.bot or not message.guild:
             return
-        if not message.guild:
+        if not isinstance(message.channel, discord.TextChannel):
             return
-        if not self._in_timer_channel(message.channel):
+        if message.channel.name.lower() != "timer":
             return
 
         content = message.content.strip()
         duration = parse_time(content)
-
-        if duration is None:
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            try:
-                await message.channel.send(
-                    f"⚠️ {message.author.mention} Invalid time format. "
-                    "Use: `10m`, `1h`, `15s`, `1h10m`, `1h10m30s`, `10m30s`",
-                    delete_after=8,
-                )
-            except Exception:
-                pass
-            return
 
         try:
             await message.delete()
         except Exception:
             pass
 
-        # Cancel existing timer in this channel
-        existing = _active_timers.pop(message.channel.id, None)
-        if existing and not existing.done():
-            existing.cancel()
+        if duration is None:
+            await message.channel.send(
+                f"⚠️ {message.author.mention} — Invalid format.\n"
+                "Use: `10m` · `1h` · `15s` · `1h30m` · `10m30s`",
+                delete_after=10,
+            )
+            return
 
-        # Fetch timezone from config
+        # Cancel any existing timer in this channel
+        old = _active_timers.pop(message.channel.id, None)
+        if old and not old.done():
+            old.cancel()
+
         cfg = await config_manager.get_config(message.guild)
         tz_str = cfg.get("timezone", "+00:00")
-        tz_offset = _get_tz_offset(tz_str)
-
-        embed = discord.Embed(
-            title="⏱️ Timer Starting…",
-            description=f"**{fmt_duration(duration)}** — started by {message.author.mention}",
-            color=discord.Color.green(),
-        )
-        timer_msg = await message.channel.send(embed=embed)
+        tz_mins = _tz_offset_mins(tz_str)
 
         task = asyncio.create_task(
-            _run_countdown(timer_msg, duration, tz_offset)
+            _run_countdown(message.channel, message.author, duration, tz_mins, tz_str)
         )
         _active_timers[message.channel.id] = task
 

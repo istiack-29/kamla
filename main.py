@@ -100,14 +100,60 @@ class KamlaBot(commands.Bot):
             title="🎉 KAMLA has arrived!",
             description=(
                 f"Hello {installer.mention if installer else 'there'}! "
-                f"I'm **KAMLA** — your automated tournament server manager.\n\n"
+                "I'm **KAMLA** — your automated tournament server manager.\n\n"
                 "Click **CREATE NOW** to build your tournament server instantly.\n"
                 "Only the person who added me can use this button."
             ),
             color=discord.Color.blurple(),
         )
         embed.set_footer(text="KAMLA • Tournament Automation Bot")
-        await channel.send(embed=embed, view=OnJoinView(installer_id=installer.id if installer else 0))
+        await channel.send(
+            embed=embed,
+            view=OnJoinView(installer_id=installer.id if installer else 0),
+        )
+
+    async def on_guild_channel_create(self, channel: discord.abc.GuildChannel) -> None:
+        """Auto-delete new channels when the server is locked."""
+        guild = channel.guild
+
+        # Never delete the config channel or channels created during build
+        if "kamla-config" in channel.name:
+            return
+
+        # If bot created this channel (e.g. during /st build), leave it alone
+        from server_builder import _building_guilds
+        if guild.id in _building_guilds:
+            return
+
+        # Check lock state
+        cfg = config_manager.get_cached(guild.id)
+        if not cfg:
+            # Fetch fresh if not cached (avoid blocking on API mid-event)
+            try:
+                cfg = await asyncio.wait_for(config_manager.get_config(guild), timeout=3.0)
+            except Exception:
+                return
+
+        if not cfg.get("locked", False):
+            return
+
+        # Server is locked — delete the channel and notify
+        try:
+            await channel.delete(reason="🔒 KAMLA — Server is locked. Channel auto-removed.")
+        except Exception:
+            pass
+
+        # Try to notify in the settings channel
+        try:
+            settings_ch = discord.utils.get(guild.text_channels, name="⚙️︱settings")
+            if settings_ch and settings_ch.permissions_for(guild.me).send_messages:
+                await settings_ch.send(
+                    f"🔒 A new channel **#{channel.name}** was automatically deleted "
+                    "because the server is locked.",
+                    delete_after=30,
+                )
+        except Exception:
+            pass
 
     async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel) -> None:
         if "kamla-config" in channel.name:
@@ -131,9 +177,7 @@ class KamlaBot(commands.Bot):
         for ch in assign_cat.text_channels:
             try:
                 async for msg in ch.history(limit=200):
-                    if msg.author.bot:
-                        continue
-                    if member in msg.mentions:
+                    if msg.author.bot and member in msg.mentions:
                         await msg.delete()
             except Exception:
                 pass
