@@ -1,7 +1,8 @@
 import discord
 from discord.ext import commands
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from config import config_manager, ADMIN_ROLE_NAMES
+import aiohttp
 
 
 def build_settings_embed(
@@ -23,12 +24,12 @@ def build_settings_embed(
         timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(name="🏆 Tournament Name", value=tournament_name, inline=True)
-    embed.add_field(name="🎭 Format", value=fmt.upper(), inline=True)
-    embed.add_field(name="🚪 Rooms", value=str(rooms), inline=True)
-    embed.add_field(name="🕐 Timezone", value=timezone, inline=True)
-    embed.add_field(name="👤 Created By", value=f"<@{creator_id}>", inline=True)
-    embed.add_field(name="📅 Created At", value=dt, inline=True)
-    embed.set_footer(text="KAMLA • Live Dashboard — use buttons to update settings")
+    embed.add_field(name="🎭 Format",          value=fmt.upper(),      inline=True)
+    embed.add_field(name="🚪 Rooms",           value=str(rooms),       inline=True)
+    embed.add_field(name="🌍 Timezone",        value=timezone,         inline=True)
+    embed.add_field(name="👤 Created By",      value=f"<@{creator_id}>", inline=True)
+    embed.add_field(name="📅 Created At",      value=dt,               inline=True)
+    embed.set_footer(text="KAMLA • Live Dashboard — use buttons to manage the tournament")
     return embed
 
 
@@ -49,39 +50,74 @@ class RenameModal(discord.ui.Modal, title="Rename Tournament"):
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        cfg = await config_manager.update_config(interaction.guild, tournament_name=self.name.value)
-        await _refresh_panel(interaction, cfg, "✅ Tournament name updated.")
+        new_name = self.name.value.strip()
+        cfg = await config_manager.update_config(interaction.guild, tournament_name=new_name)
+
+        # Sync server name and bot nickname
+        try:
+            await interaction.guild.edit(name=new_name, reason="KAMLA tournament rename")
+        except Exception:
+            pass
+        try:
+            await interaction.guild.me.edit(nick=new_name[:32])
+        except Exception:
+            pass
+
+        await _refresh_panel(interaction, cfg, f"✅ Tournament renamed to **{new_name}**. Server name and bot nickname updated.")
 
 
 class TimezoneModal(discord.ui.Modal, title="Change Timezone"):
     tz = discord.ui.TextInput(
-        label="Timezone offset (e.g. +06:00, -05:00, +00:00)",
+        label="Offset (e.g. +06:00  –05:00  +00:00)",
         placeholder="+06:00",
         max_length=10,
         required=True,
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        cfg = await config_manager.update_config(interaction.guild, timezone=self.tz.value)
+        cfg = await config_manager.update_config(interaction.guild, timezone=self.tz.value.strip())
         await _refresh_panel(interaction, cfg, "✅ Timezone updated.")
 
 
-class LogoModal(discord.ui.Modal, title="Update Logo URL"):
+class LogoModal(discord.ui.Modal, title="Change Server Logo"):
     url = discord.ui.TextInput(
-        label="Image URL",
+        label="Direct image URL (.png / .jpg / .gif)",
         placeholder="https://example.com/logo.png",
         max_length=512,
         required=True,
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        cfg = await config_manager.update_config(interaction.guild, logo_url=self.url.value)
-        await _refresh_panel(interaction, cfg, "✅ Logo URL updated.")
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        raw_url = self.url.value.strip()
+        try:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(raw_url) as resp:
+                    if resp.status != 200:
+                        await interaction.followup.send(
+                            f"❌ Could not fetch the image (HTTP {resp.status}). "
+                            "Make sure the URL is a direct link to an image.",
+                            ephemeral=True,
+                        )
+                        return
+                    icon_bytes = await resp.read()
+
+            await interaction.guild.edit(icon=icon_bytes, reason="KAMLA logo update")
+            await interaction.followup.send("✅ Server logo updated successfully.", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "❌ KAMLA lacks permission to change the server icon.", ephemeral=True
+            )
+        except Exception as e:
+            await interaction.followup.send(
+                f"❌ Failed to update logo: {e}", ephemeral=True
+            )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-async def _refresh_panel(interaction: discord.Interaction, cfg: dict, note: str = ""):
+async def _refresh_panel(interaction: discord.Interaction, cfg: dict, note: str = "") -> None:
     embed = build_settings_embed(
         tournament_name=cfg.get("tournament_name", "N/A"),
         fmt=cfg.get("format", "N/A"),
@@ -90,34 +126,35 @@ async def _refresh_panel(interaction: discord.Interaction, cfg: dict, note: str 
         creator_id=cfg.get("created_by", 0),
         created_at=cfg.get("created_at", "N/A"),
     )
-    msg = note or "✅ Settings refreshed."
+    msg_text = note or "✅ Settings refreshed."
+
     if not interaction.response.is_done():
         await interaction.response.edit_message(embed=embed, view=SettingsView())
-        await interaction.followup.send(msg, ephemeral=True)
+        await interaction.followup.send(msg_text, ephemeral=True)
     else:
         try:
             await interaction.message.edit(embed=embed, view=SettingsView())
         except Exception:
             pass
-        await interaction.followup.send(msg, ephemeral=True)
+        await interaction.followup.send(msg_text, ephemeral=True)
 
 
-async def _add_room(interaction: discord.Interaction):
+async def _add_room(interaction: discord.Interaction) -> None:
     guild = interaction.guild
     cfg = await config_manager.get_config(guild)
     current_rooms = cfg.get("rooms", 0)
     new_count = current_rooms + 1
     fmt = cfg.get("format", "ap")
 
-    from server_builder import _create_rooms, _build_admin_overwrites
     roles_map = {r.name: r for r in guild.roles}
-    await _create_rooms(guild, roles_map, fmt, 1)
+    from server_builder import _create_rooms
+    await _create_rooms(guild, roles_map, fmt, 1, start_index=new_count)
 
     cfg = await config_manager.update_config(guild, rooms=new_count)
-    await _refresh_panel(interaction, cfg, f"✅ Room {new_count:02d} added.")
+    await _refresh_panel(interaction, cfg, f"✅ Room **{new_count:02d}** added.")
 
 
-async def _delete_room(interaction: discord.Interaction):
+async def _delete_room(interaction: discord.Interaction) -> None:
     guild = interaction.guild
     cfg = await config_manager.get_config(guild)
     current_rooms = cfg.get("rooms", 0)
@@ -128,7 +165,7 @@ async def _delete_room(interaction: discord.Interaction):
     room_name = f"ROOM {current_rooms:02d}"
     cat = discord.utils.get(guild.categories, name=room_name)
     if cat:
-        for ch in cat.channels:
+        for ch in list(cat.channels):
             try:
                 await ch.delete(reason="KAMLA delete room")
             except Exception:
@@ -139,7 +176,7 @@ async def _delete_room(interaction: discord.Interaction):
             pass
 
     cfg = await config_manager.update_config(guild, rooms=current_rooms - 1)
-    await _refresh_panel(interaction, cfg, f"✅ Room {current_rooms:02d} deleted.")
+    await _refresh_panel(interaction, cfg, f"✅ Room **{current_rooms:02d}** deleted.")
 
 
 # ── Rebuild confirm view ───────────────────────────────────────────────────────
@@ -184,29 +221,32 @@ class SettingsView(discord.ui.View):
     async def _guard(self, interaction: discord.Interaction) -> bool:
         if not _is_admin(interaction):
             await interaction.response.send_message(
-                "⛔ Only ORG / CAP / TABBY / EQUITY may use the settings panel.", ephemeral=True
+                "⛔ Only **ORG / CAP / TABBY / EQUITY** may use the settings panel.",
+                ephemeral=True,
             )
             return False
         return True
 
-    @discord.ui.button(label="Add Room", style=discord.ButtonStyle.success,
-                       custom_id="kamla:settings:add_room", emoji="➕", row=0)
+    # ── Row 0 ──────────────────────────────────────────────────────────────
+
+    @discord.ui.button(label="➕ Add Room", style=discord.ButtonStyle.success,
+                       custom_id="kamla:settings:add_room", row=0)
     async def add_room(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._guard(interaction):
             return
         await interaction.response.defer(thinking=True, ephemeral=True)
         await _add_room(interaction)
 
-    @discord.ui.button(label="Delete Room", style=discord.ButtonStyle.danger,
-                       custom_id="kamla:settings:del_room", emoji="➖", row=0)
+    @discord.ui.button(label="➖ Delete Room", style=discord.ButtonStyle.danger,
+                       custom_id="kamla:settings:del_room", row=0)
     async def delete_room(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._guard(interaction):
             return
         await interaction.response.defer(thinking=True, ephemeral=True)
         await _delete_room(interaction)
 
-    @discord.ui.button(label="Switch Format", style=discord.ButtonStyle.primary,
-                       custom_id="kamla:settings:switch_format", emoji="🔄", row=0)
+    @discord.ui.button(label="🔄 Switch Format", style=discord.ButtonStyle.primary,
+                       custom_id="kamla:settings:switch_format", row=0)
     async def switch_format(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._guard(interaction):
             return
@@ -216,22 +256,33 @@ class SettingsView(discord.ui.View):
         cfg = await config_manager.update_config(interaction.guild, format=new_fmt)
         await _refresh_panel(interaction, cfg, f"✅ Format switched to **{new_fmt.upper()}**.")
 
-    @discord.ui.button(label="Change Timezone", style=discord.ButtonStyle.secondary,
-                       custom_id="kamla:settings:timezone", emoji="🕐", row=1)
+    # ── Row 1 ──────────────────────────────────────────────────────────────
+
+    @discord.ui.button(label="🌍 Change Timezone", style=discord.ButtonStyle.secondary,
+                       custom_id="kamla:settings:timezone", row=1)
     async def change_timezone(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._guard(interaction):
             return
         await interaction.response.send_modal(TimezoneModal())
 
-    @discord.ui.button(label="Rename Tournament", style=discord.ButtonStyle.secondary,
-                       custom_id="kamla:settings:rename", emoji="✏️", row=1)
+    @discord.ui.button(label="📝 Rename Tournament", style=discord.ButtonStyle.secondary,
+                       custom_id="kamla:settings:rename", row=1)
     async def rename_tournament(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._guard(interaction):
             return
         await interaction.response.send_modal(RenameModal())
 
-    @discord.ui.button(label="Rebuild Server", style=discord.ButtonStyle.danger,
-                       custom_id="kamla:settings:rebuild", emoji="🔨", row=2)
+    @discord.ui.button(label="🖼️ Change Logo", style=discord.ButtonStyle.secondary,
+                       custom_id="kamla:settings:logo", row=1)
+    async def change_logo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._guard(interaction):
+            return
+        await interaction.response.send_modal(LogoModal())
+
+    # ── Row 2 ──────────────────────────────────────────────────────────────
+
+    @discord.ui.button(label="🏗️ Rebuild Server", style=discord.ButtonStyle.danger,
+                       custom_id="kamla:settings:rebuild", row=2)
     async def rebuild_server(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._guard(interaction):
             return
@@ -241,8 +292,8 @@ class SettingsView(discord.ui.View):
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.secondary,
-                       custom_id="kamla:settings:refresh", emoji="🔁", row=2)
+    @discord.ui.button(label="♻️ Refresh", style=discord.ButtonStyle.secondary,
+                       custom_id="kamla:settings:refresh", row=2)
     async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._guard(interaction):
             return

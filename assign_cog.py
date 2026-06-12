@@ -1,4 +1,5 @@
 import discord
+from discord import app_commands
 from discord.ext import commands
 from config import (
     KAMLA_ROLE_NAMES, ADMIN_ROLE_NAMES,
@@ -33,8 +34,6 @@ class AssignCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        if message.author.bot:
-            return
         if not message.guild:
             return
         if not isinstance(message.channel, discord.TextChannel):
@@ -42,17 +41,21 @@ class AssignCog(commands.Cog):
         if not _in_assign_category(message.channel):
             return
 
-        member = message.author
-        sender_is_admin = (
-            member.guild_permissions.administrator
-            or any(r.name in ADMIN_ROLE_NAMES for r in member.roles)
-        )
-        if not sender_is_admin:
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            return
+        if message.author.bot:
+            # Bot-originated messages are trusted (sent by role buttons or admin automation)
+            pass
+        else:
+            member = message.author
+            is_admin = (
+                member.guild_permissions.administrator
+                or any(r.name in ADMIN_ROLE_NAMES for r in member.roles)
+            )
+            if not is_admin:
+                try:
+                    await message.delete()
+                except Exception:
+                    pass
+                return
 
         role_name = _channel_role(message.channel.name)
         if not role_name:
@@ -60,37 +63,65 @@ class AssignCog(commands.Cog):
 
         role = get_kamla_role(message.guild, role_name)
         if role is None:
-            await message.channel.send(
-                f"❌ Role **{role_name}** not found. Run `/st` first.", delete_after=10
-            )
+            if not message.author.bot:
+                await message.channel.send(
+                    f"❌ Role **{role_name}** not found. Ensure the server was set up with `/st`.",
+                    delete_after=10,
+                )
             return
 
-        targets: list[discord.Member] = list(message.mentions)
+        targets = [m for m in message.mentions if not m.bot]
         if not targets:
             return
 
         results = []
         for target in targets:
-            if target.bot:
-                continue
             await assign_kamla_role(target, role)
             results.append(target.mention)
 
-        if results:
+        # Confirmation only for human-sent messages to avoid bot loop
+        if results and not message.author.bot:
             await message.channel.send(
                 f"✅ Assigned **{role_name}** to: {', '.join(results)}",
                 delete_after=15,
             )
 
     @commands.Cog.listener()
-    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
-        """No-op placeholder — member-leave cleanup handled in main.py."""
-        pass
+    async def on_member_remove(self, member: discord.Member) -> None:
+        guild = member.guild
+        assign_cat = discord.utils.get(guild.categories, name="🛅︱ASSIGN")
+        if assign_cat is None:
+            return
+        for ch in assign_cat.text_channels:
+            try:
+                async for msg in ch.history(limit=200):
+                    if member in msg.mentions:
+                        try:
+                            await msg.delete()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
-    @commands.Cog.listener()
-    async def on_member_update(self, before: discord.Member, after: discord.Member):
-        """If an admin manually changes a role, clean stale assign-channel mentions."""
-        pass
+
+    @app_commands.command(name="mention", description="Mention a user in a channel.")
+    @app_commands.describe(user="User to mention", channel="Channel to mention them in")
+    @app_commands.default_permissions(administrator=True)
+    async def mention(
+        self,
+        interaction: discord.Interaction,
+        user: discord.Member,
+        channel: discord.TextChannel,
+    ):
+        try:
+            await channel.send(user.mention)
+            await interaction.response.send_message(
+                f"✅ Mentioned {user.mention} in {channel.mention}.", ephemeral=True
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                f"❌ Cannot send messages in {channel.mention}.", ephemeral=True
+            )
 
 
 async def setup(bot: commands.Bot):
