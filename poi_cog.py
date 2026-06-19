@@ -1,9 +1,8 @@
 import discord
+import re
 from discord.ext import commands
 from datetime import datetime, timezone, timedelta
 from config import config_manager
-
-POI_TRIGGERS = {"poi", "Poi", "POI"}
 
 
 def _get_tz_offset(tz_str: str) -> int:
@@ -24,6 +23,10 @@ def _in_poi_channel(channel: discord.abc.GuildChannel) -> bool:
     return channel.name.lower() == "poi"
 
 
+_POI_EXACT = re.compile(r"^\s*poi\s*$", re.IGNORECASE)
+_POI_CONTAINS = re.compile(r"p\s*o\s*i", re.IGNORECASE)
+
+
 class PoiCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -37,49 +40,59 @@ class PoiCog(commands.Cog):
         if not _in_poi_channel(message.channel):
             return
 
-        content = message.content.strip()
+        content = message.content or ""
 
-        if content not in POI_TRIGGERS:
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            try:
-                await message.channel.send(
-                    f"⚠️ Only `poi`, `POI`, or `Poi` is allowed in this channel.",
-                    delete_after=5,
-                )
-            except Exception:
-                pass
-            return
-
+        # Always delete the user's message first
         try:
             await message.delete()
         except Exception:
             pass
 
+        # Case 1: Exact "poi" in any case combination → approve
+        if _POI_EXACT.match(content):
+            await self._send_poi_embed(message)
+            return
+
+        # Case 2: Contains p-o-i in order (e.g. "poi sir", "POI please")
+        # → tell them to write only `poi`
+        if _POI_CONTAINS.search(content):
+            try:
+                await message.channel.send(
+                    f"⚠️ {message.author.mention} — please type only `poi` "
+                    "(nothing else) to request a Point of Information.",
+                    delete_after=6,
+                )
+            except Exception:
+                pass
+            return
+
+        # Case 3: Doesn't contain p-o-i at all
+        try:
+            await message.channel.send(
+                f"⚠️ {message.author.mention} — this channel is **only for POI requests**. "
+                "Type `poi` to request a Point of Information.",
+                delete_after=6,
+            )
+        except Exception:
+            pass
+
+    async def _send_poi_embed(self, message: discord.Message) -> None:
         cfg = await config_manager.get_config(message.guild)
         tz_str = cfg.get("timezone", "+00:00")
         tz_offset = _get_tz_offset(tz_str)
         tz = timezone(timedelta(minutes=tz_offset))
-        now = datetime.now(tz)
-        ts = now.strftime("%H:%M:%S")
-
-        sign = "+" if tz_offset >= 0 else "-"
-        abs_offset = abs(tz_offset)
-        tz_label = f"GMT{sign}{abs_offset // 60:02d}:{abs_offset % 60:02d}"
+        ts = datetime.now(tz).strftime("%H:%M:%S")
 
         embed = discord.Embed(
-            title="🙋 POI Requested",
-            description=f"{message.author.mention} has requested a **Point of Information**.",
+            description=f"🙋 **POI** requested by {message.author.mention} • `{ts}`",
             color=discord.Color.orange(),
-            timestamp=datetime.now(timezone.utc),
         )
-        embed.add_field(name="🕐 Time", value=f"{ts} ({tz_label})", inline=True)
-        embed.add_field(name="👤 By", value=message.author.mention, inline=True)
         embed.set_thumbnail(url=message.author.display_avatar.url)
 
-        await message.channel.send(embed=embed)
+        try:
+            await message.channel.send(embed=embed)
+        except Exception:
+            pass
 
 
 async def setup(bot: commands.Bot):

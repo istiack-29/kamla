@@ -18,6 +18,9 @@ ROLE_CONFIG = [
     {"name": "VISITOR",                "color": discord.Color.light_grey(), "administrator": False, "hoist": False},
 ]
 
+# Roles allowed to view ORGCOM + ASSIGN categories (full access)
+ORG_ACCESS_ROLES = ["ORG", "CAP", "TABBY", "EQUITY", "INVITED ADJUDICATOR"]
+
 
 def _allow(*perms) -> discord.PermissionOverwrite:
     ow = discord.PermissionOverwrite()
@@ -91,21 +94,34 @@ async def _create_roles(guild: discord.Guild) -> dict[str, discord.Role]:
 
 def _bot_ow(guild):
     return _allow("view_channel", "send_messages", "read_message_history",
-                  "manage_messages", "embed_links", "attach_files")
+                  "manage_messages", "embed_links", "attach_files",
+                  "connect", "speak", "move_members")
 
 
-def _build_admin_overwrites(guild, roles):
+# ─────────────────────────────────────────────────────────────────────────────
+# Permission overwrite builders
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_orgcom_overwrites(guild, roles):
+    """ORGCOM + ASSIGN: only ORG/CAP/TABBY/EQUITY/INVITED ADJ. Full access."""
     ow = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
         guild.me: _bot_ow(guild),
     }
-    for rn in ADMIN_ROLE_NAMES:
+    for rn in ORG_ACCESS_ROLES:
         if rn in roles:
             ow[roles[rn]] = _role_ow(admin=True, view=True, send=True)
+    # Explicitly hide from non-org roles
+    for rn in KAMLA_ROLE_NAMES:
+        if rn in ORG_ACCESS_ROLES:
+            continue
+        if rn in roles:
+            ow[roles[rn]] = discord.PermissionOverwrite(view_channel=False)
     return ow
 
 
 def _build_all_role_overwrites(guild, roles, send=True):
+    """Every KAMLA role can view (and optionally send)."""
     ow = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
         guild.me: _bot_ow(guild),
@@ -121,6 +137,7 @@ def _build_all_role_overwrites(guild, roles, send=True):
 
 
 def _build_announce_overwrites(guild, roles):
+    """All can read; only admins send."""
     ow = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
         guild.me: _bot_ow(guild),
@@ -137,6 +154,7 @@ def _build_announce_overwrites(guild, roles):
 
 
 def _build_public_overwrites(guild):
+    """Uncategorised public channels — visible to @everyone."""
     return {
         guild.default_role: discord.PermissionOverwrite(
             view_channel=True, send_messages=False, read_message_history=True,
@@ -145,14 +163,81 @@ def _build_public_overwrites(guild):
     }
 
 
-async def build_server(
-    guild: discord.Guild,
-    fmt: str,
-    rooms: int,
-    timezone: str,
-    tournament_name: str,
-    creator_id: int,
-) -> None:
+# ─────────────────────────────────────────────────────────────────────────────
+# Room channel overwrite builders
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _room_category_ow(guild, roles):
+    """Room category: visible to all KAMLA roles; child channels override."""
+    ow = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me: _bot_ow(guild),
+    }
+    for rn in KAMLA_ROLE_NAMES:
+        if rn in roles:
+            ow[roles[rn]] = discord.PermissionOverwrite(
+                view_channel=True, read_message_history=True,
+            )
+    return ow
+
+
+def _room_text_ow(guild, roles, *, hide_from=(), allow_send=True):
+    """Text channel in a room.
+    hide_from: list of role names that should NOT see the channel.
+    allow_send: whether non-hidden roles can send messages.
+    """
+    ow = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me: _bot_ow(guild),
+    }
+    for rn in KAMLA_ROLE_NAMES:
+        if rn not in roles:
+            continue
+        if rn in hide_from:
+            ow[roles[rn]] = discord.PermissionOverwrite(view_channel=False)
+        else:
+            is_admin = rn in ADMIN_ROLE_NAMES
+            ow[roles[rn]] = discord.PermissionOverwrite(
+                view_channel=True,
+                read_message_history=True,
+                send_messages=allow_send or is_admin,
+                embed_links=True,
+                attach_files=True,
+            )
+    return ow
+
+
+def _room_voice_ow(guild, roles, *, hide_from=(), no_speak=()):
+    """Voice channel in a room.
+    hide_from: roles that can't see/connect.
+    no_speak: roles that can connect but can't speak (mic muted).
+    """
+    ow = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me: _bot_ow(guild),
+    }
+    for rn in KAMLA_ROLE_NAMES:
+        if rn not in roles:
+            continue
+        if rn in hide_from:
+            ow[roles[rn]] = discord.PermissionOverwrite(view_channel=False, connect=False)
+            continue
+        can_speak = rn not in no_speak
+        ow[roles[rn]] = discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            speak=can_speak,
+            use_voice_activation=can_speak,
+            stream=can_speak,
+        )
+    return ow
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Build / rebuild
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def build_server(guild, fmt, rooms, timezone, tournament_name, creator_id) -> None:
     _building_guilds.add(guild.id)
     try:
         await _build_server_inner(guild, fmt, rooms, timezone, tournament_name, creator_id)
@@ -170,7 +255,6 @@ async def _build_server_inner(
 ) -> None:
     roles = await _create_roles(guild)
 
-    # ── Rename server and bot nickname to tournament name ─────────────────────
     try:
         await guild.edit(name=tournament_name, reason="KAMLA tournament setup")
     except Exception as e:
@@ -180,15 +264,15 @@ async def _build_server_inner(
     except Exception as e:
         print(f"[Builder] Could not set bot nickname: {e}")
 
-    # ── Public channels ───────────────────────────────────────────────────────
+    # ── Public uncategorised channels (visible to @everyone) ─────────────────
     pub_ow = _build_public_overwrites(guild)
     meet_ch = await guild.create_text_channel("👐🏻︱meet-the-developer", overwrites=pub_ow)
     await guild.create_text_channel("👋🏻︱welcome",              overwrites=pub_ow)
     await guild.create_text_channel("❓︱get-role",             overwrites=pub_ow)
     await guild.create_text_channel("🦧︱how-to-use-this-server", overwrites=pub_ow)
 
-    # ── ORGCOM ───────────────────────────────────────────────────────────────
-    orgcom_ow = _build_admin_overwrites(guild, roles)
+    # ── ORGCOM (ORG/CAP/TABBY/EQUITY + INVITED ADJ only) ─────────────────────
+    orgcom_ow = _build_orgcom_overwrites(guild, roles)
     orgcom_cat = await guild.create_category("⚜️︱ORGCOM", overwrites=orgcom_ow)
     settings_ch = await guild.create_text_channel("⚙️︱settings",  category=orgcom_cat, overwrites=orgcom_ow)
     await guild.create_text_channel("🏴︱org",      category=orgcom_cat, overwrites=orgcom_ow)
@@ -196,10 +280,8 @@ async def _build_server_inner(
     await guild.create_voice_channel("ORG",          category=orgcom_cat, overwrites=orgcom_ow)
     await guild.create_voice_channel("Control Room", category=orgcom_cat, overwrites=orgcom_ow)
 
-    # ── ASSIGN ───────────────────────────────────────────────────────────────
-    assign_ow = _build_admin_overwrites(guild, roles)
-    # Bot also needs send_messages in assign channels (for role-button flow)
-    assign_ow[guild.me] = _bot_ow(guild)
+    # ── ASSIGN (same access as ORGCOM) ───────────────────────────────────────
+    assign_ow = _build_orgcom_overwrites(guild, roles)
     assign_cat = await guild.create_category("🛅︱ASSIGN", overwrites=assign_ow)
     for rn in ["ORG", "CAP", "TABBY", "EQUITY", "DEBATER", "VISITOR",
                "INDEPENDENT ADJUDICATOR", "INVITED ADJUDICATOR"]:
@@ -235,7 +317,6 @@ async def _build_server_inner(
         await guild.create_text_channel(ch_name, category=info_cat, overwrites=info_send_ow)
         await asyncio.sleep(0.2)
 
-    # ── Persist config FIRST so settings panel can read it ───────────────────
     cfg_data = {
         "format":              fmt,
         "rooms":               rooms,
@@ -248,14 +329,12 @@ async def _build_server_inner(
     }
     await config_manager.set_config(guild, cfg_data)
 
-    # ── Populate static channels BEFORE slow room creation ────────────────────
     await _post_meet_developer(meet_ch)
     await _post_welcome(guild)
     await _post_get_role(guild)
     await _post_how_to_use(guild)
     await _post_settings_panel(settings_ch, cfg_data)
 
-    # ── ROOMS (slow — done last so panel always appears) ─────────────────────
     await _create_rooms(guild, roles, fmt, rooms, start_index=1)
 
 
@@ -264,17 +343,15 @@ BP_PREP_NAMES = {"OG PREP", "OO PREP", "CG PREP", "CO PREP"}
 
 
 async def switch_format_rooms(guild: discord.Guild, new_fmt: str, rooms: int) -> None:
-    """Delete old prep rooms + ADJUDICATION in every ROOM XX category, rebuild for new format."""
     roles = {r.name: r for r in guild.roles}
-    voice_ow = _build_all_role_overwrites(guild, roles)
+    prep_ow = _room_voice_ow(guild, roles, hide_from=("VISITOR",))
+    adj_ow  = _room_voice_ow(guild, roles, hide_from=("DEBATER", "VISITOR"))
     all_prep = AP_PREP_NAMES | BP_PREP_NAMES
 
     for i in range(1, rooms + 1):
         cat = discord.utils.get(guild.categories, name=f"ROOM {i:02d}")
         if not cat:
             continue
-
-        # Delete prep rooms + ADJUDICATION (will be recreated at the bottom)
         for ch in list(cat.voice_channels):
             if ch.name in all_prep or ch.name == "ADJUDICATION":
                 try:
@@ -283,20 +360,15 @@ async def switch_format_rooms(guild: discord.Guild, new_fmt: str, rooms: int) ->
                 except Exception:
                     pass
 
-        # Create new prep rooms
         if new_fmt.lower() == "bp":
             for prep in ["OG PREP", "OO PREP", "CG PREP", "CO PREP"]:
-                await guild.create_voice_channel(prep, category=cat,
-                                                 overwrites=voice_ow, user_limit=2)
+                await guild.create_voice_channel(prep, category=cat, overwrites=prep_ow, user_limit=2)
                 await asyncio.sleep(0.15)
         else:
-            await guild.create_voice_channel("GOVT PREP", category=cat,
-                                             overwrites=voice_ow, user_limit=3)
-            await guild.create_voice_channel("OPP PREP",  category=cat,
-                                             overwrites=voice_ow, user_limit=3)
+            await guild.create_voice_channel("GOVT PREP", category=cat, overwrites=prep_ow, user_limit=3)
+            await guild.create_voice_channel("OPP PREP",  category=cat, overwrites=prep_ow, user_limit=3)
 
-        # ADJUDICATION always last
-        await guild.create_voice_channel("ADJUDICATION", category=cat, overwrites=voice_ow)
+        await guild.create_voice_channel("ADJUDICATION", category=cat, overwrites=adj_ow)
         await asyncio.sleep(0.2)
 
 
@@ -307,55 +379,41 @@ async def _create_rooms(
     count: int,
     start_index: int = 1,
 ) -> None:
-    r_text_ow = _build_all_role_overwrites(guild, roles, send=True)
-
-    adj_roles = ["ORG", "CAP", "TABBY", "INVITED ADJUDICATOR", "INDEPENDENT ADJUDICATOR"]
-    all_in_ow = {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        guild.me: _bot_ow(guild),
-    }
-    for rn in KAMLA_ROLE_NAMES:
-        if rn in roles:
-            all_in_ow[roles[rn]] = discord.PermissionOverwrite(
-                view_channel=True,
-                read_message_history=True,
-                send_messages=rn in adj_roles,
-            )
-
-    voice_ow = _build_all_role_overwrites(guild, roles)
+    cat_ow    = _room_category_ow(guild, roles)
+    text_ow   = _room_text_ow(guild, roles, hide_from=("VISITOR",), allow_send=True)
+    allin_ow  = _room_text_ow(guild, roles, hide_from=("DEBATER", "VISITOR"), allow_send=False)
+    debate_ow = _room_voice_ow(guild, roles, no_speak=("VISITOR",))
+    prep_ow   = _room_voice_ow(guild, roles, hide_from=("VISITOR",))
+    adj_ow    = _room_voice_ow(guild, roles, hide_from=("DEBATER", "VISITOR"))
 
     for i in range(start_index, start_index + count):
         room_name = f"ROOM {i:02d}"
-        cat = await guild.create_category(room_name, overwrites=voice_ow)
+        cat = await guild.create_category(room_name, overwrites=cat_ow)
 
-        # ── Text channels (always first) ──────────────────────────────────────
-        await guild.create_text_channel("timer",  category=cat, overwrites=r_text_ow)
-        await guild.create_text_channel("poi",    category=cat, overwrites=r_text_ow)
-        all_in_ch = await guild.create_text_channel("all-in", category=cat, overwrites=all_in_ow)
+        # Text channels
+        await guild.create_text_channel("timer",  category=cat, overwrites=text_ow)
+        await guild.create_text_channel("poi",    category=cat, overwrites=text_ow)
+        all_in_ch = await guild.create_text_channel("all-in", category=cat, overwrites=allin_ow)
 
-        # ── Voice channels (DEBATE ROOM → PREP ROOMS → ADJUDICATION last) ────
-        await guild.create_voice_channel("DEBATE ROOM", category=cat, overwrites=voice_ow)
+        # Voice channels
+        await guild.create_voice_channel("DEBATE ROOM", category=cat, overwrites=debate_ow)
 
         if fmt.lower() == "ap":
-            await guild.create_voice_channel("GOVT PREP", category=cat,
-                                             overwrites=voice_ow, user_limit=3)
-            await guild.create_voice_channel("OPP PREP",  category=cat,
-                                             overwrites=voice_ow, user_limit=3)
+            await guild.create_voice_channel("GOVT PREP", category=cat, overwrites=prep_ow, user_limit=3)
+            await guild.create_voice_channel("OPP PREP",  category=cat, overwrites=prep_ow, user_limit=3)
         else:
             for prep in ["OG PREP", "OO PREP", "CG PREP", "CO PREP"]:
-                await guild.create_voice_channel(prep, category=cat,
-                                                 overwrites=voice_ow, user_limit=2)
+                await guild.create_voice_channel(prep, category=cat, overwrites=prep_ow, user_limit=2)
                 await asyncio.sleep(0.15)
 
-        # ADJUDICATION is always the last channel in the category
-        await guild.create_voice_channel("ADJUDICATION", category=cat, overwrites=voice_ow)
+        await guild.create_voice_channel("ADJUDICATION", category=cat, overwrites=adj_ow)
 
-        # ── Post persistent All-In button ─────────────────────────────────────
         from allin_cog import AllInView
         await all_in_ch.send(
             embed=discord.Embed(
                 title="🔴 Push Back All",
-                description="Press the button below to move everyone from prep rooms back to **DEBATE ROOM**.",
+                description="Press the button below to move everyone from prep rooms back to **DEBATE ROOM**.\n\n"
+                            "⛔ Text messages are not allowed in this channel.",
                 color=discord.Color.red(),
             ),
             view=AllInView(),
@@ -443,18 +501,15 @@ async def _post_how_to_use(guild: discord.Guild) -> None:
               "• **ROOM XX** — Individual debate rooms", inline=False)
     embed.add_field(name="⏱️ Timer",
         value="In **#timer**, send a time: `10m` `1h` `15s` `1h10m` `10m30s`\n"
-              "The bot starts a live countdown.", inline=False)
+              "Only lowercase d/h/m/s — no symbols or spaces.", inline=False)
     embed.add_field(name="🙋 POI",
-        value="In **#poi**, send `poi`, `POI`, or `Poi`.\n"
-              "The bot logs your POI with a timestamp.", inline=False)
+        value="In **#poi**, type `poi` (any case) to request a Point of Information.",
+        inline=False)
     embed.add_field(name="🔴 All-In",
-        value="In **#all-in**, press **Push Back All** to move everyone from prep rooms to Debate Room.\n"
-              "Adjudicators and admins only.", inline=False)
-    embed.add_field(name="🎭 Roles",
-        value="• **ORG / CAP / TABBY / EQUITY** — Admin (assigned by organisers)\n"
-              "• **Invited Adjudicator** — Official judges\n"
-              "• **Independent Adjudicator** — Self-registered judges\n"
-              "• **Debater** — Competitors\n• **Visitor** — Observers", inline=False)
+        value="In **#all-in**, only **ORG / CAP / TABBY / Invited / Independent Adjudicator** "
+              "can press **Push Back All** to pull everyone back from prep to the debate room. "
+              "Text messages are not allowed.",
+        inline=False)
     await channel.send(embed=embed)
 
 

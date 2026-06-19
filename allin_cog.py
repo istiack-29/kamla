@@ -105,6 +105,28 @@ class AllInCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        """Delete any human message in #all-in channels — text is not allowed."""
+        if message.author.bot or not message.guild:
+            return
+        if not _in_allin_channel(message.channel):
+            return
+
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        try:
+            await message.channel.send(
+                f"⛔ {message.author.mention} — sending messages in **#all-in** "
+                "is not allowed. Use the **Push Back All** button only.",
+                delete_after=6,
+            )
+        except Exception:
+            pass
+
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(AllInCog(bot))

@@ -28,6 +28,26 @@ def _in_assign_category(channel: discord.TextChannel) -> bool:
     return "assign" in channel.category.name.lower()
 
 
+async def _cleanup_old_mentions(
+    assign_cat: discord.CategoryChannel,
+    member: discord.Member,
+    keep_channel_id: int,
+) -> None:
+    """Delete any messages mentioning `member` in OTHER assign channels."""
+    for ch in assign_cat.text_channels:
+        if ch.id == keep_channel_id:
+            continue
+        try:
+            async for msg in ch.history(limit=200):
+                if member in msg.mentions:
+                    try:
+                        await msg.delete()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+
 class AssignCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -41,18 +61,42 @@ class AssignCog(commands.Cog):
         if not _in_assign_category(message.channel):
             return
 
+        # Only mentions allowed — any other message gets deleted
+        # (for both humans and unexpected bot text).
         if message.author.bot:
-            # Bot-originated messages are trusted (sent by role buttons or admin automation)
-            pass
+            # Trust bot mention messages; delete bot messages with no mentions.
+            if not message.mentions:
+                # Keep confirmation messages (they self-delete via delete_after).
+                # Only delete bot messages that aren't mentions and aren't replies.
+                pass
         else:
             member = message.author
             is_admin = (
                 member.guild_permissions.administrator
                 or any(r.name in ADMIN_ROLE_NAMES for r in member.roles)
             )
+
+            # Non-admin → delete instantly
             if not is_admin:
                 try:
                     await message.delete()
+                except Exception:
+                    pass
+                return
+
+            # Admin but the message contains NO user mention → not allowed
+            human_mentions = [m for m in message.mentions if not m.bot]
+            if not human_mentions:
+                try:
+                    await message.delete()
+                except Exception:
+                    pass
+                try:
+                    await message.channel.send(
+                        f"⚠️ {member.mention} — only **mentions** are allowed in assign channels. "
+                        "Mention a user (e.g. `@username`) to assign them the role.",
+                        delete_after=8,
+                    )
                 except Exception:
                     pass
                 return
@@ -75,11 +119,14 @@ class AssignCog(commands.Cog):
             return
 
         results = []
+        assign_cat = message.channel.category
         for target in targets:
             await assign_kamla_role(target, role)
             results.append(target.mention)
+            # Remove the user's previous mention from any other assign channel
+            if assign_cat is not None:
+                await _cleanup_old_mentions(assign_cat, target, message.channel.id)
 
-        # Confirmation only for human-sent messages to avoid bot loop
         if results and not message.author.bot:
             await message.channel.send(
                 f"✅ Assigned **{role_name}** to: {', '.join(results)}",
@@ -102,7 +149,6 @@ class AssignCog(commands.Cog):
                             pass
             except Exception:
                 pass
-
 
     @app_commands.command(name="mention", description="Mention a user in a channel.")
     @app_commands.describe(user="User to mention", channel="Channel to mention them in")
