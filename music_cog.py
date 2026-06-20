@@ -3,9 +3,14 @@ from discord import app_commands
 from discord.ext import commands
 import asyncio
 import yt_dlp
+import shutil
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
+
+# Resolve ffmpeg path explicitly (static-ffmpeg adds it to PATH via main.py)
+_FFMPEG_EXECUTABLE = shutil.which("ffmpeg") or "ffmpeg"
+print(f"[Music] Using ffmpeg at: {_FFMPEG_EXECUTABLE}")
 
 # Load Opus — required for Discord voice audio to actually transmit
 if not discord.opus.is_loaded():
@@ -309,7 +314,11 @@ async def _play_next(guild: discord.Guild, bot: commands.Bot) -> None:
 
     try:
         stream_url = await _get_stream_url(track.webpage_url or track.url)
-        source = discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTIONS)
+        source = discord.FFmpegPCMAudio(
+            stream_url,
+            executable=_FFMPEG_EXECUTABLE,
+            **FFMPEG_OPTIONS,
+        )
         source = discord.PCMVolumeTransformer(source, volume=0.8)
 
         def after(error):
