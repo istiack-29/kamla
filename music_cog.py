@@ -25,8 +25,7 @@ if not discord.opus.is_loaded():
         except Exception:
             continue
     if not discord.opus.is_loaded():
-        print("[Music] WARNING: Opus could not be loaded — voice audio will NOT work! "
-              "Add 'libopus0' to your Render build command.")
+        print("[Music] Opus not loaded via system paths — relying on davey (bundled).")
 
 SONG_REQUEST_CHANNEL = "🎼︱song-request"
 GRAND_AUDITORIUM_VC  = "Grand Auditorium"
@@ -108,6 +107,12 @@ def _can_control(interaction: discord.Interaction, state: GuildMusicState) -> bo
     if state.current and state.current.requester.id == interaction.user.id:
         return True
     return False
+
+
+def _is_song_request_channel(channel: discord.abc.GuildChannel) -> bool:
+    if not isinstance(channel, discord.TextChannel):
+        return False
+    return "song-request" in channel.name.lower()
 
 
 async def _search_youtube(query: str) -> list[dict]:
@@ -533,6 +538,35 @@ class MusicCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
+    # ── Song-request channel guard ─────────────────────────────────────────────
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        """Delete any human text message in the song-request channel.
+        Bot messages (player embed, search results) are left untouched.
+        Slash command interactions (/play) are NOT messages, so they pass through.
+        """
+        if message.author.bot:
+            return
+        if not message.guild:
+            return
+        if not _is_song_request_channel(message.channel):
+            return
+
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        try:
+            await message.channel.send(
+                f"⛔ {message.author.mention} — এই চ্যানেলে শুধু `/play` কমান্ড ব্যবহার করা যাবে।\n"
+                "Only `/play <song name or URL>` is allowed here.",
+                delete_after=6,
+            )
+        except Exception:
+            pass
+
+    # ── /play command ──────────────────────────────────────────────────────────
     @app_commands.command(name="play", description="Search for a song and add it to the queue.")
     @app_commands.describe(query="Song name or YouTube URL")
     async def play(self, interaction: discord.Interaction, query: str):
@@ -575,6 +609,7 @@ class MusicCog(commands.Cog):
         else:
             await interaction.followup.send(embed=embed, view=view)
 
+    # ── /start command ─────────────────────────────────────────────────────────
     @app_commands.command(name="start", description="Set up the music channels in this server.")
     @app_commands.default_permissions(administrator=True)
     async def start(self, interaction: discord.Interaction):
@@ -621,6 +656,7 @@ class MusicCog(commands.Cog):
             ephemeral=True,
         )
 
+    # ── /queue command ─────────────────────────────────────────────────────────
     @app_commands.command(name="queue", description="Show the current music queue.")
     async def queue_cmd(self, interaction: discord.Interaction):
         state = get_state(interaction.guild_id)
@@ -641,6 +677,7 @@ class MusicCog(commands.Cog):
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
+    # ── Auto-disconnect when voice channel is empty ────────────────────────────
     @commands.Cog.listener()
     async def on_voice_state_update(
         self,

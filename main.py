@@ -6,6 +6,14 @@ from dotenv import load_dotenv
 from keep_alive import keep_alive
 from config import config_manager
 
+# Setup static ffmpeg — no apt-get needed on Render
+try:
+    import static_ffmpeg
+    static_ffmpeg.add_paths()
+    print("[KAMLA] static-ffmpeg loaded successfully.")
+except Exception as e:
+    print(f"[KAMLA] WARNING: Could not load static-ffmpeg: {e}")
+
 load_dotenv()
 
 INTENTS = discord.Intents.all()
