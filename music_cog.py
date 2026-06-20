@@ -3,16 +3,11 @@ from discord import app_commands
 from discord.ext import commands
 import asyncio
 import yt_dlp
-import shutil
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
-# Resolve ffmpeg path explicitly (static-ffmpeg adds it to PATH via main.py)
-_FFMPEG_EXECUTABLE = shutil.which("ffmpeg") or "ffmpeg"
-print(f"[Music] Using ffmpeg at: {_FFMPEG_EXECUTABLE}")
-
-# Load Opus — required for Discord voice audio to actually transmit
+# Load Opus — system libopus installed via render.yaml aptPackages
 if not discord.opus.is_loaded():
     _OPUS_PATHS = [
         "libopus.so.0",
@@ -25,12 +20,14 @@ if not discord.opus.is_loaded():
     for _path in _OPUS_PATHS:
         try:
             discord.opus.load_opus(_path)
-            print(f"[Music] Opus loaded from: {_path}")
+            print(f"[Music] Opus loaded: {_path}")
             break
         except Exception:
             continue
     if not discord.opus.is_loaded():
-        print("[Music] Opus not loaded via system paths — relying on davey (bundled).")
+        print("[Music] Opus not loaded via system paths — davey (bundled) will handle encoding.")
+
+print(f"[Music] Opus status: is_loaded={discord.opus.is_loaded()}")
 
 SONG_REQUEST_CHANNEL = "🎼︱song-request"
 GRAND_AUDITORIUM_VC  = "Grand Auditorium"
@@ -57,7 +54,7 @@ YTDL_STREAM_OPTS = {
 
 FFMPEG_OPTIONS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn",
+    "options":        "-vn",
 }
 
 NUMBER_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
@@ -65,10 +62,10 @@ NUMBER_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣
 
 @dataclass
 class Track:
-    title:     str
-    url:       str
-    duration:  str
-    requester: discord.Member
+    title:       str
+    url:         str
+    duration:    str
+    requester:   discord.Member
     webpage_url: str = ""
 
 
@@ -122,34 +119,33 @@ def _is_song_request_channel(channel: discord.abc.GuildChannel) -> bool:
 
 async def _search_youtube(query: str) -> list[dict]:
     loop = asyncio.get_event_loop()
-    def _do_search():
+    def _do():
         with yt_dlp.YoutubeDL(YTDL_SEARCH_OPTS) as ydl:
             result = ydl.extract_info(f"ytsearch10:{query}", download=False)
             if result and "entries" in result:
                 return [e for e in result["entries"] if e]
         return []
-    return await loop.run_in_executor(None, _do_search)
+    return await loop.run_in_executor(None, _do)
 
 
 async def _get_stream_url(webpage_url: str) -> str:
     loop = asyncio.get_event_loop()
-    def _do_extract():
+    def _do():
         with yt_dlp.YoutubeDL(YTDL_STREAM_OPTS) as ydl:
             info = ydl.extract_info(webpage_url, download=False)
             return info.get("url", "")
-    return await loop.run_in_executor(None, _do_extract)
+    return await loop.run_in_executor(None, _do)
 
 
 def _build_player_embed(state: GuildMusicState) -> discord.Embed:
     if not state.current:
-        embed = discord.Embed(
+        return discord.Embed(
             title="🎵 No Music Playing",
             description="Use `/play <song name>` to add a song to the queue.",
             color=discord.Color.greyple(),
         )
-        return embed
 
-    track = state.current
+    track  = state.current
     status = "⏸ Paused" if state.paused else "▶ Playing"
     flags  = []
     if state.loop:    flags.append("🔁 Loop")
@@ -166,13 +162,10 @@ def _build_player_embed(state: GuildMusicState) -> discord.Embed:
     embed.add_field(name="Status",       value=status,                  inline=True)
 
     if state.queue:
-        queue_lines = []
-        items = list(state.queue)[:5]
-        for i, t in enumerate(items, 1):
-            queue_lines.append(f"`{i}.` {t.title} — {t.requester.mention}")
+        lines = [f"`{i}.` {t.title} — {t.requester.mention}" for i, t in enumerate(list(state.queue)[:5], 1)]
         if len(state.queue) > 5:
-            queue_lines.append(f"*…and {len(state.queue) - 5} more*")
-        embed.add_field(name="Next Up", value="\n".join(queue_lines), inline=False)
+            lines.append(f"*…and {len(state.queue) - 5} more*")
+        embed.add_field(name="Next Up", value="\n".join(lines), inline=False)
     else:
         embed.add_field(name="Next Up", value="*Queue is empty*", inline=False)
 
@@ -204,7 +197,6 @@ class PlayerControlView(discord.ui.View):
         if not vc:
             await interaction.response.send_message("❌ Not connected to voice.", ephemeral=True)
             return
-
         if vc.is_paused():
             vc.resume()
             state.paused = False
@@ -214,7 +206,6 @@ class PlayerControlView(discord.ui.View):
         else:
             await interaction.response.send_message("❌ Nothing is playing.", ephemeral=True)
             return
-
         await interaction.response.defer()
         await _update_player(interaction.guild)
 
@@ -276,8 +267,7 @@ async def _update_player(guild: discord.Guild) -> None:
     if not state.player_msg:
         return
     try:
-        embed = _build_player_embed(state)
-        await state.player_msg.edit(embed=embed, view=PlayerControlView())
+        await state.player_msg.edit(embed=_build_player_embed(state), view=PlayerControlView())
     except Exception as e:
         print(f"[Music] Failed to update player embed: {e}")
 
@@ -296,9 +286,8 @@ async def _play_next(guild: discord.Guild, bot: commands.Bot) -> None:
     elif state.queue:
         if state.shuffle:
             import random
-            idx = random.randrange(len(state.queue))
             items = list(state.queue)
-            track = items.pop(idx)
+            track = items.pop(random.randrange(len(items)))
             state.queue = deque(items)
         else:
             track = state.queue.popleft()
@@ -314,36 +303,33 @@ async def _play_next(guild: discord.Guild, bot: commands.Bot) -> None:
 
     try:
         stream_url = await _get_stream_url(track.webpage_url or track.url)
-        source = discord.FFmpegPCMAudio(
-            stream_url,
-            executable=_FFMPEG_EXECUTABLE,
-            **FFMPEG_OPTIONS,
-        )
+        if not stream_url:
+            print(f"[Music] ERROR: Empty stream URL for: {track.title}")
+            state.current = None
+            await _update_player(guild)
+            return
+
+        print(f"[Music] Starting playback: {track.title}")
+        source = discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTIONS)
         source = discord.PCMVolumeTransformer(source, volume=0.8)
 
         def after(error):
             if error:
-                print(f"[Music] Player error: {error}")
+                print(f"[Music] Playback error: {error}")
             asyncio.run_coroutine_threadsafe(_play_next(guild, bot), bot.loop)
 
         vc.play(source, after=after)
         state.paused = False
+        print(f"[Music] vc.is_playing() = {vc.is_playing()}")
         await _update_player(guild)
     except Exception as e:
-        print(f"[Music] Stream error: {e}")
+        print(f"[Music] Stream error for '{track.title}': {e}")
         state.current = None
         await _update_player(guild)
 
 
 class SearchResultView(discord.ui.View):
-    def __init__(
-        self,
-        results: list[dict],
-        requester: discord.Member,
-        guild: discord.Guild,
-        bot: commands.Bot,
-        page: int = 0,
-    ):
+    def __init__(self, results, requester, guild, bot, page=0):
         super().__init__(timeout=60)
         self.results   = results
         self.requester = requester
@@ -356,48 +342,38 @@ class SearchResultView(discord.ui.View):
         self.clear_items()
         start = self.page * RESULTS_PER_PAGE
         end   = min(start + RESULTS_PER_PAGE, len(self.results))
-        page_results = self.results[start:end]
 
-        for i, entry in enumerate(page_results):
+        for i, entry in enumerate(self.results[start:end]):
             global_idx = start + i
             emoji = NUMBER_EMOJIS[global_idx] if global_idx < len(NUMBER_EMOJIS) else f"{global_idx+1}"
-            btn = discord.ui.Button(
-                emoji=emoji,
-                style=discord.ButtonStyle.primary,
-                custom_id=f"search_select_{global_idx}",
-            )
+            btn = discord.ui.Button(emoji=emoji, style=discord.ButtonStyle.primary,
+                                    custom_id=f"search_select_{global_idx}")
             btn.callback = self._make_select_callback(global_idx)
             self.add_item(btn)
 
         total_pages = (len(self.results) + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE
 
         if self.page > 0:
-            prev_btn = discord.ui.Button(emoji="◀", style=discord.ButtonStyle.secondary,
-                                         custom_id="search_prev")
-            prev_btn.callback = self._prev_callback
-            self.add_item(prev_btn)
+            prev = discord.ui.Button(emoji="◀", style=discord.ButtonStyle.secondary, custom_id="search_prev")
+            prev.callback = self._prev_callback
+            self.add_item(prev)
 
         if self.page < total_pages - 1:
-            next_btn = discord.ui.Button(emoji="▶", style=discord.ButtonStyle.secondary,
-                                         custom_id="search_next")
-            next_btn.callback = self._next_callback
-            self.add_item(next_btn)
+            nxt = discord.ui.Button(emoji="▶", style=discord.ButtonStyle.secondary, custom_id="search_next")
+            nxt.callback = self._next_callback
+            self.add_item(nxt)
 
-        cancel_btn = discord.ui.Button(label="✖ Cancel", style=discord.ButtonStyle.danger,
-                                       custom_id="search_cancel")
-        cancel_btn.callback = self._cancel_callback
-        self.add_item(cancel_btn)
+        cancel = discord.ui.Button(label="✖ Cancel", style=discord.ButtonStyle.danger, custom_id="search_cancel")
+        cancel.callback = self._cancel_callback
+        self.add_item(cancel)
 
     def _make_select_callback(self, idx: int):
         async def callback(interaction: discord.Interaction):
             if interaction.user.id != self.requester.id:
-                await interaction.response.send_message(
-                    "❌ Only the requester can interact with this search.",
-                    ephemeral=True,
-                )
+                await interaction.response.send_message("❌ Only the requester can interact.", ephemeral=True)
                 return
             entry = self.results[idx]
-            duration = fmt_duration(entry.get("duration", 0))
+            duration    = fmt_duration(entry.get("duration", 0))
             webpage_url = entry.get("url", "") or entry.get("webpage_url", "")
             if not webpage_url.startswith("http"):
                 webpage_url = f"https://www.youtube.com/watch?v={entry.get('id', '')}"
@@ -428,31 +404,23 @@ class SearchResultView(discord.ui.View):
 
     async def _prev_callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.requester.id:
-            await interaction.response.send_message(
-                "❌ Only the requester can interact with this search.", ephemeral=True
-            )
+            await interaction.response.send_message("❌ Only the requester can interact.", ephemeral=True)
             return
         self.page -= 1
         self._build_buttons()
-        embed = _build_search_embed(self.results, self.page)
-        await interaction.response.edit_message(embed=embed, view=self)
+        await interaction.response.edit_message(embed=_build_search_embed(self.results, self.page), view=self)
 
     async def _next_callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.requester.id:
-            await interaction.response.send_message(
-                "❌ Only the requester can interact with this search.", ephemeral=True
-            )
+            await interaction.response.send_message("❌ Only the requester can interact.", ephemeral=True)
             return
         self.page += 1
         self._build_buttons()
-        embed = _build_search_embed(self.results, self.page)
-        await interaction.response.edit_message(embed=embed, view=self)
+        await interaction.response.edit_message(embed=_build_search_embed(self.results, self.page), view=self)
 
     async def _cancel_callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.requester.id:
-            await interaction.response.send_message(
-                "❌ Only the requester can interact with this search.", ephemeral=True
-            )
+            await interaction.response.send_message("❌ Only the requester can interact.", ephemeral=True)
             return
         self.stop()
         try:
@@ -469,8 +437,8 @@ class SearchResultView(discord.ui.View):
 
 
 def _build_search_embed(results: list[dict], page: int) -> discord.Embed:
-    start = page * RESULTS_PER_PAGE
-    end   = min(start + RESULTS_PER_PAGE, len(results))
+    start       = page * RESULTS_PER_PAGE
+    end         = min(start + RESULTS_PER_PAGE, len(results))
     total_pages = (len(results) + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE
 
     embed = discord.Embed(
@@ -479,16 +447,13 @@ def _build_search_embed(results: list[dict], page: int) -> discord.Embed:
     )
     lines = []
     for i in range(start, end):
-        entry = results[i]
-        emoji = NUMBER_EMOJIS[i] if i < len(NUMBER_EMOJIS) else f"{i+1}."
-        dur   = fmt_duration(entry.get("duration", 0))
-        title = entry.get("title", "Unknown")
+        entry  = results[i]
+        emoji  = NUMBER_EMOJIS[i] if i < len(NUMBER_EMOJIS) else f"{i+1}."
+        dur    = fmt_duration(entry.get("duration", 0))
+        title  = entry.get("title", "Unknown")
         vid_id = entry.get("id", "")
-        url = f"https://www.youtube.com/watch?v={vid_id}" if vid_id else ""
-        if url:
-            lines.append(f"{emoji} **[{title}]({url})** `{dur}`")
-        else:
-            lines.append(f"{emoji} **{title}** `{dur}`")
+        url    = f"https://www.youtube.com/watch?v={vid_id}" if vid_id else ""
+        lines.append(f"{emoji} **[{title}]({url})** `{dur}`" if url else f"{emoji} **{title}** `{dur}`")
 
     embed.description = "\n".join(lines)
     embed.set_footer(text="Click a number to add that song to the queue.")
@@ -497,14 +462,11 @@ def _build_search_embed(results: list[dict], page: int) -> discord.Embed:
 
 async def _ensure_voice(guild: discord.Guild, bot: commands.Bot) -> Optional[discord.VoiceClient]:
     state = get_state(guild.id)
-
     if state.voice_client and state.voice_client.is_connected():
         return state.voice_client
-
     vc_channel = discord.utils.get(guild.voice_channels, name=GRAND_AUDITORIUM_VC)
     if not vc_channel:
         return None
-
     try:
         vc = await vc_channel.connect()
         state.voice_client = vc
@@ -515,27 +477,23 @@ async def _ensure_voice(guild: discord.Guild, bot: commands.Bot) -> Optional[dis
 
 
 async def _get_or_create_player_msg(guild: discord.Guild, bot: commands.Bot) -> Optional[discord.Message]:
-    state = get_state(guild.id)
-
-    song_ch = discord.utils.get(guild.text_channels, name=SONG_REQUEST_CHANNEL.lstrip("🎼︱"))
-    if not song_ch:
-        for ch in guild.text_channels:
-            if "song-request" in ch.name:
-                song_ch = ch
-                break
+    state   = get_state(guild.id)
+    song_ch = None
+    for ch in guild.text_channels:
+        if "song-request" in ch.name:
+            song_ch = ch
+            break
     if not song_ch:
         return None
 
     if state.player_msg:
         try:
-            msg = await song_ch.fetch_message(state.player_msg.id)
-            return msg
+            return await song_ch.fetch_message(state.player_msg.id)
         except Exception:
             state.player_msg = None
 
-    embed = _build_player_embed(state)
     try:
-        msg = await song_ch.send(embed=embed, view=PlayerControlView())
+        msg = await song_ch.send(embed=_build_player_embed(state), view=PlayerControlView())
         state.player_msg = msg
         return msg
     except Exception as e:
@@ -547,25 +505,16 @@ class MusicCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    # ── Song-request channel guard ─────────────────────────────────────────────
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        """Delete any human text message in the song-request channel.
-        Bot messages (player embed, search results) are left untouched.
-        Slash command interactions (/play) are NOT messages, so they pass through.
-        """
-        if message.author.bot:
-            return
-        if not message.guild:
+        if message.author.bot or not message.guild:
             return
         if not _is_song_request_channel(message.channel):
             return
-
         try:
             await message.delete()
         except Exception:
             pass
-
         try:
             await message.channel.send(
                 f"⛔ {message.author.mention} — এই চ্যানেলে শুধু `/play` কমান্ড ব্যবহার করা যাবে।\n"
@@ -575,7 +524,6 @@ class MusicCog(commands.Cog):
         except Exception:
             pass
 
-    # ── /play command ──────────────────────────────────────────────────────────
     @app_commands.command(name="play", description="Search for a song and add it to the queue.")
     @app_commands.describe(query="Song name or YouTube URL")
     async def play(self, interaction: discord.Interaction, query: str):
@@ -591,13 +539,11 @@ class MusicCog(commands.Cog):
 
         if song_ch and interaction.channel_id != song_ch.id:
             await interaction.response.send_message(
-                f"❌ Please use `/play` in {song_ch.mention} only.",
-                ephemeral=True,
+                f"❌ Please use `/play` in {song_ch.mention} only.", ephemeral=True,
             )
             return
 
         state = get_state(interaction.guild_id)
-
         if not state.player_msg:
             await _get_or_create_player_msg(interaction.guild, self.bot)
 
@@ -618,7 +564,6 @@ class MusicCog(commands.Cog):
         else:
             await interaction.followup.send(embed=embed, view=view)
 
-    # ── /start command ─────────────────────────────────────────────────────────
     @app_commands.command(name="start", description="Set up the music channels in this server.")
     @app_commands.default_permissions(administrator=True)
     async def start(self, interaction: discord.Interaction):
@@ -632,40 +577,37 @@ class MusicCog(commands.Cog):
         ga_cat = discord.utils.get(guild.categories, name="🏟️︱GRAND AUDITORIUM")
         roles  = {r.name: r for r in guild.roles}
 
-        from server_builder import _build_song_request_overwrites, _build_all_role_overwrites, _bot_ow
-
-        def ga_ow():
-            return _build_all_role_overwrites(guild, roles)
-
-        def song_ow():
-            return _build_song_request_overwrites(guild, roles)
+        from server_builder import _build_song_request_overwrites, _build_all_role_overwrites
 
         if ga_cat is None:
-            ga_cat = await guild.create_category("🏟️︱GRAND AUDITORIUM", overwrites=ga_ow())
+            ga_cat = await guild.create_category(
+                "🏟️︱GRAND AUDITORIUM", overwrites=_build_all_role_overwrites(guild, roles)
+            )
 
-        song_ch = discord.utils.get(ga_cat.text_channels, name="song-request")
+        song_ch = None
+        for ch in ga_cat.text_channels:
+            if "song-request" in ch.name:
+                song_ch = ch
+                break
         if not song_ch:
-            song_ch = None
-            for ch in ga_cat.text_channels:
-                if "song-request" in ch.name:
-                    song_ch = ch
-                    break
-        if not song_ch:
-            song_ch = await guild.create_text_channel("🎼︱song-request", category=ga_cat, overwrites=song_ow())
+            song_ch = await guild.create_text_channel(
+                "🎼︱song-request", category=ga_cat,
+                overwrites=_build_song_request_overwrites(guild, roles),
+            )
 
         vc = discord.utils.get(ga_cat.voice_channels, name=GRAND_AUDITORIUM_VC)
         if not vc:
-            vc = await guild.create_voice_channel(GRAND_AUDITORIUM_VC, category=ga_cat, overwrites=ga_ow())
+            vc = await guild.create_voice_channel(
+                GRAND_AUDITORIUM_VC, category=ga_cat,
+                overwrites=_build_all_role_overwrites(guild, roles),
+            )
 
         await interaction.followup.send(
-            f"✅ Music channels ready!\n"
-            f"• Text: {song_ch.mention}\n"
-            f"• Voice: **{vc.name}**\n\n"
+            f"✅ Music channels ready!\n• Text: {song_ch.mention}\n• Voice: **{vc.name}**\n\n"
             f"Use `/play <song name>` in {song_ch.mention} to get started.",
             ephemeral=True,
         )
 
-    # ── /queue command ─────────────────────────────────────────────────────────
     @app_commands.command(name="queue", description="Show the current music queue.")
     async def queue_cmd(self, interaction: discord.Interaction):
         state = get_state(interaction.guild_id)
@@ -686,14 +628,8 @@ class MusicCog(commands.Cog):
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # ── Auto-disconnect when voice channel is empty ────────────────────────────
     @commands.Cog.listener()
-    async def on_voice_state_update(
-        self,
-        member: discord.Member,
-        before: discord.VoiceState,
-        after: discord.VoiceState,
-    ):
+    async def on_voice_state_update(self, member, before, after):
         if member.bot:
             return
         guild = member.guild
