@@ -275,7 +275,7 @@ async def _build_server_inner(
         overwrites=_build_all_role_overwrites(guild, roles),
     )
     await guild.create_voice_channel(
-        "Grand Auditorium", category=ga_cat,
+        "😤︱CLASH-EQUITY ROOM", category=ga_cat,
         overwrites=_build_all_role_overwrites(guild, roles),
     )
 
