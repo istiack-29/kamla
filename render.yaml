@@ -1,9 +1,0 @@
-services:
-  - type: web
-    name: kamla-bot
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
-    aptPackages:
-      - ffmpeg
-      - libopus-dev

@@ -152,31 +152,6 @@ def _build_public_overwrites(guild):
     }
 
 
-def _build_song_request_overwrites(guild, roles):
-    """song-request: all KAMLA roles except VISITOR can view and send."""
-    ow = {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        guild.me: _bot_ow(guild),
-    }
-    for rn in KAMLA_ROLE_NAMES:
-        if rn not in roles:
-            continue
-        if rn == "VISITOR":
-            ow[roles[rn]] = discord.PermissionOverwrite(
-                view_channel=False, send_messages=False, read_message_history=False
-            )
-        else:
-            is_admin = rn in ADMIN_ROLE_NAMES
-            ow[roles[rn]] = discord.PermissionOverwrite(
-                view_channel=True,
-                read_message_history=True,
-                send_messages=False,
-                embed_links=True,
-                manage_messages=is_admin,
-            )
-    return ow
-
-
 def _room_category_ow(guild, roles):
     ow = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -286,7 +261,6 @@ async def _build_server_inner(
 
     ga_all_ow = _build_all_role_overwrites(guild, roles, send=True)
     ga_ann_ow = _build_announce_overwrites(guild, roles)
-    ga_song_ow = _build_song_request_overwrites(guild, roles)
     ga_cat = await guild.create_category(
         "🏟️︱GRAND AUDITORIUM", overwrites=_build_all_role_overwrites(guild, roles)
     )
@@ -296,8 +270,6 @@ async def _build_server_inner(
     await guild.create_text_channel("🎓︱break",        category=ga_cat, overwrites=ga_ann_ow)
     await guild.create_text_channel("🎓︱matchup",      category=ga_cat, overwrites=ga_ann_ow)
     await guild.create_text_channel("🎓︱ballot",       category=ga_cat, overwrites=ga_ann_ow)
-    # Music channels — VISITOR cannot see song-request
-    await guild.create_text_channel("🎼︱song-request", category=ga_cat, overwrites=ga_song_ow)
     await guild.create_voice_channel(
         "🏟️︱GRAND AUDITORIUM", category=ga_cat,
         overwrites=_build_all_role_overwrites(guild, roles),
@@ -506,11 +478,6 @@ async def _post_how_to_use(guild: discord.Guild) -> None:
         value="In **#all-in**, only **ORG / CAP / TABBY / Invited / Independent Adjudicator** "
               "can press **Push Back All** to pull everyone back from prep to the debate room. "
               "Text messages are not allowed.",
-        inline=False)
-    embed.add_field(name="🎵 Music",
-        value="In **🎼︱song-request**, use `/play <song name>` to search and queue music.\n"
-              "Music plays in the **Grand Auditorium** voice channel.\n"
-              "Only the requester, ORG, and CAP can control playback.",
         inline=False)
     await channel.send(embed=embed)
 

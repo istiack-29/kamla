@@ -18,7 +18,6 @@ COGS = [
     "timer_cog",
     "poi_cog",
     "allin_cog",
-    "music_cog",
 ]
 
 
@@ -45,13 +44,11 @@ class KamlaBot(commands.Bot):
         from allin_cog    import AllInView
         from settings_cog import SettingsView
         from setup_cog    import OnJoinView
-        from music_cog    import PlayerControlView
 
         self.add_view(RoleSelectView())
         self.add_view(AllInView())
         self.add_view(SettingsView())
         self.add_view(OnJoinView(installer_id=0))
-        self.add_view(PlayerControlView())
 
         try:
             synced = await self.tree.sync()
