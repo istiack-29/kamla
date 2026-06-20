@@ -18,6 +18,7 @@ COGS = [
     "timer_cog",
     "poi_cog",
     "allin_cog",
+    "music_cog",
 ]
 
 
@@ -40,15 +41,17 @@ class KamlaBot(commands.Bot):
             except Exception as e:
                 print(f"[KAMLA] Failed to load cog {cog}: {e}")
 
-        from roles_cog import RoleSelectView
-        from allin_cog import AllInView
+        from roles_cog    import RoleSelectView
+        from allin_cog    import AllInView
         from settings_cog import SettingsView
-        from setup_cog import OnJoinView
+        from setup_cog    import OnJoinView
+        from music_cog    import PlayerControlView
 
         self.add_view(RoleSelectView())
         self.add_view(AllInView())
         self.add_view(SettingsView())
         self.add_view(OnJoinView(installer_id=0))
+        self.add_view(PlayerControlView())
 
         try:
             synced = await self.tree.sync()
@@ -113,22 +116,17 @@ class KamlaBot(commands.Bot):
         )
 
     async def on_guild_channel_create(self, channel: discord.abc.GuildChannel) -> None:
-        """Auto-delete new channels when the server is locked."""
         guild = channel.guild
 
-        # Never delete the config channel or channels created during build
         if "kamla-config" in channel.name:
             return
 
-        # If bot created this channel (e.g. during /st build), leave it alone
         from server_builder import _building_guilds
         if guild.id in _building_guilds:
             return
 
-        # Check lock state
         cfg = config_manager.get_cached(guild.id)
         if not cfg:
-            # Fetch fresh if not cached (avoid blocking on API mid-event)
             try:
                 cfg = await asyncio.wait_for(config_manager.get_config(guild), timeout=3.0)
             except Exception:
@@ -137,13 +135,11 @@ class KamlaBot(commands.Bot):
         if not cfg.get("locked", False):
             return
 
-        # Server is locked — delete the channel and notify
         try:
             await channel.delete(reason="🔒 KAMLA — Server is locked. Channel auto-removed.")
         except Exception:
             pass
 
-        # Try to notify in the settings channel
         try:
             settings_ch = discord.utils.get(guild.text_channels, name="⚙️︱settings")
             if settings_ch and settings_ch.permissions_for(guild.me).send_messages:
