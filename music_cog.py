@@ -7,6 +7,27 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
+# Load Opus — required for Discord voice audio to actually transmit
+if not discord.opus.is_loaded():
+    _OPUS_PATHS = [
+        "libopus.so.0",
+        "libopus.so",
+        "/usr/lib/x86_64-linux-gnu/libopus.so.0",
+        "/usr/lib/aarch64-linux-gnu/libopus.so.0",
+        "/usr/lib/libopus.so.0",
+        "opus",
+    ]
+    for _path in _OPUS_PATHS:
+        try:
+            discord.opus.load_opus(_path)
+            print(f"[Music] Opus loaded from: {_path}")
+            break
+        except Exception:
+            continue
+    if not discord.opus.is_loaded():
+        print("[Music] WARNING: Opus could not be loaded — voice audio will NOT work! "
+              "Add 'libopus0' to your Render build command.")
+
 SONG_REQUEST_CHANNEL = "🎼︱song-request"
 GRAND_AUDITORIUM_VC  = "Grand Auditorium"
 
