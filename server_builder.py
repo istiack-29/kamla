@@ -401,9 +401,9 @@ async def _post_meet_developer(channel: discord.TextChannel) -> None:
     )
     view = discord.ui.View(timeout=None)
     view.add_item(discord.ui.Button(label="Developer Contact", style=discord.ButtonStyle.link,
-                                    url="https://istiack.pages.dev/#contact"))
+                                    url="https://istiack.ami.bd/#contact"))
     view.add_item(discord.ui.Button(label="Donate", style=discord.ButtonStyle.link,
-                                    url="https://istiack.pages.dev/#donate"))
+                                    url="https://istiack.ami.bd/#donate"))
     view.add_item(discord.ui.Button(label="Create Tournament", style=discord.ButtonStyle.link,
                                     url="https://kamla-bot.pages.dev"))
 
