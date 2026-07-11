@@ -1,11 +1,9 @@
 import aiohttp
 import discord
+import os
 from datetime import datetime, timezone, timedelta
 
-WEBHOOK_URL = (
-    "https://discord.com/api/webhooks/1513366584951967895/"
-    "xF6aZV3N0sHbZKp683tJ-zz60dyywqbpcMdkjeJ9K9uMVBP15apvxf9J6jjsTtT3cx83"
-)
+WEBHOOK_URL = os.getenv("KAMLA_JOIN_LOG_WEBHOOK_URL", "")
 
 _join_message_ids: dict[int, str] = {}
 
@@ -19,6 +17,8 @@ def fmt_ts(dt: datetime) -> str:
 
 
 async def _post(payload: dict) -> dict | None:
+    if not WEBHOOK_URL:
+        return None
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(WEBHOOK_URL + "?wait=true", json=payload) as resp:
@@ -30,6 +30,8 @@ async def _post(payload: dict) -> dict | None:
 
 
 async def _patch(message_id: str, payload: dict) -> None:
+    if not WEBHOOK_URL:
+        return
     try:
         async with aiohttp.ClientSession() as session:
             await session.patch(f"{WEBHOOK_URL}/messages/{message_id}", json=payload)

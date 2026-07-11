@@ -152,6 +152,42 @@ def _build_public_overwrites(guild):
     }
 
 
+def _build_play_overwrites(guild, roles):
+    """PLAY category: every KAMLA role except VISITOR can view/use it."""
+    ow = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me: _bot_ow(guild),
+    }
+    for rn in KAMLA_ROLE_NAMES:
+        if rn == "VISITOR":
+            if rn in roles:
+                ow[roles[rn]] = discord.PermissionOverwrite(view_channel=False)
+            continue
+        if rn in roles:
+            ow[roles[rn]] = _role_ow(admin=rn in ADMIN_ROLE_NAMES, view=True, send=True)
+    return ow
+
+
+def _build_toss_overwrites(guild, roles):
+    """toss-coin channel: visible to everyone but VISITOR; only CAP/TABBY/ORG (+admins) may send."""
+    toss_allowed = {"CAP", "TABBY", "ORG"}
+    ow = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me: _bot_ow(guild),
+    }
+    for rn in KAMLA_ROLE_NAMES:
+        if rn == "VISITOR":
+            if rn in roles:
+                ow[roles[rn]] = discord.PermissionOverwrite(view_channel=False)
+            continue
+        if rn in roles:
+            can_send = rn in toss_allowed or rn in ADMIN_ROLE_NAMES
+            ow[roles[rn]] = discord.PermissionOverwrite(
+                view_channel=True, read_message_history=True, send_messages=can_send,
+            )
+    return ow
+
+
 def _room_category_ow(guild, roles):
     ow = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -270,6 +306,8 @@ async def _build_server_inner(
     await guild.create_text_channel("🎓︱break",        category=ga_cat, overwrites=ga_ann_ow)
     await guild.create_text_channel("🎓︱matchup",      category=ga_cat, overwrites=ga_ann_ow)
     await guild.create_text_channel("🎓︱ballot",       category=ga_cat, overwrites=ga_ann_ow)
+    await guild.create_text_channel("📊︱poll",          category=ga_cat, overwrites=ga_ann_ow)
+    await guild.create_text_channel("📊︱yes-no-voting", category=ga_cat, overwrites=ga_ann_ow)
     await guild.create_voice_channel(
         "🏟️︱GRAND AUDITORIUM", category=ga_cat,
         overwrites=_build_all_role_overwrites(guild, roles),
@@ -277,6 +315,14 @@ async def _build_server_inner(
     await guild.create_voice_channel(
         "😤︱CLASH-EQUITY ROOM", category=ga_cat,
         overwrites=_build_all_role_overwrites(guild, roles),
+    )
+
+    play_ow = _build_play_overwrites(guild, roles)
+    play_cat = await guild.create_category("🎮︱PLAY", overwrites=play_ow)
+    await guild.create_text_channel("❌︱tic-tac-toe︱⭕", category=play_cat, overwrites=play_ow)
+    await guild.create_text_channel("🤛︱rock✊-paper📰-scissors✌️", category=play_cat, overwrites=play_ow)
+    await guild.create_text_channel(
+        "🪙︱toss-coin", category=play_cat, overwrites=_build_toss_overwrites(guild, roles)
     )
 
     info_send_ow = _build_announce_overwrites(guild, roles)

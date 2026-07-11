@@ -18,6 +18,9 @@ COGS = [
     "timer_cog",
     "poi_cog",
     "allin_cog",
+    "games_cog",
+    "toss_cog",
+    "polls_cog",
 ]
 
 
@@ -49,6 +52,10 @@ class KamlaBot(commands.Bot):
         self.add_view(AllInView())
         self.add_view(SettingsView())
         self.add_view(OnJoinView(installer_id=0))
+        # NOTE: games_cog / polls_cog views are intentionally NOT registered here.
+        # Their state (active matches, active polls) is memory-only by design, so
+        # a restart loses it along with the match/poll; buttons left over from a
+        # previous process will simply show "This interaction failed" — expected.
 
         try:
             synced = await self.tree.sync()
