@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 import discord
 from discord import app_commands
 from discord.ext import commands
+import webhook
 
 TTT_CHANNEL_NAME = "❌︱tic-tac-toe︱⭕"
 RPS_CHANNEL_NAME = "🤛︱rock✊-paper📰-scissors✌️"
@@ -190,6 +191,14 @@ async def _finish_ttt(game: TicTacToeGame, view: "TicTacToeView", interaction: d
     _clear_busy(game.guild_id, *game.symbol.keys())
     embed = _build_ttt_embed(game, result_text=result_text)
     await interaction.response.edit_message(embed=embed, view=view)
+    guild = interaction.guild
+    if guild and "wins" in result_text:
+        winner = interaction.user
+        loser_id = game.other(winner.id)
+        loser = guild.get_member(loser_id)
+        asyncio.create_task(webhook.log_game_result(guild, "Tic-Tac-Toe", winner, loser, result_text))
+    elif guild and "DRAW" in result_text:
+        asyncio.create_task(webhook.log_game_result(guild, "Tic-Tac-Toe", None, None, "DRAW"))
 
 
 class TTTCellButton(discord.ui.Button):
@@ -329,6 +338,7 @@ async def _handle_ttt_challenge(interaction: discord.Interaction, opponent: disc
     view = TTTChallengeView(challenger, opponent)
     msg = await _send_challenge_and_cleanup_response(interaction, embed, view)
     view.message = msg
+    asyncio.create_task(webhook.log_game_challenge(guild, "Tic-Tac-Toe", challenger, opponent))
 
 
 async def _handle_ttt_challenge_from_message(message: discord.Message, opponent: discord.Member) -> None:
@@ -360,6 +370,7 @@ async def _handle_ttt_challenge_from_message(message: discord.Message, opponent:
     view = TTTChallengeView(challenger, opponent)
     msg = await message.channel.send(embed=embed, view=view)
     view.message = msg
+    asyncio.create_task(webhook.log_game_challenge(guild, "Tic-Tac-Toe", challenger, opponent))
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -431,6 +442,13 @@ async def _resolve_rps_round(game: RPSGame, view: "RPSChoiceView") -> None:
         for child in view.children:
             child.disabled = True
         _clear_busy(game.guild_id, p1.id, p2.id)
+        top = max(game.players, key=lambda m: game.score[m.id])
+        bot_player = min(game.players, key=lambda m: game.score[m.id])
+        score_str = f"{_round_label(game.score[top.id])}-{_round_label(game.score[bot_player.id])}"
+        asyncio.create_task(webhook.log_game_result(
+            game.message.guild, "Rock-Paper-Scissors", top, bot_player,
+            f"{top.display_name} wins {score_str}"
+        ))
 
     embed = _build_rps_embed(game)
     try:
@@ -559,6 +577,7 @@ async def _handle_rps_challenge_from_message(message: discord.Message, opponent:
     view = RPSChallengeView(challenger, opponent, times)
     msg = await message.channel.send(embed=embed, view=view)
     view.message = msg
+    asyncio.create_task(webhook.log_game_challenge(guild, "Rock-Paper-Scissors", challenger, opponent, f"{times} round(s)"))
 
 
 async def _handle_rps_challenge(interaction: discord.Interaction, opponent: discord.Member, times: int) -> None:
@@ -589,6 +608,7 @@ async def _handle_rps_challenge(interaction: discord.Interaction, opponent: disc
     view = RPSChallengeView(challenger, opponent, times)
     msg = await _send_challenge_and_cleanup_response(interaction, embed, view)
     view.message = msg
+    asyncio.create_task(webhook.log_game_challenge(guild, "Rock-Paper-Scissors", challenger, opponent, f"{times} round(s)"))
 
 
 # ──────────────────────────────────────────────────────────────────────────

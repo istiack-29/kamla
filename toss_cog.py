@@ -9,12 +9,14 @@ toss_cog.py — Coin toss feature for KAMLA.
 No database is used; results are ephemeral and not stored anywhere.
 """
 
+import asyncio
 import random
 from datetime import datetime, timezone
 
 import discord
 from discord import app_commands
 from discord.ext import commands
+import webhook
 
 TOSS_CHANNEL_NAME = "🪙︱toss-coin"
 GA_TEXT_CHANNEL_NAME = "📨︱ga-text"
@@ -84,6 +86,7 @@ class TossCog(commands.Cog):
                 await message.channel.send(embed=_build_toss_embed(message.author, result))
             except Exception:
                 pass
+            asyncio.create_task(webhook.log_toss(message.guild, message.author, result))
             return
 
         try:
@@ -109,6 +112,7 @@ class TossCog(commands.Cog):
 
         result = random.choice(["HEADS", "TAILS"])
         await interaction.response.send_message(embed=_build_toss_embed(interaction.user, result))
+        asyncio.create_task(webhook.log_toss(interaction.guild, interaction.user, result))
 
 
 async def setup(bot: commands.Bot):

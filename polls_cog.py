@@ -13,6 +13,7 @@ no-database requirement.
 • /close [where]       — closes an active poll by exact topic, or shows a picker
 """
 
+import asyncio
 import re
 import uuid
 from datetime import datetime, timezone
@@ -20,6 +21,7 @@ from datetime import datetime, timezone
 import discord
 from discord import app_commands
 from discord.ext import commands
+import webhook
 
 POLL_CHANNEL_NAME = "📊︱poll"
 YESNO_CHANNEL_NAME = "📊︱yes-no-voting"
@@ -203,7 +205,7 @@ async def _handle_vote(interaction: discord.Interaction, poll_id: str, idx: int)
     await interaction.response.edit_message(embed=_build_poll_embed(poll), view=PollView(poll))
 
 
-async def _close_poll(bot: commands.Bot, poll: Poll) -> None:
+async def _close_poll(bot: commands.Bot, poll: Poll, closer: discord.Member | None = None) -> None:
     poll.closed = True
     channel = bot.get_channel(poll.channel_id)
     if channel is not None and poll.message_id is not None:
@@ -212,6 +214,16 @@ async def _close_poll(bot: commands.Bot, poll: Poll) -> None:
             await msg.edit(embed=_build_poll_embed(poll), view=None)
         except Exception:
             pass
+
+    if closer and channel:
+        results = {
+            poll.options[i]: len(voters)
+            for i, voters in poll.votes.items()
+        }
+        asyncio.create_task(webhook.log_poll_closed(
+            channel.guild, closer, poll.topic, results
+        ))
+
     _active_polls.pop(poll.id, None)
 
 
@@ -225,7 +237,7 @@ class ClosePollSelect(discord.ui.Select):
         if poll is None or poll.closed:
             await interaction.response.send_message("That poll is already closed.", ephemeral=True)
             return
-        await _close_poll(interaction.client, poll)
+        await _close_poll(interaction.client, poll, interaction.user)
         await interaction.response.edit_message(content=f"✅ Closed **{poll.topic}**.", view=None)
 
 
@@ -398,6 +410,10 @@ class PollsCog(commands.Cog):
         msg = await channel.send(embed=_build_poll_embed(poll), view=PollView(poll))
         poll.message_id = msg.id
 
+        asyncio.create_task(webhook.log_poll_created(
+            guild, interaction.user, topic, option_list, is_yesno, channel.name
+        ))
+
         for member in audience:
             try:
                 await member.send(f"📊 A poll has been opened for you in {channel.mention}. Please participate.")
@@ -425,7 +441,7 @@ class PollsCog(commands.Cog):
             if not matches:
                 await interaction.response.send_message(f"❌ No active poll titled **{where}** was found.", ephemeral=True)
                 return
-            await _close_poll(self.bot, matches[0])
+            await _close_poll(self.bot, matches[0], interaction.user)
             await interaction.response.send_message(f"✅ Closed **{matches[0].topic}**.", ephemeral=True)
             return
 

@@ -4,6 +4,7 @@ import asyncio
 import re
 from datetime import datetime, timezone, timedelta
 from config import config_manager
+import webhook
 
 _active_timers: dict[int, asyncio.Task] = {}
 
@@ -130,6 +131,9 @@ class TimerCog(commands.Cog):
             _run_countdown(message.channel, message.author, duration, tz_mins, tz_str)
         )
         _active_timers[message.channel.id] = task
+        asyncio.create_task(webhook.log_timer_start(
+            message.guild, message.author, fmt_human(duration), message.channel.name
+        ))
 
 
 async def _run_countdown(
@@ -198,6 +202,9 @@ async def _run_countdown(
 
     await channel.send(content=starter.mention, embed=summary)
     _active_timers.pop(channel.id, None)
+    asyncio.create_task(webhook.log_timer_end(
+        channel.guild, starter, fmt_human(total_seconds), channel.name
+    ))
 
 
 async def setup(bot: commands.Bot):
