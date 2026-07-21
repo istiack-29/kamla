@@ -331,6 +331,37 @@ async def _handle_ttt_challenge(interaction: discord.Interaction, opponent: disc
     view.message = msg
 
 
+async def _handle_ttt_challenge_from_message(message: discord.Message, opponent: discord.Member) -> None:
+    """Message-based TTT challenge — used when someone types 'play @user'
+    in the TTT channel without a slash command (e.g. Debater role)."""
+    guild = message.guild
+    challenger = message.author
+
+    if opponent.id == challenger.id:
+        await message.channel.send(f"{challenger.mention} ⛔ You cannot challenge yourself.", delete_after=6)
+        return
+    if opponent.bot:
+        await message.channel.send(f"{challenger.mention} ⛔ You cannot challenge a bot.", delete_after=6)
+        return
+    if _is_busy(guild.id, challenger.id):
+        await message.channel.send(
+            f"{challenger.mention} ⛔ You are already in a match or have a pending challenge.", delete_after=6
+        )
+        return
+    if _is_busy(guild.id, opponent.id):
+        await message.channel.send(
+            f"⛔ {opponent.mention} is already in a match or has a pending challenge.", delete_after=6
+        )
+        return
+
+    _mark_busy(guild.id, challenger.id, opponent.id)
+
+    embed = _challenge_embed(challenger, opponent, "❌⭕ Tic-Tac-Toe Challenge")
+    view = TTTChallengeView(challenger, opponent)
+    msg = await message.channel.send(embed=embed, view=view)
+    view.message = msg
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Rock-Paper-Scissors
 # ──────────────────────────────────────────────────────────────────────────
@@ -539,8 +570,13 @@ class GamesCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        """/play never appears as a text message — any real message in these
-        channels is invalid and gets removed with a short-lived warning."""
+        """Handles messages in game channels.
+
+        • If the message matches 'play @user' (case-insensitive) in the TTT
+          channel it starts a challenge — no slash command needed (works for
+          roles that lack slash-command permission, e.g. Debater).
+        • Any other non-bot message is deleted with a short-lived warning.
+        """
         if message.author.bot or not message.guild:
             return
         if not isinstance(message.channel, discord.TextChannel):
@@ -550,6 +586,23 @@ class GamesCog(commands.Cog):
         if name not in (TTT_CHANNEL_NAME, RPS_CHANNEL_NAME):
             return
 
+        # ── Check for "play @user" / "Play @user" trigger ──────────────────
+        content = message.content.strip()
+        if (
+            name == TTT_CHANNEL_NAME
+            and content.lower().startswith("play ")
+            and message.mentions
+        ):
+            opponent = message.mentions[0]
+            # Delete the trigger message so the channel stays clean
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            await _handle_ttt_challenge_from_message(message, opponent)
+            return
+
+        # ── Any other message is not allowed — delete and warn ──────────────
         try:
             await message.delete()
         except Exception:
