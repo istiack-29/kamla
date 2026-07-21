@@ -529,6 +529,38 @@ class RPSChallengeView(discord.ui.View):
         await interaction.response.edit_message(embed=embed, view=self)
 
 
+async def _handle_rps_challenge_from_message(message: discord.Message, opponent: discord.Member, times: int) -> None:
+    """Message-based RPS challenge — used when someone types 'play @user' or
+    'play @user 3' in the RPS channel without a slash command."""
+    guild = message.guild
+    challenger = message.author
+
+    if opponent.id == challenger.id:
+        await message.channel.send(f"{challenger.mention} ⛔ You cannot challenge yourself.", delete_after=6)
+        return
+    if opponent.bot:
+        await message.channel.send(f"{challenger.mention} ⛔ You cannot challenge a bot.", delete_after=6)
+        return
+    if _is_busy(guild.id, challenger.id):
+        await message.channel.send(
+            f"{challenger.mention} ⛔ You are already in a match or have a pending challenge.", delete_after=6
+        )
+        return
+    if _is_busy(guild.id, opponent.id):
+        await message.channel.send(
+            f"⛔ {opponent.mention} is already in a match or has a pending challenge.", delete_after=6
+        )
+        return
+
+    _mark_busy(guild.id, challenger.id, opponent.id)
+
+    embed = _challenge_embed(challenger, opponent, "✊📰✌️ Rock-Paper-Scissors Challenge")
+    embed.add_field(name="Rounds", value=str(times), inline=True)
+    view = RPSChallengeView(challenger, opponent, times)
+    msg = await message.channel.send(embed=embed, view=view)
+    view.message = msg
+
+
 async def _handle_rps_challenge(interaction: discord.Interaction, opponent: discord.Member, times: int) -> None:
     guild = interaction.guild
     challenger = interaction.user
@@ -572,10 +604,11 @@ class GamesCog(commands.Cog):
     async def on_message(self, message: discord.Message):
         """Handles messages in game channels.
 
-        • If the message matches 'play @user' (case-insensitive) in the TTT
-          channel it starts a challenge — no slash command needed (works for
-          roles that lack slash-command permission, e.g. Debater).
-        • Any other non-bot message is deleted with a short-lived warning.
+        • 'play @user'    in TTT channel  → Tic-Tac-Toe challenge
+        • 'play @user'    in RPS channel  → Rock-Paper-Scissors (1 round)
+        • 'play @user N'  in RPS channel  → Rock-Paper-Scissors (N rounds, 2-20)
+        Works for roles without slash-command permission (e.g. Debater).
+        Any other message is deleted with a short-lived warning.
         """
         if message.author.bot or not message.guild:
             return
@@ -586,20 +619,39 @@ class GamesCog(commands.Cog):
         if name not in (TTT_CHANNEL_NAME, RPS_CHANNEL_NAME):
             return
 
-        # ── Check for "play @user" / "Play @user" trigger ──────────────────
+        # ── Check for "play @user" / "Play @user [N]" trigger ──────────────
         content = message.content.strip()
-        if (
-            name == TTT_CHANNEL_NAME
-            and content.lower().startswith("play ")
-            and message.mentions
-        ):
+        if content.lower().startswith("play ") and message.mentions:
             opponent = message.mentions[0]
-            # Delete the trigger message so the channel stays clean
+
             try:
                 await message.delete()
             except Exception:
                 pass
-            await _handle_ttt_challenge_from_message(message, opponent)
+
+            if name == TTT_CHANNEL_NAME:
+                await _handle_ttt_challenge_from_message(message, opponent)
+
+            elif name == RPS_CHANNEL_NAME:
+                # Parse optional round count: "play @user 3"
+                # Strip the "play " prefix and the mention(s), grab any leftover number
+                parts = content.split()
+                times = 1
+                for part in parts:
+                    if part.isdigit():
+                        val = int(part)
+                        if 2 <= val <= 20:
+                            times = val
+                        elif val == 1:
+                            times = 1
+                        else:
+                            await message.channel.send(
+                                f"{message.author.mention} ⚠️ Rounds must be between 2 and 20.",
+                                delete_after=6,
+                            )
+                            return
+                        break
+                await _handle_rps_challenge_from_message(message, opponent, times)
             return
 
         # ── Any other message is not allowed — delete and warn ──────────────
