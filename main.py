@@ -21,6 +21,7 @@ COGS = [
     "games_cog",
     "toss_cog",
     "polls_cog",
+    "welcome_cog",
 ]
 
 

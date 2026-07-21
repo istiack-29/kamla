@@ -265,9 +265,39 @@ class YesNoAskView(discord.ui.View):
         await self._finish(interaction, False)
 
 
+POLL_FILTER_MSG = "⛔ এই চ্যানেলটি শুধুমাত্র ভোটিং-এর জন্য। অন্য কোনো মেসেজ পাঠাবেন না।"
+YESNO_FILTER_MSG = "⛔ এই চ্যানেলটি শুধুমাত্র Yes/No ভোটিং-এর জন্য। অন্য কোনো মেসেজ পাঠাবেন না।"
+
+
 class PollsCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message) -> None:
+        """Delete any plain text message in poll/yes-no channels and warn the sender."""
+        if message.author.bot or not message.guild:
+            return
+        if not isinstance(message.channel, discord.TextChannel):
+            return
+
+        name = message.channel.name
+        if name not in (POLL_CHANNEL_NAME, YESNO_CHANNEL_NAME):
+            return
+
+        # Allow only bot-posted embeds (poll cards); delete everything else
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        warning = POLL_FILTER_MSG if name == POLL_CHANNEL_NAME else YESNO_FILTER_MSG
+        try:
+            await message.channel.send(
+                f"{message.author.mention} {warning}", delete_after=6
+            )
+        except Exception:
+            pass
 
     @app_commands.command(name="newpoll", description="Create a poll or yes/no vote in this channel.")
     @app_commands.describe(
