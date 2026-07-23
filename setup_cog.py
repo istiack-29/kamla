@@ -110,7 +110,7 @@ async def _do_build(interaction: discord.Interaction, setup_data: dict) -> None:
         # ── Edit webhook log ──────────────────────────────────────────────────
         from webhook import edit_join_log
         cfg = await config_manager.get_config(guild)
-        await edit_join_log(guild, cfg, invite_url)
+        await edit_join_log(guild, cfg)
 
         # ── Completion report ─────────────────────────────────────────────────
         embed = discord.Embed(title="✅ Tournament Server Ready!", color=discord.Color.green())

@@ -4,7 +4,6 @@ import re
 from discord.ext import commands
 from datetime import datetime, timezone, timedelta
 from config import config_manager
-import webhook
 
 
 def _get_tz_offset(tz_str: str) -> int:
@@ -95,7 +94,6 @@ class PoiCog(commands.Cog):
             await message.channel.send(embed=embed)
         except Exception:
             pass
-        asyncio.create_task(webhook.log_poi(message.author))
 
 
 async def setup(bot: commands.Bot):

@@ -2,8 +2,6 @@ import discord
 from discord.ext import commands
 import asyncio
 from config import ADMIN_ROLE_NAMES
-import webhook
-
 ALLOWED_ROLES = {
     "ORG", "CAP", "TABBY",
     "INVITED ADJUDICATOR", "INDEPENDENT ADJUDICATOR",
@@ -100,9 +98,6 @@ class AllInView(discord.ui.View):
             parts.append(f"⚠️ Failed to move {failed} member(s) (no permission or not in voice).")
 
         await interaction.followup.send("\n".join(parts), ephemeral=True)
-        asyncio.create_task(webhook.log_allin(
-            interaction.guild, interaction.user, moved, debate_room.name
-        ))
 
 
 class AllInCog(commands.Cog):

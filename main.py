@@ -120,19 +120,14 @@ class KamlaBot(commands.Bot):
             view=OnJoinView(installer_id=installer.id if installer else 0),
         )
 
-    async def on_voice_state_update(
-        self,
-        member: discord.Member,
-        before: discord.VoiceState,
-        after: discord.VoiceState,
-    ) -> None:
-        from webhook import log_voice_join, log_voice_leave, log_voice_move
-        if before.channel is None and after.channel is not None:
-            asyncio.create_task(log_voice_join(member, after.channel))
-        elif before.channel is not None and after.channel is None:
-            asyncio.create_task(log_voice_leave(member, before.channel))
-        elif before.channel is not None and after.channel is not None and before.channel.id != after.channel.id:
-            asyncio.create_task(log_voice_move(member, before.channel, after.channel))
+    async def on_guild_remove(self, guild: discord.Guild) -> None:
+        from webhook import mark_guild_deleted
+        asyncio.create_task(mark_guild_deleted(guild))
+
+    async def on_member_join(self, member: discord.Member) -> None:
+        from webhook import edit_join_log
+        cfg = config_manager.get_cached(member.guild.id) or {}
+        asyncio.create_task(edit_join_log(member.guild, cfg))
 
     async def on_guild_channel_create(self, channel: discord.abc.GuildChannel) -> None:
         guild = channel.guild
@@ -152,17 +147,12 @@ class KamlaBot(commands.Bot):
                 return
 
         if not cfg.get("locked", False):
-            from webhook import log_channel_create
-            asyncio.create_task(log_channel_create(channel, auto_deleted=False))
             return
 
         try:
             await channel.delete(reason="🔒 KAMLA — Server is locked. Channel auto-removed.")
         except Exception:
             pass
-
-        from webhook import log_channel_create
-        asyncio.create_task(log_channel_create(channel, auto_deleted=True))
 
         try:
             settings_ch = discord.utils.get(guild.text_channels, name="⚙️︱settings")
@@ -176,9 +166,6 @@ class KamlaBot(commands.Bot):
             pass
 
     async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel) -> None:
-        if "kamla-config" not in channel.name:
-            from webhook import log_channel_delete
-            asyncio.create_task(log_channel_delete(channel))
         if "kamla-config" in channel.name:
             guild = channel.guild
             cached = config_manager.get_cached(guild.id)
@@ -194,6 +181,13 @@ class KamlaBot(commands.Bot):
 
     async def on_member_remove(self, member: discord.Member) -> None:
         guild = member.guild
+
+        # Update live member count in webhook embed
+        from webhook import edit_join_log
+        cfg = config_manager.get_cached(guild.id) or {}
+        asyncio.create_task(edit_join_log(guild, cfg))
+
+        # Clean up assign messages
         assign_cat = discord.utils.get(guild.categories, name="🛅︱ASSIGN")
         if assign_cat is None:
             return

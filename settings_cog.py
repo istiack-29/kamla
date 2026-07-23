@@ -3,7 +3,7 @@ import discord
 from discord.ext import commands
 from datetime import datetime, timezone
 from config import config_manager, ADMIN_ROLE_NAMES
-import webhook
+from webhook import edit_join_log
 
 
 def _is_admin(interaction: discord.Interaction) -> bool:
@@ -84,9 +84,7 @@ class SettingsView(discord.ui.View):
         await _create_rooms(guild, roles, fmt, 1, start_index=new_count)
 
         cfg = await config_manager.update_config(guild, rooms=new_count)
-        asyncio.create_task(webhook.log_settings_change(
-            guild, interaction.user, {"Rooms": (str(current), str(new_count))}
-        ))
+        asyncio.create_task(edit_join_log(guild, cfg))
         await _refresh_panel(interaction, cfg, f"✅ Room **{new_count:02d}** added.")
 
     @discord.ui.button(label="➖ Remove Room", style=discord.ButtonStyle.danger,
@@ -116,9 +114,7 @@ class SettingsView(discord.ui.View):
                 pass
 
         cfg = await config_manager.update_config(guild, rooms=current - 1)
-        asyncio.create_task(webhook.log_settings_change(
-            guild, interaction.user, {"Rooms": (str(current), str(current - 1))}
-        ))
+        asyncio.create_task(edit_join_log(guild, cfg))
         await _refresh_panel(interaction, cfg, f"✅ Room **{current:02d}** removed.")
 
     @discord.ui.button(label="🔄 Switch Format", style=discord.ButtonStyle.primary,
@@ -138,9 +134,7 @@ class SettingsView(discord.ui.View):
         await switch_format_rooms(guild, new_fmt, rooms)
 
         cfg = await config_manager.update_config(guild, format=new_fmt)
-        asyncio.create_task(webhook.log_settings_change(
-            guild, interaction.user, {"Format": (current.upper(), new_fmt.upper())}
-        ))
+        asyncio.create_task(edit_join_log(guild, cfg))
 
         prep_info = "4 prep rooms × 2 max" if new_fmt == "bp" else "2 prep rooms × 3 max"
         await _refresh_panel(
@@ -170,7 +164,7 @@ class SettingsView(discord.ui.View):
         else:
             note = "🔓 **Server is now UNLOCKED.** Members may create channels normally."
 
-        asyncio.create_task(webhook.log_lock_change(guild, new_locked, interaction.user))
+        asyncio.create_task(edit_join_log(guild, cfg))
         await _refresh_panel(interaction, cfg, note)
 
 

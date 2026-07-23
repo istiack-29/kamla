@@ -6,12 +6,10 @@ the server. The embed shows the member's avatar, a personalised greeting,
 role instructions, and a quick-start channel guide.
 """
 
-import asyncio
 from datetime import datetime, timezone
 
 import discord
 from discord.ext import commands
-import webhook
 
 WELCOME_CHANNEL_NAME = "👋🏻︱welcome"
 
@@ -124,11 +122,6 @@ class WelcomeCog(commands.Cog):
         except discord.Forbidden:
             pass
 
-        asyncio.create_task(webhook.log_member_join(member))
-
-    @commands.Cog.listener()
-    async def on_member_remove(self, member: discord.Member) -> None:
-        asyncio.create_task(webhook.log_member_leave(member))
 
 
 async def setup(bot: commands.Bot):
