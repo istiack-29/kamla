@@ -15,6 +15,7 @@ COGS = [
     "settings_cog",
     "roles_cog",
     "assign_cog",
+    "dm_notify_cog",
     "timer_cog",
     "poi_cog",
     "allin_cog",
