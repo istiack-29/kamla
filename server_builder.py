@@ -84,6 +84,14 @@ def _role_ow(admin: bool = False, view: bool = True, send: bool = True) -> disco
 
 
 async def wipe_server(guild: discord.Guild) -> None:
+    """
+    Completely wipe the server — all channels, categories, and roles.
+    Keeps only: kamla-config channel, @everyone, and the bot's own managed role.
+    Adds guild to _building_guilds so the channel guard does not fire during wipe.
+    """
+    _building_guilds.add(guild.id)
+
+    # Delete every channel/category except kamla-config
     for channel in list(guild.channels):
         if "kamla-config" in channel.name:
             continue
@@ -93,10 +101,11 @@ async def wipe_server(guild: discord.Guild) -> None:
         except Exception:
             pass
 
-    bot_role = guild.me.top_role
-    protected = {guild.default_role.id, bot_role.id}
-    for role in list(guild.roles):
-        if role.id in protected or role.name in KAMLA_ROLE_NAMES:
+    # Delete every role except @everyone and the bot's own managed role
+    bot_managed_ids = {r.id for r in guild.me.roles if r.managed}
+    protected = {guild.default_role.id} | bot_managed_ids
+    for role in sorted(guild.roles, key=lambda r: r.position):
+        if role.id in protected:
             continue
         try:
             await role.delete(reason="KAMLA server wipe")
