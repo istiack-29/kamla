@@ -19,6 +19,49 @@ ROLE_CONFIG = [
 
 ORG_ACCESS_ROLES = ["ORG", "CAP", "TABBY", "EQUITY", "INVITED ADJUDICATOR"]
 
+# ── Protected structure ────────────────────────────────────────────────────────
+
+PROTECTED_CATEGORIES = {
+    "⚜️︱ORGCOM",
+    "🛅︱ASSIGN",
+    "🏟️︱GRAND AUDITORIUM",
+    "🎮︱PLAY",
+    "ℹ️︱INFORMATION",
+}
+
+PROTECTED_TOP_LEVEL_CHANNELS = {
+    "👐🏻︱meet-the-developer",
+    "👋🏻︱welcome",
+    "❓︱get-role",
+    "🦧︱how-to-use-this-server",
+}
+
+CATEGORY_CHANNEL_STRUCTURE: dict[str, dict] = {
+    "⚜️︱ORGCOM": {
+        "text":  ["⚙️︱settings", "🏴︱org", "📂︱document"],
+        "voice": ["ORG", "Control Room"],
+    },
+    "🛅︱ASSIGN": {
+        "text":  ["org", "cap", "tabby", "equity", "debater", "visitor",
+                  "independent-adjudicator", "invited-adjudicator"],
+        "voice": [],
+    },
+    "🏟️︱GRAND AUDITORIUM": {
+        "text":  ["📨︱ga-text", "🎓︱motion", "🎓︱announcement", "🎓︱break",
+                  "🎓︱matchup", "🎓︱ballot", "📊︱poll", "📊︱yes-no-voting"],
+        "voice": ["🏟️︱GRAND AUDITORIUM", "😤︱CLASH-EQUITY ROOM"],
+    },
+    "🎮︱PLAY": {
+        "text":  ["❌︱tic-tac-toe︱⭕", "🤛︱rock✊-paper📰-scissors✌️", "🪙︱toss-coin"],
+        "voice": [],
+    },
+    "ℹ️︱INFORMATION": {
+        "text":  ["schedule", "important-forms", "debater-briefing",
+                  "judge-briefing", "equity-briefing"],
+        "voice": [],
+    },
+}
+
 
 def _allow(*perms) -> discord.PermissionOverwrite:
     ow = discord.PermissionOverwrite()
@@ -532,3 +575,186 @@ async def _post_settings_panel(channel: discord.TextChannel, cfg: dict) -> None:
     from settings_cog import build_settings_embed, SettingsView
     embed = build_settings_embed(cfg)
     await channel.send(embed=embed, view=SettingsView())
+
+
+# ── Channel / Category Restoration ────────────────────────────────────────────
+
+async def restore_if_protected(
+    guild: discord.Guild,
+    channel_name: str,
+    is_category: bool,
+) -> bool:
+    """
+    Called from on_guild_channel_delete.
+    Returns True if the channel/category was protected and has been restored.
+    Runs in the background — fire-and-forget via asyncio.create_task.
+    """
+    if is_category:
+        if channel_name not in PROTECTED_CATEGORIES:
+            return False
+        await asyncio.sleep(1)  # brief pause before recreating
+        await _restore_category(guild, channel_name)
+        return True
+    else:
+        if channel_name in PROTECTED_TOP_LEVEL_CHANNELS:
+            await asyncio.sleep(1)
+            await _restore_top_level_channel(guild, channel_name)
+            return True
+        # Check whether it belongs to a protected category
+        for cat_name, structure in CATEGORY_CHANNEL_STRUCTURE.items():
+            if channel_name in structure["text"] or channel_name in structure["voice"]:
+                cat = discord.utils.get(guild.categories, name=cat_name)
+                if cat is None:
+                    # The whole category is also gone — let on_guild_channel_delete
+                    # handle that separately.
+                    return False
+                await asyncio.sleep(1)
+                roles = {r.name: r for r in guild.roles}
+                is_voice = channel_name in structure["voice"]
+                await _restore_single_channel(guild, roles, cat, cat_name, channel_name, is_voice)
+                return True
+    return False
+
+
+async def _restore_category(guild: discord.Guild, cat_name: str) -> None:
+    """Recreate a protected category and ALL its missing channels."""
+    roles = {r.name: r for r in guild.roles}
+
+    # Compute the right overwrites for this category
+    ow = _category_overwrites(guild, roles, cat_name)
+
+    # Check if it already got recreated while we were sleeping
+    existing_cat = discord.utils.get(guild.categories, name=cat_name)
+    if existing_cat is None:
+        try:
+            existing_cat = await guild.create_category(cat_name, overwrites=ow)
+            print(f"[Guard] Recreated category: {cat_name}")
+        except Exception as e:
+            print(f"[Guard] Failed to recreate category {cat_name}: {e}")
+            return
+
+    structure = CATEGORY_CHANNEL_STRUCTURE.get(cat_name, {"text": [], "voice": []})
+    existing_names = {ch.name for ch in existing_cat.channels}
+
+    for ch_name in structure["text"]:
+        if ch_name not in existing_names:
+            await _restore_single_channel(guild, roles, existing_cat, cat_name, ch_name, False)
+            await asyncio.sleep(0.3)
+
+    for ch_name in structure["voice"]:
+        if ch_name not in existing_names:
+            await _restore_single_channel(guild, roles, existing_cat, cat_name, ch_name, True)
+            await asyncio.sleep(0.3)
+
+    # Re-post content for channels that need it
+    await _repost_channel_content(guild, cat_name, existing_cat)
+
+
+async def _restore_top_level_channel(guild: discord.Guild, ch_name: str) -> None:
+    """Recreate a protected top-level (no-category) channel."""
+    existing = discord.utils.get(guild.text_channels, name=ch_name)
+    if existing:
+        return  # already back
+
+    pub_ow = _build_public_overwrites(guild)
+    try:
+        new_ch = await guild.create_text_channel(ch_name, overwrites=pub_ow)
+        print(f"[Guard] Recreated top-level channel: {ch_name}")
+    except Exception as e:
+        print(f"[Guard] Failed to recreate channel {ch_name}: {e}")
+        return
+
+    # Re-post embedded content
+    if ch_name == "👐🏻︱meet-the-developer":
+        await _post_meet_developer(new_ch)
+    elif ch_name == "👋🏻︱welcome":
+        await _post_welcome(guild)
+    elif ch_name == "❓︱get-role":
+        await _post_get_role(guild)
+    elif ch_name == "🦧︱how-to-use-this-server":
+        await _post_how_to_use(guild)
+
+
+async def _restore_single_channel(
+    guild: discord.Guild,
+    roles: dict,
+    cat: discord.CategoryChannel,
+    cat_name: str,
+    ch_name: str,
+    is_voice: bool,
+) -> None:
+    """Recreate one channel inside a protected category."""
+    existing = discord.utils.get(
+        cat.voice_channels if is_voice else cat.text_channels, name=ch_name
+    )
+    if existing:
+        return  # already back
+
+    ow = _channel_overwrites(guild, roles, cat_name, ch_name)
+    try:
+        if is_voice:
+            await guild.create_voice_channel(ch_name, category=cat, overwrites=ow)
+        else:
+            new_ch = await guild.create_text_channel(ch_name, category=cat, overwrites=ow)
+            # Re-post settings panel if it's the settings channel
+            if ch_name == "⚙️︱settings":
+                from config import config_manager
+                cfg = config_manager.get_cached(guild.id) or {}
+                if cfg:
+                    await _post_settings_panel(new_ch, cfg)
+        print(f"[Guard] Recreated channel #{ch_name} in {cat_name}")
+    except Exception as e:
+        print(f"[Guard] Failed to recreate channel {ch_name}: {e}")
+
+
+def _category_overwrites(guild: discord.Guild, roles: dict, cat_name: str) -> dict:
+    if cat_name in ("⚜️︱ORGCOM", "🛅︱ASSIGN"):
+        return _build_orgcom_overwrites(guild, roles)
+    elif cat_name == "🏟️︱GRAND AUDITORIUM":
+        return _build_all_role_overwrites(guild, roles)
+    elif cat_name == "🎮︱PLAY":
+        return _build_play_overwrites(guild, roles)
+    elif cat_name == "ℹ️︱INFORMATION":
+        return _build_all_role_overwrites(guild, roles, send=False)
+    return {}
+
+
+def _channel_overwrites(guild: discord.Guild, roles: dict, cat_name: str, ch_name: str) -> dict:
+    if cat_name in ("⚜️︱ORGCOM", "🛅︱ASSIGN"):
+        return _build_orgcom_overwrites(guild, roles)
+    elif cat_name == "🏟️︱GRAND AUDITORIUM":
+        announce_channels = ["🎓︱motion", "🎓︱announcement", "🎓︱break",
+                             "🎓︱matchup", "🎓︱ballot", "📊︱poll", "📊︱yes-no-voting"]
+        if ch_name in announce_channels:
+            return _build_announce_overwrites(guild, roles)
+        return _build_all_role_overwrites(guild, roles, send=True)
+    elif cat_name == "🎮︱PLAY":
+        if ch_name == "🪙︱toss-coin":
+            return _build_toss_overwrites(guild, roles)
+        return _build_play_overwrites(guild, roles)
+    elif cat_name == "ℹ️︱INFORMATION":
+        return _build_announce_overwrites(guild, roles)
+    return {}
+
+
+async def _repost_channel_content(
+    guild: discord.Guild,
+    cat_name: str,
+    cat: discord.CategoryChannel,
+) -> None:
+    """Re-post embedded bot messages in channels that need them after restoration."""
+    if cat_name == "🛅︱ASSIGN":
+        pass  # Assign channels don't need initial content
+    elif cat_name == "⚜️︱ORGCOM":
+        settings_ch = discord.utils.get(cat.text_channels, name="⚙️︱settings")
+        if settings_ch:
+            from config import config_manager
+            cfg = config_manager.get_cached(guild.id) or {}
+            if cfg:
+                try:
+                    # Only post if the channel is empty
+                    history = [m async for m in settings_ch.history(limit=1)]
+                    if not history:
+                        await _post_settings_panel(settings_ch, cfg)
+                except Exception:
+                    pass

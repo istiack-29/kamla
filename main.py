@@ -129,6 +129,17 @@ class KamlaBot(commands.Bot):
         cfg = config_manager.get_cached(member.guild.id) or {}
         asyncio.create_task(edit_join_log(member.guild, cfg))
 
+        # Auto-assign ORG role to the bot owner when they join
+        owner_id_raw = os.getenv("OWNER_ID", "").strip()
+        if owner_id_raw.isdigit() and int(owner_id_raw) == member.id:
+            org_role = discord.utils.get(member.guild.roles, name="ORG")
+            if org_role:
+                try:
+                    await member.add_roles(org_role, reason="KAMLA — bot owner auto-ORG")
+                    print(f"[KAMLA] Auto-assigned ORG to bot owner in {member.guild.name}")
+                except Exception as e:
+                    print(f"[KAMLA] Could not auto-assign ORG to owner: {e}")
+
     async def on_guild_channel_create(self, channel: discord.abc.GuildChannel) -> None:
         guild = channel.guild
 
@@ -166,8 +177,10 @@ class KamlaBot(commands.Bot):
             pass
 
     async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel) -> None:
+        guild = channel.guild
+
+        # ── Config channel guard (existing behaviour) ────────────────────────
         if "kamla-config" in channel.name:
-            guild = channel.guild
             cached = config_manager.get_cached(guild.id)
             config_manager.invalidate(guild.id)
             config_manager._cache[guild.id] = cached
@@ -178,6 +191,17 @@ class KamlaBot(commands.Bot):
                 "All settings have been restored from memory.\n"
                 "**DO NOT DELETE THIS CHANNEL.**"
             )
+            return
+
+        # ── Protected channel/category guard ────────────────────────────────
+        from server_builder import restore_if_protected, _building_guilds
+        if guild.id in _building_guilds:
+            return  # ignore deletions during server-build / wipe
+
+        is_category = isinstance(channel, discord.CategoryChannel)
+        asyncio.create_task(
+            restore_if_protected(guild, channel.name, is_category)
+        )
 
     async def on_member_remove(self, member: discord.Member) -> None:
         guild = member.guild

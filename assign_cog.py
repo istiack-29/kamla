@@ -17,6 +17,13 @@ ASSIGN_CHANNEL_ROLE_MAP: dict[str, str] = {
     "invited-adjudicator":      "INVITED ADJUDICATOR",
 }
 
+# Reverse map: role name → assign channel name
+ROLE_ASSIGN_CHANNEL_MAP: dict[str, str] = {v: k for k, v in ASSIGN_CHANNEL_ROLE_MAP.items()}
+
+# Track roles the bot itself just assigned so on_member_update doesn't double-post.
+# Key: (guild_id, member_id, role_name) — consumed once when on_member_update fires.
+_bot_assigned_roles: set[tuple[int, int, str]] = set()
+
 
 def _channel_role(channel_name: str) -> str | None:
     return ASSIGN_CHANNEL_ROLE_MAP.get(channel_name.lower())
@@ -121,6 +128,8 @@ class AssignCog(commands.Cog):
         results = []
         assign_cat = message.channel.category
         for target in targets:
+            # Mark as bot-assigned so on_member_update skips double-post
+            _bot_assigned_roles.add((message.guild.id, target.id, role_name))
             await assign_kamla_role(target, role)
             results.append(target.mention)
             # Remove the user's previous mention from any other assign channel
@@ -132,6 +141,53 @@ class AssignCog(commands.Cog):
                 f"✅ Assigned **{role_name}** to: {', '.join(results)}",
                 delete_after=15,
             )
+
+    @commands.Cog.listener()
+    async def on_member_update(self, before: discord.Member, after: discord.Member) -> None:
+        """
+        Detect when a KAMLA role is added to a member by ANY means (manual, another bot, etc.)
+        and post/update the mention in the corresponding assign channel.
+        """
+        guild = after.guild
+
+        before_role_names = {r.name for r in before.roles}
+        after_role_names  = {r.name for r in after.roles}
+
+        added_kamla = [
+            name for name in (after_role_names - before_role_names)
+            if name in KAMLA_ROLE_NAMES
+        ]
+        if not added_kamla:
+            return
+
+        assign_cat = discord.utils.get(guild.categories, name="🛅︱ASSIGN")
+        if assign_cat is None:
+            return
+
+        for role_name in added_kamla:
+            key = (guild.id, after.id, role_name)
+
+            # If it was the bot's own assignment (via on_message), skip to avoid double-post
+            if key in _bot_assigned_roles:
+                _bot_assigned_roles.discard(key)
+                continue
+
+            ch_name = ROLE_ASSIGN_CHANNEL_MAP.get(role_name)
+            if not ch_name:
+                continue
+
+            assign_ch = discord.utils.get(assign_cat.text_channels, name=ch_name)
+            if assign_ch is None:
+                continue
+
+            # Clean up old mentions in all other assign channels first
+            await _cleanup_old_mentions(assign_cat, after, assign_ch.id)
+
+            # Post the mention in the correct channel
+            try:
+                await assign_ch.send(after.mention)
+            except Exception as e:
+                print(f"[AssignCog] Could not post mention in #{ch_name}: {e}")
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member) -> None:
