@@ -147,6 +147,7 @@ class KamlaBot(commands.Bot):
         if "kamla-config" in channel.name:
             return
 
+        # Never interfere while KAMLA is building / wiping
         from server_builder import _building_guilds
         if guild.id in _building_guilds:
             return
@@ -160,6 +161,18 @@ class KamlaBot(commands.Bot):
 
         if not cfg.get("locked", False):
             return
+
+        # Check audit log — if KAMLA itself created the channel, allow it
+        try:
+            async for entry in guild.audit_logs(
+                action=discord.AuditLogAction.channel_create, limit=5
+            ):
+                if entry.target and entry.target.id == channel.id:
+                    if entry.user and entry.user.id == self.user.id:
+                        return  # KAMLA created it — skip lock enforcement
+                    break
+        except discord.Forbidden:
+            pass
 
         try:
             await channel.delete(reason="🔒 KAMLA — Server is locked. Channel auto-removed.")
