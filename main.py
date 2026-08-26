@@ -148,8 +148,8 @@ class KamlaBot(commands.Bot):
             return
 
         # Never interfere while KAMLA is building / wiping
-        from server_builder import _building_guilds
-        if guild.id in _building_guilds:
+        from server_builder import _building_guilds, _restoring_guilds
+        if guild.id in _building_guilds or guild.id in _restoring_guilds:
             return
 
         cfg = config_manager.get_cached(guild.id)
@@ -213,8 +213,14 @@ class KamlaBot(commands.Bot):
             return  # ignore deletions during server-build / wipe
 
         is_category = isinstance(channel, discord.CategoryChannel)
+        parent = None
+        if not is_category:
+            category = getattr(channel, "category", None)
+            parent = category.name if category else None
         asyncio.create_task(
-            restore_if_protected(guild, channel.name, is_category)
+            restore_if_protected(
+                guild, channel.name, is_category, parent_category_name=parent
+            )
         )
 
     async def on_member_remove(self, member: discord.Member) -> None:

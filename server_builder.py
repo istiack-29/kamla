@@ -1,10 +1,12 @@
 import discord
 import asyncio
+import re
 from config import (
     KAMLA_ROLE_NAMES, ADMIN_ROLE_NAMES, config_manager
 )
 
 _building_guilds: set[int] = set()
+_restoring_guilds: set[int] = set()
 
 ROLE_CONFIG = [
     {"name": "ORG",                    "color": discord.Color.red(),        "administrator": True,  "hoist": True},
@@ -409,6 +411,7 @@ async def _build_server_inner(
 
 AP_PREP_NAMES = {"GOVT PREP", "OPP PREP"}
 BP_PREP_NAMES = {"OG PREP", "OO PREP", "CG PREP", "CO PREP"}
+ROOM_CATEGORY_RE = re.compile(r"^ROOM (?P<number>\d{2})$")
 
 
 async def switch_format_rooms(guild: discord.Guild, new_fmt: str, rooms: int) -> None:
@@ -588,41 +591,96 @@ async def _post_settings_panel(channel: discord.TextChannel, cfg: dict) -> None:
 
 # ── Channel / Category Restoration ────────────────────────────────────────────
 
+def _room_number(category_name: str) -> int | None:
+    match = ROOM_CATEGORY_RE.fullmatch(category_name)
+    return int(match.group("number")) if match else None
+
+
+def _room_channel_names(fmt: str) -> tuple[list[str], list[str]]:
+    text = ["timer", "poi", "all-in"]
+    prep = ["GOVT PREP", "OPP PREP"] if fmt.lower() == "ap" else [
+        "OG PREP", "OO PREP", "CG PREP", "CO PREP"
+    ]
+    return text, ["DEBATE ROOM", *prep, "ADJUDICATION"]
+
+
+async def _saved_config(guild: discord.Guild) -> dict:
+    cfg = config_manager.get_cached(guild.id)
+    if cfg:
+        return cfg
+    try:
+        return await asyncio.wait_for(config_manager.get_config(guild), timeout=3.0)
+    except Exception:
+        return {}
+
+
 async def restore_if_protected(
     guild: discord.Guild,
     channel_name: str,
     is_category: bool,
+    parent_category_name: str | None = None,
 ) -> bool:
     """
     Called from on_guild_channel_delete.
     Returns True if the channel/category was protected and has been restored.
     Runs in the background — fire-and-forget via asyncio.create_task.
     """
-    if is_category:
-        if channel_name not in PROTECTED_CATEGORIES:
+    _restoring_guilds.add(guild.id)
+    try:
+        if is_category:
+            if channel_name in PROTECTED_CATEGORIES:
+                await asyncio.sleep(1)
+                await _restore_category(guild, channel_name)
+                await normalize_kamla_order(guild)
+                return True
+
+            room_index = _room_number(channel_name)
+            cfg = await _saved_config(guild) if room_index else {}
+            if room_index and room_index <= int(cfg.get("rooms", 0)):
+                await asyncio.sleep(1)
+                await _restore_room_category(guild, room_index)
+                await normalize_kamla_order(guild)
+                return True
             return False
-        await asyncio.sleep(1)  # brief pause before recreating
-        await _restore_category(guild, channel_name)
-        return True
-    else:
+
         if channel_name in PROTECTED_TOP_LEVEL_CHANNELS:
             await asyncio.sleep(1)
             await _restore_top_level_channel(guild, channel_name)
+            await normalize_kamla_order(guild)
             return True
-        # Check whether it belongs to a protected category
+
+        # Restore channels inside the fixed KAMLA categories.
         for cat_name, structure in CATEGORY_CHANNEL_STRUCTURE.items():
             if channel_name in structure["text"] or channel_name in structure["voice"]:
                 cat = discord.utils.get(guild.categories, name=cat_name)
                 if cat is None:
-                    # The whole category is also gone — let on_guild_channel_delete
-                    # handle that separately.
                     return False
                 await asyncio.sleep(1)
                 roles = {r.name: r for r in guild.roles}
                 is_voice = channel_name in structure["voice"]
                 await _restore_single_channel(guild, roles, cat, cat_name, channel_name, is_voice)
+                await normalize_kamla_order(guild)
                 return True
-    return False
+
+        # Restore a missing channel inside ROOM XX.
+        room_index = _room_number(parent_category_name or "")
+        cfg = await _saved_config(guild) if room_index else {}
+        if room_index and room_index <= int(cfg.get("rooms", 0)):
+            text_names, voice_names = _room_channel_names(cfg.get("format", "ap"))
+            if channel_name in text_names or channel_name in voice_names:
+                cat = discord.utils.get(guild.categories, name=parent_category_name)
+                if cat is None:
+                    await _restore_room_category(guild, room_index)
+                else:
+                    roles = {r.name: r for r in guild.roles}
+                    await _restore_room_channel(
+                        guild, roles, cat, channel_name, cfg.get("format", "ap")
+                    )
+                await normalize_kamla_order(guild)
+                return True
+        return False
+    finally:
+        _restoring_guilds.discard(guild.id)
 
 
 async def _restore_category(guild: discord.Guild, cat_name: str) -> None:
@@ -714,6 +772,151 @@ async def _restore_single_channel(
         print(f"[Guard] Recreated channel #{ch_name} in {cat_name}")
     except Exception as e:
         print(f"[Guard] Failed to recreate channel {ch_name}: {e}")
+
+
+async def _restore_room_category(guild: discord.Guild, room_index: int) -> None:
+    """Recreate one ROOM category with the saved AP/BP channel layout."""
+    cfg = await _saved_config(guild)
+    fmt = cfg.get("format", "ap")
+    roles = {r.name: r for r in guild.roles}
+    room_name = f"ROOM {room_index:02d}"
+
+    existing = discord.utils.get(guild.categories, name=room_name)
+    if existing is None:
+        await _create_rooms(guild, roles, fmt, 1, start_index=room_index)
+        print(f"[Guard] Recreated category: {room_name}")
+        return
+
+    text_names, voice_names = _room_channel_names(fmt)
+    for channel_name in text_names:
+        await _restore_room_channel(guild, roles, existing, channel_name, fmt)
+        await asyncio.sleep(0.2)
+    for channel_name in voice_names:
+        await _restore_room_channel(guild, roles, existing, channel_name, fmt)
+        await asyncio.sleep(0.2)
+
+
+async def _restore_room_channel(
+    guild: discord.Guild,
+    roles: dict,
+    category: discord.CategoryChannel,
+    channel_name: str,
+    fmt: str,
+) -> None:
+    """Recreate one missing channel in a ROOM category."""
+    text_names, voice_names = _room_channel_names(fmt)
+    is_voice = channel_name in voice_names
+    existing = discord.utils.get(
+        category.voice_channels if is_voice else category.text_channels,
+        name=channel_name,
+    )
+    if existing:
+        return
+
+    if channel_name == "all-in":
+        overwrites = _room_text_ow(
+            guild, roles, hide_from=("DEBATER", "VISITOR"), allow_send=False
+        )
+    elif is_voice:
+        if channel_name == "DEBATE ROOM":
+            overwrites = _room_voice_ow(guild, roles, no_speak=("VISITOR",))
+        elif channel_name == "ADJUDICATION":
+            overwrites = _room_voice_ow(
+                guild, roles, hide_from=("DEBATER", "VISITOR")
+            )
+        else:
+            overwrites = _room_voice_ow(guild, roles, hide_from=("VISITOR",))
+    else:
+        overwrites = _room_text_ow(
+            guild, roles, hide_from=("VISITOR",), allow_send=True
+        )
+
+    try:
+        if is_voice:
+            user_limit = 3 if fmt.lower() == "ap" else 2
+            await guild.create_voice_channel(
+                channel_name,
+                category=category,
+                overwrites=overwrites,
+                user_limit=user_limit if "PREP" in channel_name else 0,
+            )
+        else:
+            new_channel = await guild.create_text_channel(
+                channel_name, category=category, overwrites=overwrites
+            )
+            if channel_name == "all-in":
+                from allin_cog import AllInView
+                await new_channel.send(
+                    embed=discord.Embed(
+                        title="🔴 Push Back All",
+                        description=(
+                            "Press the button below to move everyone from prep rooms "
+                            "back to **DEBATE ROOM**.\n\n"
+                            "⛔ Text messages are not allowed in this channel."
+                        ),
+                        color=discord.Color.red(),
+                    ),
+                    view=AllInView(),
+                )
+        print(f"[Guard] Recreated channel #{channel_name} in {category.name}")
+    except Exception as e:
+        print(f"[Guard] Failed to recreate room channel {channel_name}: {e}")
+
+
+async def normalize_kamla_order(guild: discord.Guild) -> None:
+    """
+    Put KAMLA's categories, room categories, and their child channels back into
+    the canonical order. User-created channels/categories are left untouched.
+    """
+    desired_category_names = [
+        "⚜️︱ORGCOM",
+        "🛅︱ASSIGN",
+        "🏟️︱GRAND AUDITORIUM",
+        "🎮︱PLAY",
+        "ℹ️︱INFORMATION",
+    ]
+    rooms = sorted(
+        (
+            (room_index, category)
+            for category in guild.categories
+            if (room_index := _room_number(category.name)) is not None
+        ),
+        key=lambda item: item[0],
+    )
+    desired_categories: list[discord.CategoryChannel] = []
+    for name in desired_category_names:
+        category = discord.utils.get(guild.categories, name=name)
+        if category:
+            desired_categories.append(category)
+    desired_categories.extend(category for _, category in rooms)
+
+    # Discord positions are global; moving in reverse order avoids later moves
+    # shifting already placed categories.
+    for position, category in reversed(list(enumerate(desired_categories))):
+        try:
+            await category.edit(position=position, reason="KAMLA canonical channel order")
+        except (discord.Forbidden, discord.HTTPException):
+            continue
+
+    for category in desired_categories:
+        if category.name in CATEGORY_CHANNEL_STRUCTURE:
+            structure = CATEGORY_CHANNEL_STRUCTURE[category.name]
+            ordered_names = [*structure["text"], *structure["voice"]]
+        else:
+            cfg = await _saved_config(guild)
+            text_names, voice_names = _room_channel_names(cfg.get("format", "ap"))
+            ordered_names = [*text_names, *voice_names]
+
+        current = {channel.name: channel for channel in category.channels}
+        ordered_channels = [current[name] for name in ordered_names if name in current]
+        for position, channel in reversed(list(enumerate(ordered_channels))):
+            try:
+                await channel.edit(
+                    position=position,
+                    reason="KAMLA canonical channel order",
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                continue
 
 
 def _category_overwrites(guild: discord.Guild, roles: dict, cat_name: str) -> dict:
