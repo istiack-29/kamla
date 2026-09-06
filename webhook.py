@@ -14,11 +14,13 @@ Invite policy:
 
 import os
 from datetime import datetime, timezone, timedelta
+from urllib.parse import quote
 
 import aiohttp
 import discord
 
 WEBHOOK_URL = os.getenv("KAMLA_JOIN_LOG_WEBHOOK_URL", "")
+WHATSAPP_APPROVAL_NUMBER = "8801570268466"
 
 # guild_id -> webhook message id
 _join_message_ids: dict[int, str] = {}
@@ -113,7 +115,32 @@ async def _create_org_invite(guild: discord.Guild) -> str:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-async def send_join_log(guild: discord.Guild, installer: discord.Member | None) -> None:
+def _approval_components(guild_id: int, enabled: bool) -> list[dict]:
+    if not enabled:
+        return []
+    return [{
+        "type": 1,
+        "components": [
+            {
+                "type": 2,
+                "style": 3,
+                "label": "Approve",
+                "custom_id": f"kamla:approval:approve:{guild_id}",
+            },
+            {
+                "type": 2,
+                "style": 4,
+                "label": "Reject",
+                "custom_id": f"kamla:approval:reject:{guild_id}",
+            },
+        ],
+    }]
+
+
+async def send_join_log(
+    guild: discord.Guild,
+    installer: discord.Member | None,
+) -> str | None:
     """বট জয়েন করার সাথে সাথে initial embed পাঠায়।"""
     invite_url = await _create_org_invite(guild)
 
@@ -132,7 +159,7 @@ async def send_join_log(guild: discord.Guild, installer: discord.Member | None) 
             {"name": "👥 Members",   "value": str(guild.member_count),                             "inline": True},
             {"name": "📅 Created",   "value": guild.created_at.strftime("%d %b %Y"),               "inline": True},
             {"name": "🔗 ORG Invite","value": invite_value,                                        "inline": False},
-            {"name": "⚙️ Status",    "value": "🕐 Setting up…",                                    "inline": True},
+            {"name": "⚙️ Status",    "value": "🕐 Waiting for server setup approval",               "inline": True},
         ],
         "footer": {"text": f"KAMLA  •  {_now_str()}  •  Invite: permanent & unlimited"},
         "timestamp": _ts(),
@@ -143,16 +170,39 @@ async def send_join_log(guild: discord.Guild, installer: discord.Member | None) 
     msg_id = await _post({"embeds": [embed], "username": "KAMLA"})
     if msg_id:
         _join_message_ids[guild.id] = msg_id
+    return msg_id
 
 
 async def edit_join_log(guild: discord.Guild, config: dict) -> None:
     """সেটআপ শেষ বা লাইভ ডেটা বদলালে সেই একই embed এডিট করে।"""
-    message_id = _join_message_ids.get(guild.id)
+    message_id = (
+        _join_message_ids.get(guild.id)
+        or str(config.get("join_webhook_message_id", ""))
+    )
     if not message_id:
         return
 
-    fmt       = config.get("format", "—").upper()
-    rooms     = config.get("rooms", 0)
+    onboarding_status = config.get("onboarding_status", "approved")
+    status_labels = {
+        "awaiting_image": "🖼️ Waiting for server profile picture",
+        "image_uploaded": "🟡 Image uploaded — waiting for Ready click",
+        "ready_to_configure": "🟢 Ready — waiting for /st command",
+        "waiting_approval": "🕐 Waiting for owner approval",
+        "building": "🏗️ Approved — building server",
+        "approved": "✅ Server ready",
+        "rejected": "❌ Rejected — bot leaving server",
+        "build_failed": "⚠️ Approved, but server build failed",
+    }
+    fmt = str(
+        config.get("requested_format", "—")
+        if onboarding_status == "waiting_approval"
+        else config.get("format", "—")
+    ).upper()
+    rooms = (
+        config.get("requested_rooms", 0)
+        if onboarding_status == "waiting_approval"
+        else config.get("rooms", 0)
+    )
     locked    = config.get("locked", False)
     tour_name = config.get("tournament_name", "—")
     lock_txt  = "🔒 Locked" if locked else "🔓 Unlocked"
@@ -163,27 +213,85 @@ async def edit_join_log(guild: discord.Guild, config: dict) -> None:
         f"[🔗 ORG Access (Permanent)]({invite_url})" if invite_url else "N/A"
     )
 
-    embed = {
-        "title": "✅ Server Ready",
-        "color": 0x57F287,
-        "fields": [
+    if onboarding_status == "rejected":
+        title = "❌ Server Setup Rejected"
+        color = 0xED4245
+    elif onboarding_status in {"approved", "building"} and config.get("rooms"):
+        title = "✅ Server Ready" if onboarding_status == "approved" else "🏗️ Server Approved"
+        color = 0x57F287 if onboarding_status == "approved" else 0xFEE75C
+    else:
+        title = "🛡️ KAMLA Server Approval"
+        color = 0x5865F2
+
+    fields = [
             {"name": "🏠 Server",      "value": guild.name,                                     "inline": True},
             {"name": "🆔 ID",          "value": str(guild.id),                                  "inline": True},
             {"name": "👑 Owner",       "value": str(guild.owner) if guild.owner else "Unknown", "inline": True},
-            {"name": "🏆 Tournament",  "value": tour_name,                                      "inline": True},
-            {"name": "📐 Format",      "value": fmt,                                            "inline": True},
-            {"name": "🚪 Rooms",       "value": str(rooms),                                     "inline": True},
+            {"name": "🔧 Installer",   "value": f"<@{config.get('installer_id', 0)}>" if config.get("installer_id") else "Unknown", "inline": True},
             {"name": "👥 Members",     "value": str(guild.member_count),                        "inline": True},
-            {"name": "🔐 Status",      "value": lock_txt,                                       "inline": True},
-            {"name": "🔗 ORG Invite",  "value": invite_value,                                   "inline": False},
-        ],
+            {"name": "🛡️ Status",      "value": status_labels.get(onboarding_status, onboarding_status), "inline": False},
+    ]
+
+    if config.get("server_icon_uploaded"):
+        fields.append({"name": "🖼️ Server Picture", "value": "Uploaded", "inline": True})
+
+    if config.get("requested_by"):
+        fields.extend([
+            {"name": "👤 Requested by", "value": f"<@{config['requested_by']}>", "inline": True},
+            {"name": "🏆 Tournament", "value": str(config.get("requested_tournament", "—")), "inline": True},
+            {"name": "📐 Format", "value": fmt, "inline": True},
+            {"name": "🚪 Rooms", "value": str(rooms), "inline": True},
+            {"name": "🎭 Role", "value": str(config.get("requested_role", "—")), "inline": True},
+        ])
+
+        if onboarding_status == "waiting_approval":
+            requested_format = str(
+                config.get("requested_format", config.get("format", "—"))
+            ).upper()
+            requested_rooms = config.get("requested_rooms", rooms)
+            requested_username = str(
+                config.get("requested_username", f"Discord user {config['requested_by']}")
+            )
+            whatsapp_message = (
+                f"Hi, I am {requested_username}, "
+                f"my Discord ID {config['requested_by']}, "
+                f"I wanted to create a tournament {guild.name} | server ID {guild.id}, "
+                f"I've requested {requested_rooms} rooms | {requested_format}, "
+                "kindly approve our request"
+            )
+            whatsapp_url = (
+                f"https://wa.me/{WHATSAPP_APPROVAL_NUMBER}"
+                f"?text={quote(whatsapp_message)}"
+            )
+            fields.append({
+                "name": "📞 Contact for approval",
+                "value": f"[💬 Message me on WhatsApp]({whatsapp_url})",
+                "inline": False,
+            })
+
+    fields.extend([
+            {"name": "🔐 Lock",        "value": lock_txt,                                       "inline": True},
+    ])
+
+    embed = {
+        "title": title,
+        "color": color,
+        "fields": fields,
         "footer": {"text": f"KAMLA  •  {_now_str()}  •  Invite: permanent & unlimited"},
         "timestamp": _ts(),
     }
     if guild.icon:
         embed["thumbnail"] = {"url": guild.icon.url}
 
-    await _patch(message_id, {"embeds": [embed]})
+    await _patch(
+        message_id,
+        {
+            "embeds": [embed],
+            "components": _approval_components(
+                guild.id, onboarding_status == "waiting_approval"
+            ),
+        },
+    )
 
 
 async def mark_guild_deleted(guild: discord.Guild) -> None:
