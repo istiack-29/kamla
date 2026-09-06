@@ -388,7 +388,6 @@ async def _build_server_inner(
         await guild.create_text_channel(ch_name, category=info_cat, overwrites=info_send_ow)
         await asyncio.sleep(0.2)
 
-    previous_cfg = config_manager.get_cached(guild.id)
     cfg_data = {
         "format":              fmt,
         "rooms":               rooms,
@@ -398,23 +397,7 @@ async def _build_server_inner(
         "created_at":          discord.utils.utcnow().isoformat(),
         "settings_channel_id": settings_ch.id,
         "locked":              False,
-        "onboarding_status":   "approved",
     }
-    for key in (
-        "installer_id",
-        "join_webhook_message_id",
-        "onboarding_channel_id",
-        "onboarding_message_id",
-        "server_icon_uploaded",
-        "requested_by",
-        "requested_tournament",
-        "requested_role",
-        "approval_requested_at",
-        "approved_by",
-        "approved_at",
-    ):
-        if key in previous_cfg:
-            cfg_data[key] = previous_cfg[key]
     await config_manager.set_config(guild, cfg_data)
 
     await _post_meet_developer(meet_ch)
