@@ -1,7 +1,10 @@
+import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands
+from datetime import datetime, timezone
 from config import config_manager, ADMIN_ROLE_NAMES
+from webhook import edit_join_log
 
 ADMIN_ASSIGN_CHANNEL_MAP = {
     "ORG":    "org",
@@ -17,23 +20,51 @@ class OnJoinView(discord.ui.View):
         self.installer_id = installer_id
 
     @discord.ui.button(
-        label="CREATE NOW",
+        label="READY YOUR SERVER",
         style=discord.ButtonStyle.success,
         custom_id="kamla:on_join:create_now",
         emoji="⚡",
     )
     async def create_now(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.installer_id and interaction.user.id != self.installer_id:
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "This button can only be used inside a server.", ephemeral=True
+            )
+            return
+
+        cfg = await config_manager.get_config(interaction.guild)
+        installer_id = int(cfg.get("installer_id", self.installer_id or 0))
+        if not installer_id or interaction.user.id != installer_id:
             await interaction.response.send_message(
                 "⛔ Only the person who added KAMLA to this server may use this button.",
                 ephemeral=True,
             )
             return
 
+        if cfg.get("onboarding_status") == "waiting_approval":
+            await interaction.response.send_message(
+                "🕐 Your setup request is already waiting for owner approval.",
+                ephemeral=True,
+            )
+            return
+
+        if not cfg.get("server_icon_uploaded"):
+            await interaction.response.send_message(
+                "🖼️ Please upload the server profile picture first, then click this button.",
+                ephemeral=True,
+            )
+            return
+
+        cfg = await config_manager.update_config(
+            interaction.guild,
+            onboarding_status="ready_to_configure",
+        )
+        asyncio.create_task(edit_join_log(interaction.guild, cfg))
         await interaction.response.send_message(
-            "🚀 To set up your tournament server use the slash command:\n"
+            "✅ Your server is ready for configuration.\n\n"
+            "Use this command to request setup:\n"
             "```\n/st format:ap room:20 tournamentname:MY OPEN 2026 as:ORG\n```\n"
-            "Replace the values with your tournament details.",
+            "After you submit it, the KAMLA owner must approve the request.",
             ephemeral=True,
         )
 
@@ -55,6 +86,57 @@ class ConfirmBuildView(discord.ui.View):
         await interaction.response.edit_message(
             content="❌ Setup cancelled.", embed=None, view=None
         )
+
+
+async def _build_approved_server(guild: discord.Guild, setup_data: dict) -> None:
+    """Build a server only after the KAMLA owner has approved its request."""
+    from server_builder import wipe_server, build_server
+
+    await wipe_server(guild)
+    await build_server(
+        guild=guild,
+        fmt=setup_data["format"],
+        rooms=setup_data["rooms"],
+        timezone=setup_data["timezone"],
+        tournament_name=setup_data["tournament_name"],
+        creator_id=setup_data["creator_id"],
+    )
+    creator = setup_data.get("creator")
+    if creator is not None:
+        await _assign_creator_role(guild, creator, setup_data["role_name"])
+
+    cfg = await config_manager.get_config(guild)
+    await edit_join_log(guild, cfg)
+
+
+async def submit_setup_for_approval(
+    interaction: discord.Interaction,
+    setup_data: dict,
+) -> None:
+    """Save a pending request and update the owner's webhook approval card."""
+    guild = interaction.guild
+    if guild is None:
+        return
+
+    cfg = await config_manager.update_config(
+        guild,
+        onboarding_status="waiting_approval",
+        requested_by=interaction.user.id,
+        requested_username=interaction.user.name,
+        requested_tournament=setup_data["tournament_name"],
+        requested_role=setup_data["role_name"],
+        requested_format=setup_data["format"],
+        requested_rooms=setup_data["rooms"],
+        requested_timezone=setup_data["timezone"],
+        approval_requested_at=discord.utils.utcnow().isoformat(),
+    )
+    await edit_join_log(guild, cfg)
+    await interaction.response.send_message(
+        "🕐 **Waiting for approval.**\n"
+        "The KAMLA owner has received your request. "
+        "You will receive a DM when it is approved or rejected.",
+        ephemeral=True,
+    )
 
 
 async def _do_build(interaction: discord.Interaction, setup_data: dict) -> None:
@@ -82,19 +164,18 @@ async def _do_build(interaction: discord.Interaction, setup_data: dict) -> None:
     )
 
     try:
-        from server_builder import wipe_server, build_server
-        await wipe_server(guild)
-        await build_server(
-            guild=guild,
-            fmt=fmt,
-            rooms=rooms,
-            timezone=tz,
-            tournament_name=tournament_name,
-            creator_id=creator_id,
+        await _build_approved_server(
+            guild,
+            {
+                "format": fmt,
+                "rooms": rooms,
+                "timezone": tz,
+                "tournament_name": tournament_name,
+                "creator_id": creator_id,
+                "creator": interaction.user,
+                "role_name": role_name,
+            },
         )
-
-        # ── Assign creator role via assign channel (single source of truth) ──
-        await _assign_creator_role(guild, interaction.user, role_name)
 
         # ── Permanent invite ──────────────────────────────────────────────────
         invite_url = ""
@@ -108,7 +189,6 @@ async def _do_build(interaction: discord.Interaction, setup_data: dict) -> None:
             pass
 
         # ── Edit webhook log ──────────────────────────────────────────────────
-        from webhook import edit_join_log
         cfg = await config_manager.get_config(guild)
         await edit_join_log(guild, cfg)
 
@@ -183,6 +263,66 @@ class SetupCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message) -> None:
+        """Accept only the installer’s image upload during onboarding."""
+        if not message.guild or message.author.bot or not message.attachments:
+            return
+
+        cfg = await config_manager.get_config(message.guild)
+        status = cfg.get("onboarding_status")
+        if status not in {"awaiting_image", "image_uploaded", "ready_to_configure"}:
+            return
+
+        if message.author.id != int(cfg.get("installer_id", 0)):
+            return
+        if message.channel.id != int(cfg.get("onboarding_channel_id", 0)):
+            return
+
+        attachment = next(
+            (
+                item for item in message.attachments
+                if (item.content_type or "").startswith("image/")
+                or item.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif"))
+            ),
+            None,
+        )
+        if attachment is None:
+            return
+        if attachment.size > 10 * 1024 * 1024:
+            await message.channel.send(
+                "❌ This image is too large. Please upload an image under 10 MB.",
+                delete_after=10,
+            )
+            return
+
+        try:
+            image_bytes = await attachment.read()
+            await message.guild.edit(
+                icon=image_bytes,
+                reason="KAMLA onboarding — server profile picture",
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            await message.channel.send(
+                "❌ KAMLA could not update the server picture. "
+                "Please ensure it has **Manage Server** permission.",
+                delete_after=12,
+            )
+            return
+
+        cfg = await config_manager.update_config(
+            message.guild,
+            onboarding_status="image_uploaded",
+            server_icon_uploaded=True,
+            server_icon_filename=attachment.filename,
+        )
+        await edit_join_log(message.guild, cfg)
+        await message.channel.send(
+            "✅ Server profile picture uploaded successfully. "
+            "Now click **READY YOUR SERVER** on the KAMLA setup message.",
+            delete_after=15,
+        )
+
     @app_commands.command(name="st", description="Set up the KAMLA tournament server.")
     @app_commands.describe(
         format="Debate format",
@@ -216,6 +356,50 @@ class SetupCog(commands.Cog):
                 )
                 return
 
+        cfg = await config_manager.get_config(interaction.guild)
+        onboarding_status = cfg.get("onboarding_status", "approved")
+        if onboarding_status != "approved":
+            installer_id = int(cfg.get("installer_id", 0))
+            if interaction.user.id != installer_id:
+                await interaction.response.send_message(
+                    "⛔ This server is waiting for setup approval from the person "
+                    "who added KAMLA.",
+                    ephemeral=True,
+                )
+                return
+
+            if onboarding_status in {"awaiting_image", "image_uploaded"}:
+                await interaction.response.send_message(
+                    "🖼️ First upload the server profile picture and click "
+                    "**READY YOUR SERVER**.",
+                    ephemeral=True,
+                )
+                return
+
+            if onboarding_status == "waiting_approval":
+                await interaction.response.send_message(
+                    "🕐 A setup request is already waiting for KAMLA owner approval.",
+                    ephemeral=True,
+                )
+                return
+
+            if onboarding_status == "rejected":
+                await interaction.response.send_message(
+                    "⛔ This server was rejected and cannot use KAMLA.",
+                    ephemeral=True,
+                )
+                return
+
+            pending_setup = {
+                "format": format.value,
+                "rooms": room,
+                "timezone": "+06:00",
+                "tournament_name": tournamentname,
+                "role_name": as_role.value,
+            }
+            await submit_setup_for_approval(interaction, pending_setup)
+            return
+
         setup_data = {
             "format":          format.value,
             "rooms":           room,
@@ -243,10 +427,21 @@ class SetupCog(commands.Cog):
     @app_commands.command(name="rebuild", description="Rebuild the tournament server structure.")
     @app_commands.default_permissions(administrator=True)
     async def rebuild(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "This command must be used in a server.", ephemeral=True
+            )
+            return
         cfg = await config_manager.get_config(interaction.guild)
         if not cfg:
             await interaction.response.send_message(
                 "⛔ No tournament config found. Use `/st` first.", ephemeral=True
+            )
+            return
+        if cfg.get("onboarding_status", "approved") != "approved":
+            await interaction.response.send_message(
+                "⛔ This server has not been approved by the KAMLA owner yet.",
+                ephemeral=True,
             )
             return
         setup_data = {
