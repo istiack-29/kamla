@@ -30,6 +30,7 @@ class KamlaBot(commands.Bot):
     def __init__(self) -> None:
         app_id_raw = os.getenv("APPLICATION_ID", "")
         app_id = int(app_id_raw) if app_id_raw.strip().isdigit() else None
+        self._control_owner_id: int | None = None
         super().__init__(
             command_prefix="!kamla ",
             intents=INTENTS,
@@ -75,6 +76,168 @@ class KamlaBot(commands.Bot):
             ),
         )
 
+    async def _get_control_owner_id(self) -> int | None:
+        if self._control_owner_id is not None:
+            return self._control_owner_id
+        try:
+            app_info = await self.application_info()
+            self._control_owner_id = app_info.owner.id
+        except Exception:
+            return None
+        return self._control_owner_id
+
+    async def on_interaction(self, interaction: discord.Interaction) -> None:
+        """Handle owner-only Approve/Reject buttons sent through the webhook."""
+        data = interaction.data or {}
+        custom_id = data.get("custom_id") if isinstance(data, dict) else None
+        if not isinstance(custom_id, str) or not custom_id.startswith("kamla:approval:"):
+            await super().on_interaction(interaction)
+            return
+
+        parts = custom_id.split(":")
+        if len(parts) != 4 or parts[2] not in {"approve", "reject"}:
+            await interaction.response.send_message(
+                "❌ Invalid approval action.", ephemeral=True
+            )
+            return
+
+        owner_id = await self._get_control_owner_id()
+        if owner_id is None or interaction.user.id != owner_id:
+            await interaction.response.send_message(
+                "⛔ Only the KAMLA owner can approve or reject server setup.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            guild_id = int(parts[3])
+        except ValueError:
+            await interaction.response.send_message(
+                "❌ Invalid server reference.", ephemeral=True
+            )
+            return
+
+        guild = self.get_guild(guild_id)
+        if guild is None:
+            await interaction.response.send_message(
+                "❌ KAMLA is no longer in that server.", ephemeral=True
+            )
+            return
+
+        cfg = await config_manager.get_config(guild)
+        if cfg.get("onboarding_status") != "waiting_approval":
+            await interaction.response.send_message(
+                "ℹ️ This setup request is no longer pending.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        requested_by = int(cfg.get("requested_by", 0))
+        requester = guild.get_member(requested_by)
+        if requester is None and requested_by:
+            try:
+                requester = await guild.fetch_member(requested_by)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                requester = None
+
+        if parts[2] == "reject":
+            cfg = await config_manager.update_config(
+                guild,
+                onboarding_status="rejected",
+                rejected_by=interaction.user.id,
+                rejected_at=discord.utils.utcnow().isoformat(),
+            )
+            await self._notify_setup_result(
+                requester,
+                "❌ KAMLA setup rejected",
+                f"Your KAMLA setup request for **{guild.name}** was rejected. "
+                "KAMLA will now leave the server.",
+                discord.Color.red(),
+            )
+            from webhook import edit_join_log
+            await edit_join_log(guild, cfg)
+            await interaction.followup.send(
+                f"❌ Rejected **{guild.name}**. KAMLA is leaving the server.",
+                ephemeral=True,
+            )
+            await guild.leave()
+            return
+
+        cfg = await config_manager.update_config(
+            guild,
+            onboarding_status="building",
+            approved_by=interaction.user.id,
+            approved_at=discord.utils.utcnow().isoformat(),
+        )
+        from webhook import edit_join_log
+        await edit_join_log(guild, cfg)
+        await self._notify_setup_result(
+            requester,
+            "✅ KAMLA setup approved",
+            f"Your KAMLA setup request for **{guild.name}** was approved. "
+            "The tournament server is now being built.",
+            discord.Color.green(),
+        )
+        await interaction.followup.send(
+            f"✅ Approved **{guild.name}**. KAMLA is building the server now.",
+            ephemeral=True,
+        )
+
+        from setup_cog import _build_approved_server
+        setup_data = {
+            "format": cfg.get("requested_format", "ap"),
+            "rooms": int(cfg.get("requested_rooms", 1)),
+            "timezone": cfg.get("requested_timezone", "+06:00"),
+            "tournament_name": cfg.get("requested_tournament", "Tournament"),
+            "role_name": cfg.get("requested_role", "ORG"),
+            "creator_id": requested_by,
+            "creator": requester,
+        }
+        try:
+            await _build_approved_server(guild, setup_data)
+            cfg = await config_manager.get_config(guild)
+            await self._notify_setup_result(
+                requester,
+                "🎉 Your server is ready",
+                f"**{guild.name}** has been approved and fully set up by KAMLA.",
+                discord.Color.green(),
+            )
+            await edit_join_log(guild, cfg)
+        except Exception as error:
+            cfg = await config_manager.update_config(
+                guild,
+                onboarding_status="build_failed",
+                build_error=str(error)[:500],
+            )
+            await edit_join_log(guild, cfg)
+            await self._notify_setup_result(
+                requester,
+                "⚠️ KAMLA setup failed",
+                f"The request for **{guild.name}** was approved, but the server "
+                "could not be built. Please contact the KAMLA owner.",
+                discord.Color.orange(),
+            )
+
+    @staticmethod
+    async def _notify_setup_result(
+        member: discord.Member | discord.User | None,
+        title: str,
+        description: str,
+        color: discord.Color,
+    ) -> None:
+        if member is None:
+            return
+        try:
+            await member.send(
+                embed=discord.Embed(
+                    title=title,
+                    description=description,
+                    color=color,
+                )
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
     async def on_guild_join(self, guild: discord.Guild) -> None:
         print(f"[KAMLA] Joined guild: {guild.name} ({guild.id})")
         await config_manager.ensure_config_channel(guild)
@@ -91,8 +254,31 @@ class KamlaBot(commands.Bot):
         except discord.Forbidden:
             pass
 
+        existing_cfg = await config_manager.get_config(guild)
+        already_approved = existing_cfg.get("onboarding_status") == "approved"
+        if not already_approved:
+            await config_manager.set_config(
+                guild,
+                {
+                    "onboarding_status": "awaiting_image",
+                    "installer_id": installer.id if installer else 0,
+                    "server_icon_uploaded": False,
+                    "locked": False,
+                },
+            )
+
         from webhook import send_join_log
-        await send_join_log(guild, installer)
+        join_message_id = await send_join_log(guild, installer)
+        if join_message_id:
+            await config_manager.update_config(
+                guild, join_webhook_message_id=join_message_id
+            )
+
+        if already_approved:
+            from webhook import edit_join_log
+            cfg = await config_manager.get_config(guild)
+            await edit_join_log(guild, cfg)
+            return
 
         channel = guild.system_channel
         if channel is None:
@@ -110,15 +296,21 @@ class KamlaBot(commands.Bot):
             description=(
                 f"Hello {installer.mention if installer else 'there'}! "
                 "I'm **KAMLA** — your automated tournament server manager.\n\n"
-                "Click **CREATE NOW** to build your tournament server instantly.\n"
+                "Please upload the server profile picture as an attachment in this "
+                "channel, then click **READY YOUR SERVER**.\n"
                 "Only the person who added me can use this button."
             ),
             color=discord.Color.blurple(),
         )
         embed.set_footer(text="KAMLA • Tournament Automation Bot")
-        await channel.send(
+        onboarding_message = await channel.send(
             embed=embed,
             view=OnJoinView(installer_id=installer.id if installer else 0),
+        )
+        await config_manager.update_config(
+            guild,
+            onboarding_channel_id=channel.id,
+            onboarding_message_id=onboarding_message.id,
         )
 
     async def on_guild_remove(self, guild: discord.Guild) -> None:
