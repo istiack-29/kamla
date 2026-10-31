@@ -14,7 +14,8 @@ def env(monkeypatch):
         return None
     fast = RequestCoordinator("t", 2, 0, retry_kwargs={"sleep": nosleep})
     monkeypatch.setattr(ir, "bulk", fast)
-    monkeypatch.setattr(ir, "notify", fast)
+    import config as cfgmod
+    monkeypatch.setattr(cfgmod, "notify", fast)
     monkeypatch.setattr(ir, "BATCH_DELAY", 0.02)
     monkeypatch.setattr(ir, "config_manager", FakeConfig())
     ir._uses.clear()
@@ -56,27 +57,31 @@ class InviteGuild(FakeGuild):
 
 
 def member(guild, uid=1, bot=False):
-    m = types.SimpleNamespace(id=uid, guild=guild, bot=bot, granted=[])
+    m = types.SimpleNamespace(id=uid, guild=guild, bot=bot, granted=[], roles=[])
 
     async def add_roles(*roles, reason=None):
         m.granted += [r.name for r in roles]
-    m.add_roles = add_roles
+        m.roles += list(roles)
+
+    async def remove_roles(*roles, reason=None):
+        m.roles = [r for r in m.roles if r not in roles]
+    m.add_roles, m.remove_roles = add_roles, remove_roles
     return m
 
 
-async def test_creates_three_lifetime_invites_with_right_roles():
+async def test_creates_five_lifetime_invites_each_with_exactly_one_role():
     g = InviteGuild(); g.make_welcome()
     links = await ir.create_role_invites(g)
-    assert [l["key"] for l in links] == ["visitor", "captain", "staff"]
-    assert [l["roles"] for l in links] == [["VISITOR"], ["CAP"], ["TABBY", "ORG", "EQUITY"]]
-    assert len({l["url"] for l in links}) == 3 and len(g.live) == 3
+    assert [l["key"] for l in links] == ["visitor", "captain", "tabby", "org", "equity"]
+    assert [l["roles"] for l in links] == [["VISITOR"], ["CAP"], ["TABBY"], ["ORG"], ["EQUITY"]]
+    assert len({l["url"] for l in links}) == 5 and len(g.live) == 5
 
 
 async def test_rerun_reuses_live_invites_and_recreates_dead_ones():
     g = InviteGuild(); g.make_welcome()
     first = await ir.create_role_invites(g)
     again = await ir.create_role_invites(g)
-    assert [l["code"] for l in again] == [l["code"] for l in first] and len(g.live) == 3
+    assert [l["code"] for l in again] == [l["code"] for l in first] and len(g.live) == 5
     del g.live[first[1]["code"]]                                  # one expired/deleted
     third = await ir.create_role_invites(g)
     assert third[0]["code"] == first[0]["code"] and third[1]["code"] != first[1]["code"]
@@ -89,7 +94,7 @@ async def test_dm_text_contains_copyable_links_and_instruction():
     for l in links:
         assert f"<{l['url']}>" in text
     assert "send the links as per your need" in text.lower()
-    assert "administrator" in text
+    assert "administrator" in text and "[T]" in text and "[O]" in text and "[E]" in text
 
 
 async def joined_via(cog, g, code, who):
@@ -103,11 +108,21 @@ async def test_member_joining_via_each_link_gets_those_roles():
     g = InviteGuild(); g.make_welcome()
     links = await ir.create_role_invites(g)
     cog = ir.InviteRolesCog(bot=None)
-    v, c, s = member(g, 1), member(g, 2), member(g, 3)
-    await joined_via(cog, g, links[0]["code"], [v])
-    await joined_via(cog, g, links[1]["code"], [c])
-    await joined_via(cog, g, links[2]["code"], [s])
-    assert v.granted == ["VISITOR"] and c.granted == ["CAP"] and sorted(s.granted) == ["EQUITY", "ORG", "TABBY"]
+    people = [member(g, i) for i in range(1, 6)]
+    for link, who in zip(links, people):
+        await joined_via(cog, g, link["code"], [who])
+    assert [p.granted for p in people] == [["VISITOR"], ["CAP"], ["TABBY"], ["ORG"], ["EQUITY"]]
+    assert all(len(p.roles) == 1 for p in people)               # never more than one role
+
+
+async def test_invite_never_stacks_roles_on_someone_who_already_has_one():
+    g = InviteGuild(); g.make_welcome()
+    links = await ir.create_role_invites(g)
+    cog = ir.InviteRolesCog(bot=None)
+    rejoiner = member(g, 1)
+    rejoiner.roles = [r for r in g.roles if r.name == "VISITOR"]
+    await joined_via(cog, g, links[3]["code"], [rejoiner])      # joins via the [O] link
+    assert [r.name for r in rejoiner.roles] == ["ORG"]
 
 
 async def test_burst_of_joins_on_one_link_costs_one_lookup():
@@ -129,13 +144,13 @@ async def test_ambiguous_joins_never_grant_roles():
     cog = ir.InviteRolesCog(bot=None)
     a, b = member(g, 1), member(g, 2)
     g.live[links[0]["code"]].uses += 1                    # two different invites changed,
-    g.live[links[2]["code"]].uses += 1                    # including the staff one
+    g.live[links[3]["code"]].uses += 1                    # including an admin ([O]) one
     await cog.on_member_join(a); await cog.on_member_join(b)
     await asyncio.sleep(0.2)
     assert a.granted == [] and b.granted == []
     # more invite uses than joins we witnessed (someone joined while we weren't looking)
     c = member(g, 3)
-    g.live[links[2]["code"]].uses += 2
+    g.live[links[3]["code"]].uses += 2
     await cog.on_member_join(c)
     await asyncio.sleep(0.2)
     assert c.granted == []

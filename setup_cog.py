@@ -169,7 +169,7 @@ async def _do_build(interaction: discord.Interaction, setup_data: dict) -> None:
                 links_field = "\n".join(f"**{i['label']}**\n<{i['url']}>" for i in links)
                 links_note = "Your DMs are closed, so the invite links are shown here."
             else:
-                links_note = "The 3 role invite links were sent to your DMs."
+                links_note = "The 5 role invite links were sent to your DMs."
         except Exception as e:
             log.warning("Could not create role invite links: %s", describe(e))
             links_note = "⚠️ The role invite links could not be created."

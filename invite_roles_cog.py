@@ -1,12 +1,12 @@
 """
 invite_roles_cog.py — role-granting invite links.
 
-After a server build KAMLA creates three permanent, unlimited-use invites in the welcome
-channel and DMs them to whoever ran the build:
+After a server build KAMLA creates five permanent, unlimited-use invites in the welcome
+channel and DMs them to whoever ran the build. Each link grants exactly ONE role (a member
+can only ever hold one KAMLA role; assignment goes through assign_kamla_role, which removes
+any other KAMLA role first):
 
-    [V]            ->  VISITOR
-    [CA]           ->  CAP
-    [T] [O] [E]    ->  TABBY + ORG + EQUITY      (staff link — grants admin roles!)
+    [V] VISITOR   [CA] CAP   [T] TABBY   [O] ORG   [E] EQUITY     (CAP/TABBY/ORG/EQUITY are admin roles)
 
 Discord invites cannot carry roles, so KAMLA works out which invite a new member used by
 comparing invite use-counts before/after the join, then assigns that invite's role(s).
@@ -25,8 +25,8 @@ import logging
 import discord
 from discord.ext import commands
 
-from config import config_manager
-from ratelimit import bulk, notify, describe
+from config import config_manager, assign_kamla_role
+from ratelimit import bulk, describe
 
 log = logging.getLogger("kamla.invites")
 
@@ -35,10 +35,13 @@ BATCH_DELAY = 1.0
 
 # key -> (label shown to the user, roles granted)
 GROUPS = [
-    ("visitor", "[V] Visitor",                 ["VISITOR"]),
-    ("captain", "[CA] Captain",                ["CAP"]),
-    ("staff",   "[T] [O] [E] Tabby + Org + Equity", ["TABBY", "ORG", "EQUITY"]),
+    ("visitor", "[V] Visitor", ["VISITOR"]),
+    ("captain", "[CA] Captain", ["CAP"]),
+    ("tabby",   "[T] Tabby",   ["TABBY"]),
+    ("org",     "[O] Org",     ["ORG"]),
+    ("equity",  "[E] Equity",  ["EQUITY"]),
 ]
+ADMIN_LABELS = "[CA], [T], [O] and [E]"
 
 # guild_id -> {invite code: uses}. In memory only; rebuilt from Discord on startup.
 _uses: dict[int, dict[str, int]] = {}
@@ -53,7 +56,7 @@ async def _snapshot(guild: discord.Guild) -> dict[str, int]:
 
 
 async def create_role_invites(guild: discord.Guild) -> list[dict]:
-    """Create (or reuse still-valid) the three invites. Returns
+    """Create (or reuse still-valid) the five invites. Returns
     [{key, label, roles, code, url}], in display order. Idempotent: re-running after an
     interrupted build reuses invites that still exist instead of making duplicates."""
     channel = discord.utils.get(guild.text_channels, name=WELCOME_CHANNEL)
@@ -92,9 +95,9 @@ def dm_text(tournament: str, links: list[dict]) -> str:
         lines.append(f"<{item['url']}>")
         lines.append("")
     lines.append("These links never expire and can be used any number of times. "
-                 "Anyone who joins with a link gets the role(s) shown above.")
-    lines.append("⚠️ The last link grants **TABBY, ORG and EQUITY** (administrator roles) — "
-                 "share it only with people you fully trust.")
+                 "Anyone who joins with a link gets the role shown above (one role per person).")
+    lines.append(f"⚠️ The {ADMIN_LABELS} links grant **administrator roles** — "
+                 "share them only with people you fully trust.")
     lines.append("")
     lines.append("Please send the links as per your need.")
     return "\n".join(lines)
@@ -194,20 +197,17 @@ class InviteRolesCog(commands.Cog):
         entry = mapping.get(code)
         if not entry:
             return                                        # a normal, non-role invite
-        roles = [r for r in (discord.utils.get(guild.roles, name=n) for n in entry["roles"]) if r]
-        if not roles:
-            log.warning("Roles %s for invite %s are missing in guild %s.", entry["roles"], code, guild.id)
+        role = discord.utils.get(guild.roles, name=entry["roles"][0])
+        if role is None:
+            log.warning("Role %s for invite %s is missing in guild %s.", entry["roles"][0], code, guild.id)
             return
         for member in members:
             try:
-                await notify.run(
-                    lambda m=member: m.add_roles(*roles, reason=f"KAMLA role invite ({entry['key']})"),
-                    label="invite-role")
-                log.info("Assigned %s to a new member via the %s invite.", entry["roles"], entry["key"])
-            except discord.Forbidden:
-                log.warning("Missing permission to assign %s (check role hierarchy).", entry["roles"])
+                # one KAMLA role per person: removes any other KAMLA role, then adds this one
+                await assign_kamla_role(member, role)
+                log.info("Assigned %s to a new member via the %s invite.", role.name, entry["key"])
             except Exception as e:  # noqa: BLE001
-                log.warning("Could not assign invite roles: %s", describe(e))
+                log.warning("Could not assign invite role: %s", describe(e))
 
 
 async def setup(bot: commands.Bot):
