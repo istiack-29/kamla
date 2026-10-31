@@ -15,12 +15,12 @@ from tests.fakes import http_error, FakeGuild, FakeChannel, FakeCategory
 
 BASELINE = {
     "cogs": ["AllInCog", "AssignCog", "DMNotifyCog", "GamesCog", "PoiCog", "PollsCog", "RolesCog",
-             "SettingsCog", "SetupCog", "TimerCog", "TossCog", "WelcomeCog"],
-    "commands": ["close", "mention", "newpoll", "play", "rebuild", "st", "toss"],
+             "SettingsCog", "SetupCog", "TimerCog", "TossCog", "WelcomeCog", "NicknameCog"],
+    "commands": ["close", "mention", "newpoll", "nicknames", "play", "rebuild", "st", "toss"],
     "custom_ids": ["kamla:allin:push_back", "kamla:on_join:create_now", "kamla:role:debater",
                    "kamla:role:independent_adj", "kamla:role:invited_adj", "kamla:role:visitor",
                    "kamla:s:add", "kamla:s:del", "kamla:s:fmt", "kamla:s:lock"],
-    "listeners": {"on_member_join": 2, "on_member_remove": 2, "on_member_update": 2, "on_message": 7},
+    "listeners": {"on_member_join": 2, "on_member_remove": 2, "on_member_update": 3, "on_message": 7},
     "views": ["AllInView", "OnJoinView", "RoleSelectView", "SettingsView"],
 }
 
@@ -39,7 +39,7 @@ async def test_startup_once_and_features_preserved(state_dir):
         await bot.setup_hook()
         await bot.setup_hook()                      # accidental second call must be a no-op
     assert sync.await_count == 1
-    assert sorted(bot.cogs) == BASELINE["cogs"]
+    assert sorted(bot.cogs) == sorted(BASELINE["cogs"])
     assert sorted(c.qualified_name for c in bot.tree.walk_commands()) == BASELINE["commands"]
     assert sorted(i.custom_id for v in bot.persistent_views for i in v.children if getattr(i, "custom_id", None)) == BASELINE["custom_ids"]
     assert sorted(v.__class__.__name__ for v in bot.persistent_views) == BASELINE["views"]
