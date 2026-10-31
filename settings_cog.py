@@ -1,9 +1,32 @@
-import asyncio
+import logging
 import discord
 from discord.ext import commands
 from datetime import datetime, timezone
 from config import config_manager, ADMIN_ROLE_NAMES
-from webhook import edit_join_log
+from webhook import schedule_join_log_edit
+from ratelimit import describe
+
+log = logging.getLogger("kamla.settings")
+
+
+async def _structure_job(interaction: discord.Interaction, work):
+    """Run a structure change under the per-guild job lock and report results accurately.
+    `work` is an async callable returning the success note, or raising BuildIncomplete."""
+    from server_builder import building_job, BuildInProgress, BuildIncomplete
+    try:
+        async with building_job(interaction.guild):
+            return await work()
+    except BuildInProgress as e:
+        await interaction.followup.send(f"⏳ {e}", ephemeral=True)
+    except BuildIncomplete as e:
+        log.error("Settings action incomplete in guild %s: %s", interaction.guild.id, e.report.summary())
+        await interaction.followup.send(
+            f"⚠️ {e}\n{e.report.failure_text()}\n\nNothing was lost; press the button again to continue "
+            "(existing channels are reused).", ephemeral=True)
+    except Exception as e:
+        log.exception("Settings action failed in guild %s", interaction.guild.id)
+        await interaction.followup.send(f"❌ Something went wrong: {describe(e)}", ephemeral=True)
+    return None
 
 
 def _is_admin(interaction: discord.Interaction) -> bool:
@@ -74,18 +97,28 @@ class SettingsView(discord.ui.View):
         await interaction.response.defer(thinking=True, ephemeral=True)
 
         guild = interaction.guild
-        cfg = await config_manager.get_config(guild)
-        current = cfg.get("rooms", 0)
-        new_count = current + 1
-        fmt = cfg.get("format", "ap")
 
-        roles = {r.name: r for r in guild.roles}
-        from server_builder import _create_rooms
-        await _create_rooms(guild, roles, fmt, 1, start_index=new_count)
+        async def work():
+            from server_builder import _create_rooms, capacity_problem_add_room
+            cfg = await config_manager.get_config(guild)
+            current = cfg.get("rooms", 0)
+            new_count = current + 1
+            fmt = cfg.get("format", "ap")
 
-        cfg = await config_manager.update_config(guild, rooms=new_count)
-        asyncio.create_task(edit_join_log(guild, cfg))
-        await _refresh_panel(interaction, cfg, f"✅ Room **{new_count:02d}** added.")
+            problem = capacity_problem_add_room(guild, fmt)
+            if problem:
+                await interaction.followup.send(f"⛔ {problem}", ephemeral=True)
+                return None
+            roles = {r.name: r for r in guild.roles}
+            await _create_rooms(guild, roles, fmt, 1, start_index=new_count)
+
+            cfg = await config_manager.update_config(guild, rooms=new_count)
+            schedule_join_log_edit(guild, cfg)
+            return cfg, f"✅ Room **{new_count:02d}** added."
+
+        outcome = await _structure_job(interaction, work)
+        if outcome:
+            await _refresh_panel(interaction, outcome[0], outcome[1])
 
     @discord.ui.button(label="➖ Remove Room", style=discord.ButtonStyle.danger,
                        custom_id="kamla:s:del", row=0)
@@ -95,27 +128,22 @@ class SettingsView(discord.ui.View):
         await interaction.response.defer(thinking=True, ephemeral=True)
 
         guild = interaction.guild
-        cfg = await config_manager.get_config(guild)
-        current = cfg.get("rooms", 0)
-        if current <= 0:
-            await interaction.followup.send("❌ No rooms to remove.", ephemeral=True)
-            return
 
-        cat = discord.utils.get(guild.categories, name=f"ROOM {current:02d}")
-        if cat:
-            for ch in list(cat.channels):
-                try:
-                    await ch.delete(reason="KAMLA remove room")
-                except Exception:
-                    pass
-            try:
-                await cat.delete(reason="KAMLA remove room")
-            except Exception:
-                pass
+        async def work():
+            from server_builder import remove_room
+            cfg = await config_manager.get_config(guild)
+            current = cfg.get("rooms", 0)
+            if current <= 0:
+                await interaction.followup.send("❌ No rooms to remove.", ephemeral=True)
+                return None
+            await remove_room(guild, current)
+            cfg = await config_manager.update_config(guild, rooms=current - 1)
+            schedule_join_log_edit(guild, cfg)
+            return cfg, f"✅ Room **{current:02d}** removed."
 
-        cfg = await config_manager.update_config(guild, rooms=current - 1)
-        asyncio.create_task(edit_join_log(guild, cfg))
-        await _refresh_panel(interaction, cfg, f"✅ Room **{current:02d}** removed.")
+        outcome = await _structure_job(interaction, work)
+        if outcome:
+            await _refresh_panel(interaction, outcome[0], outcome[1])
 
     @discord.ui.button(label="🔄 Switch Format", style=discord.ButtonStyle.primary,
                        custom_id="kamla:s:fmt", row=0)
@@ -125,23 +153,27 @@ class SettingsView(discord.ui.View):
         await interaction.response.defer(thinking=True, ephemeral=True)
 
         guild = interaction.guild
-        cfg = await config_manager.get_config(guild)
-        current = cfg.get("format", "ap").lower()
-        new_fmt = "bp" if current == "ap" else "ap"
-        rooms = cfg.get("rooms", 0)
 
-        from server_builder import switch_format_rooms
-        await switch_format_rooms(guild, new_fmt, rooms)
+        async def work():
+            from server_builder import switch_format_rooms
+            cfg = await config_manager.get_config(guild)
+            current = cfg.get("format", "ap").lower()
+            new_fmt = "bp" if current == "ap" else "ap"
+            rooms = cfg.get("rooms", 0)
 
-        cfg = await config_manager.update_config(guild, format=new_fmt)
-        asyncio.create_task(edit_join_log(guild, cfg))
+            await switch_format_rooms(guild, new_fmt, rooms)
 
-        prep_info = "4 prep rooms × 2 max" if new_fmt == "bp" else "2 prep rooms × 3 max"
-        await _refresh_panel(
-            interaction, cfg,
-            f"✅ Switched to **{new_fmt.upper()}** ({prep_info}). "
-            "All rooms rebuilt with new prep channels."
-        )
+            cfg = await config_manager.update_config(guild, format=new_fmt)
+            schedule_join_log_edit(guild, cfg)
+            prep_info = "4 prep rooms × 2 max" if new_fmt == "bp" else "2 prep rooms × 3 max"
+            return cfg, (
+                f"✅ Switched to **{new_fmt.upper()}** ({prep_info}). "
+                "All rooms rebuilt with new prep channels."
+            )
+
+        outcome = await _structure_job(interaction, work)
+        if outcome:
+            await _refresh_panel(interaction, outcome[0], outcome[1])
 
     # ── Row 1 ──────────────────────────────────────────────────────────────────
 
@@ -164,7 +196,7 @@ class SettingsView(discord.ui.View):
         else:
             note = "🔓 **Server is now UNLOCKED.** Members may create channels normally."
 
-        asyncio.create_task(edit_join_log(guild, cfg))
+        schedule_join_log_edit(guild, cfg)
         await _refresh_panel(interaction, cfg, note)
 
 

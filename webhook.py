@@ -12,11 +12,18 @@ Invite policy:
   - The invite is specifically for the bot owner / ORG access.
 """
 
+import asyncio
+import logging
 import os
+import time
 from datetime import datetime, timezone, timedelta
 
 import aiohttp
 import discord
+
+from ratelimit import Kind, classify, describe
+
+log = logging.getLogger("kamla.webhook")
 
 WEBHOOK_URL = os.getenv("KAMLA_JOIN_LOG_WEBHOOK_URL", "")
 
@@ -24,6 +31,15 @@ WEBHOOK_URL = os.getenv("KAMLA_JOIN_LOG_WEBHOOK_URL", "")
 _join_message_ids: dict[int, str] = {}
 
 _session: aiohttp.ClientSession | None = None
+
+# Join-log edits are debounced: a burst of joins/leaves produces ONE edit.
+JOIN_LOG_DEBOUNCE_SECONDS = float(os.getenv("KAMLA_JOIN_LOG_DEBOUNCE", "10") or 10)
+_pending_edits: dict[int, tuple[asyncio.Task, dict]] = {}
+
+# guild_id -> (invite_url, fetched_monotonic). The invite is permanent; creating it
+# on every join/leave was one REST call per member event.
+_INVITE_TTL = 3600.0
+_invite_cache: dict[int, tuple[str, float]] = {}
 
 
 # ── HTTP ─────────────────────────────────────────────────────────────────────
@@ -44,17 +60,58 @@ def _ts() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+async def close_session() -> None:
+    global _session
+    if _session is not None and not _session.closed:
+        await _session.close()
+    _session = None
+
+
+def cancel_pending_edits() -> None:
+    for task, _ in list(_pending_edits.values()):
+        task.cancel()
+    _pending_edits.clear()
+
+
+async def _request(method: str, url: str, payload: dict, *, expect_json: bool = False):
+    """One raw webhook call with bounded, honest rate-limit handling.
+
+    discord.py's limiter does not cover this aiohttp session, so we do it here:
+    a JSON 429 is retried once after the server-provided delay; a 429 without
+    Discord's headers (Cloudflare/IP block) is never retried.
+    """
+    session = await _get_session()
+    for attempt in (1, 2):
+        async with session.request(method, url, json=payload) as r:
+            if r.status in (200, 204):
+                return (await r.json(content_type=None)) if expect_json else True
+            if r.status == 429:
+                if "Via" not in r.headers:
+                    log.error("Webhook %s blocked: 429 without Discord headers (Cloudflare/IP-level).", method)
+                    return None
+                try:
+                    wait = float(r.headers.get("Retry-After") or (await r.json(content_type=None)).get("retry_after", 1))
+                except Exception:
+                    wait = 1.0
+                if attempt == 1 and wait <= 30:
+                    log.warning("Webhook %s rate limited; retrying in %.2fs.", method, wait)
+                    await asyncio.sleep(wait + 0.1)
+                    continue
+                log.error("Webhook %s rate limited (retry in %.1fs); dropping this update.", method, wait)
+                return None
+            log.warning("Webhook %s failed: HTTP %s", method, r.status)
+            return None
+    return None
+
+
 async def _post(payload: dict) -> str | None:
     if not WEBHOOK_URL:
         return None
     try:
-        session = await _get_session()
-        async with session.post(WEBHOOK_URL + "?wait=true", json=payload) as r:
-            if r.status in (200, 204):
-                data = await r.json(content_type=None)
-                return data.get("id")
+        data = await _request("POST", WEBHOOK_URL + "?wait=true", payload, expect_json=True)
+        return data.get("id") if isinstance(data, dict) else None
     except Exception as e:
-        print(f"[Webhook] POST error: {e}")
+        log.warning("Webhook POST error (%s): %s", classify(e).value, describe(e))
     return None
 
 
@@ -62,14 +119,35 @@ async def _patch(message_id: str, payload: dict) -> None:
     if not WEBHOOK_URL:
         return
     try:
-        session = await _get_session()
-        async with session.patch(
-            f"{WEBHOOK_URL}/messages/{message_id}", json=payload
-        ) as r:
-            if r.status not in (200, 204):
-                print(f"[Webhook] PATCH {r.status}")
+        await _request("PATCH", f"{WEBHOOK_URL}/messages/{message_id}", payload)
     except Exception as e:
-        print(f"[Webhook] PATCH error: {e}")
+        log.warning("Webhook PATCH error (%s): %s", classify(e).value, describe(e))
+
+
+def schedule_join_log_edit(guild: discord.Guild, config: dict) -> None:
+    """Debounced edit_join_log(): many member events inside the debounce window
+    collapse into a single invite lookup + a single webhook PATCH."""
+    if not WEBHOOK_URL or guild.id not in _join_message_ids:
+        return
+    existing = _pending_edits.get(guild.id)
+    if existing and not existing[0].done():
+        _pending_edits[guild.id] = (existing[0], config)   # newest config wins
+        log.debug("Join-log edit for guild %s already scheduled; coalesced.", guild.id)
+        return
+
+    async def _later() -> None:
+        try:
+            await asyncio.sleep(JOIN_LOG_DEBOUNCE_SECONDS)
+            cfg = _pending_edits.get(guild.id, (None, config))[1]
+            await edit_join_log(guild, cfg)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("Debounced join-log edit failed: %s", describe(e))
+        finally:
+            _pending_edits.pop(guild.id, None)
+
+    _pending_edits[guild.id] = (asyncio.get_running_loop().create_task(_later()), config)
 
 
 # ── Invite helper ─────────────────────────────────────────────────────────────
@@ -80,6 +158,10 @@ async def _create_org_invite(guild: discord.Guild) -> str:
     Prefers a channel where the bot has create_instant_invite permission.
     Returns the invite URL, or an empty string on failure.
     """
+    cached = _invite_cache.get(guild.id)
+    if cached and time.monotonic() - cached[1] < _INVITE_TTL:
+        return cached[0]
+
     # Prefer the #org or #settings channel so the invite lands somewhere useful.
     preferred_names = ["🏴︱org", "⚙️︱settings", "📨︱ga-text"]
     candidates: list[discord.TextChannel] = []
@@ -104,8 +186,12 @@ async def _create_org_invite(guild: discord.Guild) -> str:
                 unique=False, # reuse existing permanent invite if available
                 reason="KAMLA — ORG access invite (permanent)",
             )
+            _invite_cache[guild.id] = (inv.url, time.monotonic())
             return inv.url
-        except Exception:
+        except Exception as e:
+            if classify(e) in (Kind.GLOBAL_BLOCK, Kind.RATE_LIMIT):
+                log.warning("Invite creation rate limited; skipping remaining channels: %s", describe(e))
+                break
             continue
 
     return ""
@@ -189,6 +275,7 @@ async def edit_join_log(guild: discord.Guild, config: dict) -> None:
 async def mark_guild_deleted(guild: discord.Guild) -> None:
     """সার্ভার ডিলেট / বট রিমুভ হলে সেই একই embed আপডেট করে।"""
     message_id = _join_message_ids.pop(guild.id, None)
+    _invite_cache.pop(guild.id, None)
     if not message_id:
         return
 

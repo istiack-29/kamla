@@ -1,3 +1,5 @@
+import logging
+
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -5,6 +7,9 @@ from config import (
     KAMLA_ROLE_NAMES, ADMIN_ROLE_NAMES,
     get_kamla_role, assign_kamla_role,
 )
+from ratelimit import notify, describe
+
+log = logging.getLogger("kamla.assign")
 
 ASSIGN_CHANNEL_ROLE_MAP: dict[str, str] = {
     "org":                      "ORG",
@@ -35,24 +40,35 @@ def _in_assign_category(channel: discord.TextChannel) -> bool:
     return "assign" in channel.category.name.lower()
 
 
+def _channels_for_roles(assign_cat: discord.CategoryChannel, role_names) -> list[discord.TextChannel]:
+    """Assign channels that can hold a mention for any of these KAMLA roles."""
+    wanted = {ROLE_ASSIGN_CHANNEL_MAP[n] for n in role_names if n in ROLE_ASSIGN_CHANNEL_MAP}
+    return [ch for ch in assign_cat.text_channels if ch.name.lower() in wanted]
+
+
 async def _cleanup_old_mentions(
     assign_cat: discord.CategoryChannel,
     member: discord.Member,
     keep_channel_id: int,
+    only_channels: "list[discord.TextChannel] | None" = None,
 ) -> None:
-    """Delete any messages mentioning `member` in OTHER assign channels."""
-    for ch in assign_cat.text_channels:
+    """Delete messages mentioning `member` in OTHER assign channels.
+
+    A member's mention only ever lives in the assign channel of the role they hold, so
+    callers pass `only_channels` (the channels of their previous KAMLA role(s)). The old
+    code scanned all 7 other channels x 200 messages (>= 14 history requests) for EVERY
+    assignment, which turns a rush of role clicks into thousands of requests.
+    When `only_channels` is None the full scan is kept as a fallback."""
+    channels = only_channels if only_channels is not None else assign_cat.text_channels
+    for ch in channels:
         if ch.id == keep_channel_id:
             continue
         try:
             async for msg in ch.history(limit=200):
                 if member in msg.mentions:
-                    try:
-                        await msg.delete()
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                    await notify.best_effort(lambda m=msg: m.delete(), label="assign-cleanup-delete")
+        except Exception as e:
+            log.debug("Could not scan #%s for old mentions: %s", ch.name, describe(e))
 
 
 class AssignCog(commands.Cog):
@@ -128,13 +144,18 @@ class AssignCog(commands.Cog):
         results = []
         assign_cat = message.channel.category
         for target in targets:
+            # Roles held BEFORE the swap tell us which assign channel(s) hold the old mention.
+            previous = [r.name for r in target.roles if r.name in KAMLA_ROLE_NAMES and r.name != role_name]
             # Mark as bot-assigned so on_member_update skips double-post
             _bot_assigned_roles.add((message.guild.id, target.id, role_name))
             await assign_kamla_role(target, role)
             results.append(target.mention)
-            # Remove the user's previous mention from any other assign channel
-            if assign_cat is not None:
-                await _cleanup_old_mentions(assign_cat, target, message.channel.id)
+            # Remove the user's previous mention from the assign channel of their old role
+            if assign_cat is not None and previous:
+                await _cleanup_old_mentions(
+                    assign_cat, target, message.channel.id,
+                    only_channels=_channels_for_roles(assign_cat, previous),
+                )
 
         if results and not message.author.bot:
             await message.channel.send(
@@ -180,14 +201,17 @@ class AssignCog(commands.Cog):
             if assign_ch is None:
                 continue
 
-            # Clean up old mentions in all other assign channels first
-            await _cleanup_old_mentions(assign_cat, after, assign_ch.id)
+            # Clean up the old mention (assign channel of the role(s) they just lost)
+            lost = [n for n in (before_role_names - after_role_names) if n in KAMLA_ROLE_NAMES]
+            if lost:
+                await _cleanup_old_mentions(
+                    assign_cat, after, assign_ch.id,
+                    only_channels=_channels_for_roles(assign_cat, lost),
+                )
 
             # Post the mention in the correct channel
-            try:
-                await assign_ch.send(after.mention)
-            except Exception as e:
-                print(f"[AssignCog] Could not post mention in #{ch_name}: {e}")
+            if not await notify.best_effort(lambda: assign_ch.send(after.mention), label="assign-mention"):
+                log.warning("Could not post mention in #%s", ch_name)
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member) -> None:
@@ -195,16 +219,16 @@ class AssignCog(commands.Cog):
         assign_cat = discord.utils.get(guild.categories, name="🛅︱ASSIGN")
         if assign_cat is None:
             return
-        for ch in assign_cat.text_channels:
-            try:
-                async for msg in ch.history(limit=200):
-                    if member in msg.mentions:
-                        try:
-                            await msg.delete()
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+        # Only the channel(s) of the role(s) the member held can contain their mention.
+        # (Members with no KAMLA role — e.g. someone who joined and left without
+        # claiming one — now cost zero requests instead of a full scan.)
+        held = [r.name for r in member.roles if r.name in KAMLA_ROLE_NAMES]
+        if not held:
+            return
+        await _cleanup_old_mentions(
+            assign_cat, member, keep_channel_id=0,
+            only_channels=_channels_for_roles(assign_cat, held),
+        )
 
     @app_commands.command(name="mention", description="Mention a user in a channel.")
     @app_commands.describe(user="User to mention", channel="Channel to mention them in")

@@ -11,14 +11,12 @@ Sends a DM to the user when:
 import discord
 from discord.ext import commands
 from config import KAMLA_ROLE_NAMES
+from ratelimit import notify
 
 
 async def _dm(user: discord.User | discord.Member, embed: discord.Embed) -> None:
     """Send a DM; silently ignore if DMs are closed."""
-    try:
-        await user.send(embed=embed)
-    except (discord.Forbidden, discord.HTTPException):
-        pass
+    await notify.best_effort(lambda: user.send(embed=embed), label="dm")
 
 
 class DMNotifyCog(commands.Cog):

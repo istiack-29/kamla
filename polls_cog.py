@@ -19,6 +19,7 @@ import uuid
 from datetime import datetime, timezone
 
 import discord
+from ratelimit import notify
 from discord import app_commands
 from discord.ext import commands
 POLL_CHANNEL_NAME = "📊︱poll"
@@ -398,11 +399,13 @@ class PollsCog(commands.Cog):
         msg = await channel.send(embed=_build_poll_embed(poll), view=PollView(poll))
         poll.message_id = msg.id
 
+        # DM fan-out (can be hundreds of members when a role is targeted): sequential and
+        # paced through the shared coordinator; closed DMs are expected and not retried.
         for member in audience:
-            try:
-                await member.send(f"📊 A poll has been opened for you in {channel.mention}. Please participate.")
-            except Exception:
-                pass
+            await notify.best_effort(
+                lambda m=member: m.send(f"📊 A poll has been opened for you in {channel.mention}. Please participate."),
+                label="poll-dm",
+            )
 
     @app_commands.command(name="close", description="Close an active poll or yes/no vote.")
     @app_commands.describe(where="Exact topic/title of the poll to close (leave empty to pick from a list)")
