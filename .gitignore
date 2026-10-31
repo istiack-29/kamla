@@ -1,0 +1,4 @@
+__pycache__/
+.pytest_cache/
+.kamla_sync_hash
+.env

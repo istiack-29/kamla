@@ -1,7 +1,17 @@
 import discord
 import json
 import asyncio
+import logging
+import time
 from datetime import datetime, timezone, timedelta
+
+from ratelimit import notify, describe
+
+log = logging.getLogger("kamla.config")
+
+# How long to remember "this guild has no readable config" so callers that run on
+# every message (POI, timers) do not re-read the config channel history each time.
+_MISS_TTL = 60.0
 
 CHANNEL_NAME = "🔒︱kamla-config"
 WARNING_MSG = (
@@ -20,6 +30,7 @@ ADMIN_ROLE_NAMES = ["ORG", "CAP", "TABBY", "EQUITY"]
 class ConfigManager:
     _cache: dict[int, dict] = {}
     _channel_ids: dict[int, int] = {}
+    _miss_until: dict[int, float] = {}
 
     async def ensure_config_channel(self, guild: discord.Guild) -> discord.TextChannel:
         for ch in guild.text_channels:
@@ -55,6 +66,8 @@ class ConfigManager:
     async def get_config(self, guild: discord.Guild) -> dict:
         if guild.id in self._cache and self._cache[guild.id]:
             return dict(self._cache[guild.id])
+        if time.monotonic() < self._miss_until.get(guild.id, 0.0):
+            return {}
 
         try:
             channel = await self.ensure_config_channel(guild)
@@ -68,17 +81,19 @@ class ConfigManager:
                     except (json.JSONDecodeError, ValueError):
                         continue
         except Exception as e:
-            print(f"[ConfigManager] get_config error for guild {guild.id}: {e}")
+            log.warning("get_config error for guild %s: %s", guild.id, describe(e))
 
+        self._miss_until[guild.id] = time.monotonic() + _MISS_TTL
         return {}
 
     async def set_config(self, guild: discord.Guild, data: dict) -> None:
         self._cache[guild.id] = dict(data)
+        self._miss_until.pop(guild.id, None)
         try:
             channel = await self.ensure_config_channel(guild)
             await channel.send(json.dumps(data, ensure_ascii=False))
         except Exception as e:
-            print(f"[ConfigManager] set_config error for guild {guild.id}: {e}")
+            log.warning("set_config error for guild %s: %s", guild.id, describe(e))
 
     async def update_config(self, guild: discord.Guild, **kwargs) -> dict:
         current = await self.get_config(guild)
@@ -91,6 +106,7 @@ class ConfigManager:
 
     def invalidate(self, guild_id: int) -> None:
         self._cache.pop(guild_id, None)
+        self._miss_until.pop(guild_id, None)
 
 
 def get_kamla_role(guild: discord.Guild, name: str) -> discord.Role | None:
@@ -112,13 +128,19 @@ async def assign_kamla_role(member: discord.Member, role: discord.Role) -> None:
     ]
     if to_remove:
         try:
-            await member.remove_roles(*to_remove, reason="KAMLA role replacement")
+            await notify.run(
+                lambda: member.remove_roles(*to_remove, reason="KAMLA role replacement"),
+                label="remove_roles",
+            )
         except discord.Forbidden:
-            pass
+            log.warning("Missing permission to remove roles from %s (check role hierarchy).", member.id)
     try:
-        await member.add_roles(role, reason="KAMLA role assignment")
+        await notify.run(
+            lambda: member.add_roles(role, reason="KAMLA role assignment"),
+            label="add_roles",
+        )
     except discord.Forbidden:
-        pass
+        log.warning("Missing permission to add role %s to %s (check role hierarchy).", role.name, member.id)
 
 
 config_manager = ConfigManager()

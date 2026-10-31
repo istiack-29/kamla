@@ -1,7 +1,13 @@
+import logging
+import time
+
 import discord
 from discord import app_commands
 from discord.ext import commands
 from config import config_manager, ADMIN_ROLE_NAMES
+from ratelimit import describe
+
+log = logging.getLogger("kamla.setup")
 
 ADMIN_ASSIGN_CHANNEL_MAP = {
     "ORG":    "org",
@@ -58,6 +64,10 @@ class ConfirmBuildView(discord.ui.View):
 
 
 async def _do_build(interaction: discord.Interaction, setup_data: dict) -> None:
+    from server_builder import (
+        wipe_server, build_server, building_job, find_resumable, mark_build_state,
+        capacity_problem_fresh_build, BuildInProgress, BuildIncomplete,
+    )
     guild = interaction.guild
     fmt            = setup_data["format"]
     rooms          = setup_data["rooms"]
@@ -65,6 +75,11 @@ async def _do_build(interaction: discord.Interaction, setup_data: dict) -> None:
     tournament_name = setup_data["tournament_name"]
     creator_id     = interaction.user.id
     role_name      = setup_data["role_name"]
+
+    problem = capacity_problem_fresh_build(fmt, rooms)
+    if problem:
+        await interaction.followup.send(f"⛔ {problem}", ephemeral=True)
+        return
 
     status_msg = await interaction.followup.send(
         embed=discord.Embed(
@@ -81,36 +96,64 @@ async def _do_build(interaction: discord.Interaction, setup_data: dict) -> None:
         wait=True,
     )
 
-    try:
-        from server_builder import wipe_server, build_server
-        await wipe_server(guild)
-        await build_server(
-            guild=guild,
-            fmt=fmt,
-            rooms=rooms,
-            timezone=tz,
-            tournament_name=tournament_name,
-            creator_id=creator_id,
-        )
+    last_edit = 0.0
 
-        # ── Assign creator role via assign channel (single source of truth) ──
-        await _assign_creator_role(guild, interaction.user, role_name)
+    async def progress(text: str) -> None:
+        # Throttled: a status line, not a request per step.
+        nonlocal last_edit
+        now = time.monotonic()
+        if now - last_edit < 4.0:
+            return
+        last_edit = now
+        await status_msg.edit(embed=discord.Embed(
+            title="⚙️ Building Tournament Server…",
+            description=f"{text}\n\nThis may take a few minutes.",
+            color=discord.Color.yellow(),
+        ))
 
-        # ── Permanent invite ──────────────────────────────────────────────────
-        invite_url = ""
+    async def show(embed: discord.Embed) -> None:
         try:
-            for ch in guild.text_channels:
-                if ch.permissions_for(guild.me).create_instant_invite:
-                    inv = await ch.create_invite(max_age=0, max_uses=0, reason="KAMLA post-build")
-                    invite_url = inv.url
-                    break
+            await status_msg.edit(embed=embed)
         except Exception:
-            pass
+            await interaction.followup.send(embed=embed, ephemeral=True)
 
-        # ── Edit webhook log ──────────────────────────────────────────────────
-        from webhook import edit_join_log
-        cfg = await config_manager.get_config(guild)
-        await edit_join_log(guild, cfg)
+    try:
+        async with building_job(guild):
+            if await find_resumable(guild, setup_data):
+                log.info("Resuming interrupted build for guild %s (existing structure is reused, nothing is wiped).", guild.id)
+                await progress("Resuming an interrupted build — keeping everything already created…")
+            else:
+                await wipe_server(guild)
+                await mark_build_state(guild, setup_data, wiped=True)
+
+            report = await build_server(
+                guild=guild,
+                fmt=fmt,
+                rooms=rooms,
+                timezone=tz,
+                tournament_name=tournament_name,
+                creator_id=creator_id,
+                progress=progress,
+            )
+
+            # ── Assign creator role via assign channel (single source of truth) ──
+            await _assign_creator_role(guild, interaction.user, role_name)
+
+            # ── Permanent invite ──────────────────────────────────────────────────
+            invite_url = ""
+            try:
+                for ch in guild.text_channels:
+                    if ch.permissions_for(guild.me).create_instant_invite:
+                        inv = await ch.create_invite(max_age=0, max_uses=0, reason="KAMLA post-build")
+                        invite_url = inv.url
+                        break
+            except Exception as e:
+                log.warning("Could not create post-build invite: %s", describe(e))
+
+            # ── Edit webhook log ──────────────────────────────────────────────────
+            from webhook import edit_join_log
+            cfg = await config_manager.get_config(guild)
+            await edit_join_log(guild, cfg)
 
         # ── Completion report ─────────────────────────────────────────────────
         embed = discord.Embed(title="✅ Tournament Server Ready!", color=discord.Color.green())
@@ -121,27 +164,33 @@ async def _do_build(interaction: discord.Interaction, setup_data: dict) -> None:
         embed.add_field(name="Your Role",   value=role_name.upper(), inline=True)
         if invite_url:
             embed.add_field(name="Server Link", value=f"[Join]({invite_url})", inline=True)
-        embed.set_footer(text="KAMLA • Tournament Automation Bot")
+        embed.set_footer(text=f"KAMLA • Tournament Automation Bot • {report.summary()}")
+        await show(embed)
 
-        try:
-            await status_msg.edit(embed=embed)
-        except Exception:
-            await interaction.followup.send(embed=embed, ephemeral=True)
-
+    except BuildInProgress as e:
+        await show(discord.Embed(title="⏳ Already Running", description=str(e), color=discord.Color.orange()))
+    except BuildIncomplete as e:
+        log.error("Build incomplete for guild %s: %s", guild.id, e.report.summary())
+        details = e.report.failure_text() or str(e)
+        await show(discord.Embed(
+            title="⚠️ Build Incomplete",
+            description=(
+                f"{e}\n\n**Progress:** {e.report.summary()}\n{details}\n\n"
+                "Nothing that succeeded was lost. Run `/rebuild` (or `/st` with the **same settings**) again: "
+                "KAMLA will **resume** — it reuses what already exists and does not wipe the server again."
+            )[:4000],
+            color=discord.Color.orange(),
+        ))
     except Exception as e:
-        err_embed = discord.Embed(
+        log.exception("Unexpected build failure in guild %s", guild.id)
+        await show(discord.Embed(
             title="❌ Build Failed",
             description=(
-                f"An error occurred:\n```{e}```\n"
+                f"An error occurred:\n```{describe(e)}```\n"
                 "Ensure KAMLA has **Administrator** permission and try again."
             ),
             color=discord.Color.red(),
-        )
-        try:
-            await status_msg.edit(embed=err_embed)
-        except Exception:
-            await interaction.followup.send(embed=err_embed, ephemeral=True)
-        raise
+        ))
 
 
 async def _assign_creator_role(guild: discord.Guild, user: discord.Member, role_name: str) -> None:
@@ -216,6 +265,12 @@ class SetupCog(commands.Cog):
                 )
                 return
 
+        from server_builder import capacity_problem_fresh_build
+        problem = capacity_problem_fresh_build(format.value, room)
+        if problem:
+            await interaction.response.send_message(f"⛔ {problem}", ephemeral=True)
+            return
+
         setup_data = {
             "format":          format.value,
             "rooms":           room,
@@ -232,6 +287,7 @@ class SetupCog(commands.Cog):
                 f"**Rooms:** {room}\n"
                 f"**Your Role:** {as_role.value}\n\n"
                 "⚠️ This will **wipe all existing channels and roles** and rebuild the server.\n"
+                "(If an interrupted build with these exact settings is found, it is **resumed** instead — nothing is wiped again.)\n"
                 "Press **Confirm & Build** to proceed."
             ),
             color=discord.Color.blurple(),
@@ -243,6 +299,9 @@ class SetupCog(commands.Cog):
     @app_commands.command(name="rebuild", description="Rebuild the tournament server structure.")
     @app_commands.default_permissions(administrator=True)
     async def rebuild(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+            return
         cfg = await config_manager.get_config(interaction.guild)
         if not cfg:
             await interaction.response.send_message(
@@ -256,10 +315,16 @@ class SetupCog(commands.Cog):
             "tournament_name": cfg.get("tournament_name", "Tournament"),
             "role_name":       "ORG",
         }
+        from server_builder import capacity_problem_fresh_build
+        problem = capacity_problem_fresh_build(str(setup_data["format"]), int(setup_data["rooms"]))
+        if problem:
+            await interaction.response.send_message(f"⛔ {problem}", ephemeral=True)
+            return
         embed = discord.Embed(
             title="🔨 Rebuild Server",
             description=(
-                "⚠️ This will **wipe and rebuild** the entire server from saved configuration.\n\n"
+                "⚠️ This will **wipe and rebuild** the entire server from saved configuration.\n"
+                "(An interrupted build with these settings is **resumed** instead of wiped.)\n\n"
                 "Press **Confirm & Build** to proceed."
             ),
             color=discord.Color.orange(),

@@ -4,6 +4,7 @@ import asyncio
 import re
 from datetime import datetime, timezone, timedelta
 from config import config_manager
+from ratelimit import timer_edits, edits
 _active_timers: dict[int, asyncio.Task] = {}
 
 # Strict time format: only digits + lowercase d/h/m/s (e.g. 1d2h3m4s, 10m, 30s)
@@ -78,6 +79,14 @@ class TimerCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
+    async def cog_unload(self) -> None:
+        # Reloading / shutting down must not leave countdown tasks running
+        # (they would duplicate after a reload and keep editing messages).
+        for task in list(_active_timers.values()):
+            if not task.done():
+                task.cancel()
+        _active_timers.clear()
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author.bot or not message.guild:
@@ -120,6 +129,7 @@ class TimerCog(commands.Cog):
         old = _active_timers.pop(message.channel.id, None)
         if old and not old.done():
             old.cancel()
+            timer_edits.discard(("timer", message.channel.id))  # drop the old timer's queued frame
 
         cfg = await config_manager.get_config(message.guild)
         tz_str = cfg.get("timezone", "+00:00")
@@ -153,7 +163,23 @@ async def _run_countdown(
     embed.set_footer(text=f"Started by {starter.display_name}  •  {started_fmt} ({tz_label})")
     msg = await channel.send(embed=embed)
 
+    # All countdown edits go through one shared, paced "latest wins" sender so many
+    # rooms running timers at once cannot exceed the API budget (previously each timer
+    # edited its message every second in the last minute, with no global limit).
+    edit_key = ("timer", channel.id)
+    gone = False
+
+    async def _edit(e: discord.Embed) -> None:
+        nonlocal gone
+        try:
+            await msg.edit(embed=e)
+        except discord.NotFound:
+            gone = True
+
     while True:
+        if gone:
+            _active_timers.pop(channel.id, None)
+            return
         remaining = int((end_dt - datetime.now(timezone.utc)).total_seconds())
         if remaining <= 0:
             break
@@ -168,13 +194,7 @@ async def _run_countdown(
         embed = discord.Embed(title=f"⏱  {fmt_clock(remaining)}", color=color)
         embed.set_footer(text=f"Started by {starter.display_name}  •  {started_fmt} ({tz_label})")
 
-        try:
-            await msg.edit(embed=embed)
-        except discord.NotFound:
-            _active_timers.pop(channel.id, None)
-            return
-        except Exception:
-            pass
+        timer_edits.submit(edit_key, lambda e=embed: _edit(e))
 
         sleep = 1 if remaining <= 60 else 5
         await asyncio.sleep(sleep)
@@ -184,10 +204,8 @@ async def _run_countdown(
 
     done_embed = discord.Embed(title="✅  0:00", color=discord.Color.dark_grey())
     done_embed.set_footer(text=f"Ended  •  {ended_fmt} ({tz_label})")
-    try:
-        await msg.edit(embed=done_embed)
-    except Exception:
-        pass
+    # Same sender + same key => ordered after any in-flight frame, replaces a stale queued one.
+    timer_edits.submit(edit_key, lambda: _edit(done_embed))
 
     summary = discord.Embed(title="⏰  Time's Up!", color=discord.Color.red())
     summary.add_field(name="⏱  Duration", value=f"**{duration_human}**", inline=False)
@@ -195,8 +213,12 @@ async def _run_countdown(
     summary.add_field(name="🔴  Ended",   value=f"{ended_fmt} ({tz_label})", inline=True)
     summary.set_footer(text=f"Timer started by {starter.display_name}")
 
-    await channel.send(content=starter.mention, embed=summary)
-    _active_timers.pop(channel.id, None)
+    try:
+        await edits.run(lambda: channel.send(content=starter.mention, embed=summary), label="timer-summary")
+    finally:
+        # Only clear the slot if it is still ours (a newer timer may have replaced it).
+        if _active_timers.get(channel.id) is asyncio.current_task():
+            _active_timers.pop(channel.id, None)
 
 
 async def setup(bot: commands.Bot):
