@@ -143,6 +143,8 @@ async def _do_build(interaction: discord.Interaction, setup_data: dict) -> None:
             invite_url = ""
             try:
                 for ch in guild.text_channels:
+                    if ch.name == "👋🏻︱welcome":      # reserved for the role-granting invites
+                        continue
                     if ch.permissions_for(guild.me).create_instant_invite:
                         inv = await ch.create_invite(max_age=0, max_uses=0, reason="KAMLA post-build")
                         invite_url = inv.url
@@ -155,6 +157,23 @@ async def _do_build(interaction: discord.Interaction, setup_data: dict) -> None:
             cfg = await config_manager.get_config(guild)
             await edit_join_log(guild, cfg)
 
+        # ── Role-granting invite links → DM to whoever built the server ───────
+        links_field = None
+        try:
+            from invite_roles_cog import create_role_invites, dm_text
+            from ratelimit import notify
+            links = await create_role_invites(guild)
+            text = dm_text(tournament_name, links)
+            if not await notify.best_effort(lambda: interaction.user.send(text), label="invite-links-dm"):
+                # DMs closed: show them privately here instead (this message is visible only to you)
+                links_field = "\n".join(f"**{i['label']}**\n<{i['url']}>" for i in links)
+                links_note = "Your DMs are closed, so the invite links are shown here."
+            else:
+                links_note = "The 3 role invite links were sent to your DMs."
+        except Exception as e:
+            log.warning("Could not create role invite links: %s", describe(e))
+            links_note = "⚠️ The role invite links could not be created."
+
         # ── Completion report ─────────────────────────────────────────────────
         embed = discord.Embed(title="✅ Tournament Server Ready!", color=discord.Color.green())
         embed.add_field(name="Tournament",  value=tournament_name,  inline=True)
@@ -164,6 +183,9 @@ async def _do_build(interaction: discord.Interaction, setup_data: dict) -> None:
         embed.add_field(name="Your Role",   value=role_name.upper(), inline=True)
         if invite_url:
             embed.add_field(name="Server Link", value=f"[Join]({invite_url})", inline=True)
+        embed.add_field(name="Invite Links", value=links_note, inline=False)
+        if links_field:
+            embed.add_field(name="Links (private)", value=links_field[:1000], inline=False)
         embed.set_footer(text=f"KAMLA • Tournament Automation Bot • {report.summary()}")
         await show(embed)
 

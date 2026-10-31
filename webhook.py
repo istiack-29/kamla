@@ -171,8 +171,12 @@ async def _create_org_invite(guild: discord.Guild) -> str:
         if ch and ch.permissions_for(guild.me).create_instant_invite:
             candidates.insert(0, ch)
 
-    # Fall back to any text channel where we can create an invite
+    # Fall back to any text channel where we can create an invite.
+    # NEVER the welcome channel: unique=False below could hand back one of the role-granting
+    # invites that live there, and the join-log webhook must not publish those.
     for ch in guild.text_channels:
+        if ch.name == "👋🏻︱welcome":
+            continue
         perms = ch.permissions_for(guild.me)
         if perms.create_instant_invite and perms.view_channel:
             if ch not in candidates:

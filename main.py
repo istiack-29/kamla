@@ -36,6 +36,7 @@ COGS = [
     "polls_cog",
     "welcome_cog",
     "nickname_cog",
+    "invite_roles_cog",
 ]
 
 

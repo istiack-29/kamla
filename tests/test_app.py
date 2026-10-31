@@ -15,12 +15,12 @@ from tests.fakes import http_error, FakeGuild, FakeChannel, FakeCategory
 
 BASELINE = {
     "cogs": ["AllInCog", "AssignCog", "DMNotifyCog", "GamesCog", "PoiCog", "PollsCog", "RolesCog",
-             "SettingsCog", "SetupCog", "TimerCog", "TossCog", "WelcomeCog", "NicknameCog"],
+             "SettingsCog", "SetupCog", "TimerCog", "TossCog", "WelcomeCog", "NicknameCog", "InviteRolesCog"],
     "commands": ["close", "mention", "newpoll", "nicknames", "play", "rebuild", "st", "toss"],
     "custom_ids": ["kamla:allin:push_back", "kamla:on_join:create_now", "kamla:role:debater",
                    "kamla:role:independent_adj", "kamla:role:invited_adj", "kamla:role:visitor",
                    "kamla:s:add", "kamla:s:del", "kamla:s:fmt", "kamla:s:lock"],
-    "listeners": {"on_member_join": 2, "on_member_remove": 2, "on_member_update": 3, "on_message": 7},
+    "listeners": {"on_member_join": 3, "on_ready": 1, "on_invite_create": 1, "on_invite_delete": 1, "on_member_remove": 2, "on_member_update": 3, "on_message": 7},
     "views": ["AllInView", "OnJoinView", "RoleSelectView", "SettingsView"],
 }
 

@@ -723,6 +723,8 @@ async def _build_server_inner(
     }
     if previous.get("pending_build"):
         cfg_data["pending_build"] = previous["pending_build"]      # keep the resume marker until we finish
+    if previous.get("invite_roles"):
+        cfg_data["invite_roles"] = previous["invite_roles"]        # validated against live invites when reused
     await config_manager.set_config(guild, cfg_data)
 
     await _tell(progress, "Posting guide messages…")
