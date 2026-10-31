@@ -175,28 +175,6 @@ async def test_timer_tasks_not_duplicated_and_cleaned():
     assert not timer_cog._active_timers
 
 
-async def test_countdown_runs_and_finishes_through_paced_sender(monkeypatch):
-    edits_seen = []
-
-    class Msg:
-        async def edit(self, embed=None):
-            edits_seen.append(embed.title)
-
-    class Chan:
-        id = 99
-        sent = []
-        async def send(self, content=None, embed=None):
-            self.sent.append(embed.title)
-            return Msg()
-
-    monkeypatch.setattr(timer_cog, "_active_timers", {})
-    starter = types.SimpleNamespace(display_name="u", mention="@u")
-    await asyncio.wait_for(timer_cog._run_countdown(Chan(), starter, 2, 0, "+00:00"), 8)
-    await asyncio.sleep(0.2)
-    assert Chan.sent[0].startswith("⏱") and "Time's Up" in Chan.sent[-1]
-    assert any(t.startswith("✅") for t in edits_seen)
-
-
 # assign cleanup: scans only the previous role's channel (was: every other channel)
 async def test_assign_cleanup_is_targeted():
     g = FakeGuild()

@@ -1,11 +1,22 @@
 import discord
 from discord.ext import commands
 import asyncio
+import logging
+import math
 import re
+import time
 from datetime import datetime, timezone, timedelta
-from config import config_manager
-from ratelimit import timer_edits, edits
+from config import config_manager, ADMIN_ROLE_NAMES
+from ratelimit import timer_edits, edits, describe
+
+log = logging.getLogger("kamla.timer")
+
 _active_timers: dict[int, asyncio.Task] = {}
+_pens_tasks: set[asyncio.Task] = set()
+
+# Module constants (tests shrink them so a "minute" takes a fraction of a second).
+MINUTE = 60.0
+PENS_DROP_DELAY = 15.0
 
 # Strict time format: only digits + lowercase d/h/m/s (e.g. 1d2h3m4s, 10m, 30s)
 _TIME_STRICT = re.compile(r'^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$')
@@ -82,10 +93,11 @@ class TimerCog(commands.Cog):
     async def cog_unload(self) -> None:
         # Reloading / shutting down must not leave countdown tasks running
         # (they would duplicate after a reload and keep editing messages).
-        for task in list(_active_timers.values()):
+        for task in list(_active_timers.values()) + list(_pens_tasks):
             if not task.done():
                 task.cancel()
         _active_timers.clear()
+        _pens_tasks.clear()
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -128,8 +140,7 @@ class TimerCog(commands.Cog):
         # Cancel any existing timer in this channel
         old = _active_timers.pop(message.channel.id, None)
         if old and not old.done():
-            old.cancel()
-            timer_edits.discard(("timer", message.channel.id))  # drop the old timer's queued frame
+            old.cancel()    # its handler marks the old message "Replaced" and disables its buttons
 
         cfg = await config_manager.get_config(message.guild)
         tz_str = cfg.get("timezone", "+00:00")
@@ -141,82 +152,251 @@ class TimerCog(commands.Cog):
         _active_timers[message.channel.id] = task
 
 
+def _mins_text(seconds: float) -> str:
+    """'6 mins' for whole minutes, otherwise '1m 30s'."""
+    whole = seconds / MINUTE
+    if math.isclose(whole, round(whole), abs_tol=1e-6):
+        return f"{int(round(whole))} mins"
+    m, sec = divmod(int(round(seconds / MINUTE * 60)), 60)
+    return f"{m}m {sec:02d}s" if m else f"{sec}s"
+
+
+class TimerState:
+    """Running time excludes paused periods. Everything here is local; no API calls."""
+
+    _seq = 0
+
+    def __init__(self, channel, starter, total, started_fmt, tz_label, clock=time.monotonic):
+        TimerState._seq += 1
+        self.id = TimerState._seq
+        self.channel = channel
+        self.starter = starter
+        self.total = total
+        self.started_fmt = started_fmt
+        self.tz_label = tz_label
+        self.ended_fmt = ""
+        self._clock = clock
+        self._acc = 0.0
+        self._since = clock()
+        self.paused = False
+        self.phase = "running"          # running | ended | skipped | replaced
+        self.skipped_by = None
+        self.wake = asyncio.Event()
+        self.msg = None
+        self.view = None
+        self.gone = False
+
+    def running(self) -> float:
+        base = self._acc if self.paused else self._acc + (self._clock() - self._since)
+        return min(base, self.total)
+
+    def pause(self) -> None:
+        if not self.paused and self.phase == "running":
+            self._acc += self._clock() - self._since
+            self.paused = True
+            self.wake.set()
+
+    def resume(self) -> None:
+        if self.paused and self.phase == "running":
+            self._since = self._clock()
+            self.paused = False
+            self.wake.set()
+
+    def skip(self, by) -> None:
+        if self.phase == "running":
+            self.phase = "skipped"
+            self.skipped_by = by
+            self.wake.set()
+
+
+def render(state: TimerState) -> discord.Embed:
+    """Status only — deliberately NO live clock (so it needs one edit per minute, not per second)."""
+    minutes = int(state.running() // MINUTE)
+    if state.phase == "running":
+        if state.paused:
+            status, color = f"⏸ **Paused** · POI · {minutes} min run so far", discord.Color.orange()
+        else:
+            frac = state.running() / state.total if state.total else 1
+            color = (discord.Color.green() if frac < 0.5 else
+                     discord.Color.gold() if frac < 0.75 else discord.Color.red())
+            status = f"▶ **{minutes} min running**"
+    elif state.phase == "ended":
+        status, color = "✅ **Time's up**", discord.Color.dark_grey()
+    elif state.phase == "skipped":
+        status, color = "⏭ **Skipped**", discord.Color.dark_grey()
+    else:
+        status, color = "🔁 **Replaced by a new timer**", discord.Color.dark_grey()
+    embed = discord.Embed(title="⏱ Timer", description=status, color=color)
+    embed.add_field(name="Length", value=fmt_human(int(state.total)), inline=True)
+    embed.add_field(name="Commander", value=state.starter.display_name, inline=True)
+    footer = f"Started {state.started_fmt} ({state.tz_label})"
+    if state.ended_fmt:
+        footer += f"  •  Ended {state.ended_fmt}"
+    embed.set_footer(text=footer)
+    return embed
+
+
+class TimerView(discord.ui.View):
+    """Pause (POI) / Resume and Skip. Only the commander or an admin may use them —
+    otherwise any debater could pause or skip a speech."""
+
+    def __init__(self, state: TimerState):
+        super().__init__(timeout=None)
+        self.state = state
+
+    def disable_all(self) -> None:
+        for child in self.children:
+            child.disabled = True
+
+    async def _allowed(self, interaction: discord.Interaction) -> bool:
+        user = interaction.user
+        perms = getattr(user, "guild_permissions", None)
+        ok = (
+            user.id == self.state.starter.id
+            or bool(perms and perms.administrator)
+            or any(r.name in ADMIN_ROLE_NAMES for r in getattr(user, "roles", []))
+        )
+        if not ok:
+            await interaction.response.send_message(
+                "Only the timer's commander or an admin can use these buttons.", ephemeral=True)
+        return ok
+
+    @discord.ui.button(label="Pause (POI)", emoji="⏸", style=discord.ButtonStyle.secondary)
+    async def pause_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._allowed(interaction):
+            return
+        st = self.state
+        if st.phase != "running":
+            await interaction.response.send_message("This timer has already finished.", ephemeral=True)
+            return
+        if st.paused:
+            st.resume()
+            button.label, button.emoji = "Pause (POI)", "⏸"
+        else:
+            st.pause()
+            button.label, button.emoji = "Resume", "▶"
+        await interaction.response.edit_message(embed=render(st), view=self)
+
+    @discord.ui.button(label="Skip", emoji="⏭", style=discord.ButtonStyle.danger)
+    async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._allowed(interaction):
+            return
+        st = self.state
+        if st.phase != "running":
+            await interaction.response.send_message("This timer has already finished.", ephemeral=True)
+            return
+        st.skip(interaction.user)
+        self.disable_all()
+        await interaction.response.edit_message(embed=render(st), view=self)
+
+
+async def _pens_drop(channel, starter) -> None:
+    try:
+        await asyncio.sleep(PENS_DROP_DELAY)
+        await edits.run(lambda: channel.send(content=f"Adjudicators Pens Drop {starter.mention}"),
+                        label="timer-pens-drop")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.warning("Could not post pens-drop message: %s", describe(e))
+
+
 async def _run_countdown(
     channel: discord.TextChannel,
     starter: discord.Member,
-    total_seconds: int,
+    total_seconds: float,
     tz_offset_mins: int,
     tz_str: str,
 ) -> None:
     tz = timezone(timedelta(minutes=tz_offset_mins))
-    started_at = datetime.now(tz)
-    end_dt = datetime.now(timezone.utc) + timedelta(seconds=total_seconds)
-
-    started_fmt = started_at.strftime("%d-%m-%Y %H:%M:%S")
+    started_fmt = datetime.now(tz).strftime("%d-%m-%Y %H:%M:%S")
     tz_label = _tz_label(tz_str)
-    duration_human = fmt_human(total_seconds)
+    total = float(total_seconds)
 
-    embed = discord.Embed(
-        title=f"⏱  {fmt_clock(total_seconds)}",
-        color=discord.Color.green(),
-    )
-    embed.set_footer(text=f"Started by {starter.display_name}  •  {started_fmt} ({tz_label})")
-    msg = await channel.send(embed=embed)
+    state = TimerState(channel, starter, total, started_fmt, tz_label)
+    view = TimerView(state)
+    state.view = view
+    state.msg = await edits.run(lambda: channel.send(embed=render(state), view=view), label="timer-start")
 
-    # All countdown edits go through one shared, paced "latest wins" sender so many
-    # rooms running timers at once cannot exceed the API budget (previously each timer
-    # edited its message every second in the last minute, with no global limit).
-    edit_key = ("timer", channel.id)
-    gone = False
+    # One edit per whole minute / pause / resume / end, instead of one per second.
+    edit_key = ("timer", channel.id, state.id)
 
-    async def _edit(e: discord.Embed) -> None:
-        nonlocal gone
+    async def _edit() -> None:
         try:
-            await msg.edit(embed=e)
+            await state.msg.edit(embed=render(state), view=view)   # rendered when sent => never stale
         except discord.NotFound:
-            gone = True
+            state.gone = True
 
-    while True:
-        if gone:
-            _active_timers.pop(channel.id, None)
-            return
-        remaining = int((end_dt - datetime.now(timezone.utc)).total_seconds())
-        if remaining <= 0:
-            break
-
-        pct = remaining / total_seconds
-        color = (
-            discord.Color.green()  if pct > 0.50 else
-            discord.Color.yellow() if pct > 0.25 else
-            discord.Color.red()
-        )
-
-        embed = discord.Embed(title=f"⏱  {fmt_clock(remaining)}", color=color)
-        embed.set_footer(text=f"Started by {starter.display_name}  •  {started_fmt} ({tz_label})")
-
-        timer_edits.submit(edit_key, lambda e=embed: _edit(e))
-
-        sleep = 1 if remaining <= 60 else 5
-        await asyncio.sleep(sleep)
-
-    ended_at = datetime.now(tz)
-    ended_fmt = ended_at.strftime("%d-%m-%Y %H:%M:%S")
-
-    done_embed = discord.Embed(title="✅  0:00", color=discord.Color.dark_grey())
-    done_embed.set_footer(text=f"Ended  •  {ended_fmt} ({tz_label})")
-    # Same sender + same key => ordered after any in-flight frame, replaces a stale queued one.
-    timer_edits.submit(edit_key, lambda: _edit(done_embed))
-
-    summary = discord.Embed(title="⏰  Time's Up!", color=discord.Color.red())
-    summary.add_field(name="⏱  Duration", value=f"**{duration_human}**", inline=False)
-    summary.add_field(name="🟢  Started", value=f"{started_fmt} ({tz_label})", inline=True)
-    summary.add_field(name="🔴  Ended",   value=f"{ended_fmt} ({tz_label})", inline=True)
-    summary.set_footer(text=f"Timer started by {starter.display_name}")
+    # Announcements: NEW messages mentioning the commander.
+    mention = starter.mention
+    announcements: list[tuple[float, str]] = []
+    if total > MINUTE:
+        left = total - MINUTE
+        if math.isclose(total, 2 * MINUTE, abs_tol=1e-6):
+            announcements.append((MINUTE, f"1 Mins Done, 1 mins left {mention}"))
+        else:
+            announcements.append((MINUTE, f"1 Mins Done, {_mins_text(left)} left {mention}"))
+            if total > 2 * MINUTE:
+                announcements.append((left, f"{_mins_text(left)} done, 1 mins left {mention}"))
+    marks = [k * MINUTE for k in range(1, int(total // MINUTE) + 1) if k * MINUTE < total - 1e-6]
+    schedule = sorted({t for t, _ in announcements} | set(marks) | {total})
+    fired: set[float] = set()
+    last_minute = 0
 
     try:
-        await edits.run(lambda: channel.send(content=starter.mention, embed=summary), label="timer-summary")
+        while state.phase == "running":
+            state.wake.clear()                       # before reading state, so no wake-up is lost
+            running = state.running()
+
+            for t, text in announcements:
+                if t not in fired and running >= t - 1e-6:
+                    fired.add(t)
+                    await edits.run(lambda tx=text: channel.send(content=tx), label="timer-announce")
+
+            minute = int(running // MINUTE)
+            if minute > last_minute:
+                last_minute = minute
+                timer_edits.submit(edit_key, _edit)
+
+            if running >= total - 1e-6:
+                state.phase = "ended"
+                break
+            if state.phase != "running":
+                break
+
+            if state.paused:
+                timeout = None
+            else:
+                nxt = min([t for t in schedule if t > running + 1e-6] or [total])
+                timeout = max(0.01, nxt - running)
+            try:
+                await asyncio.wait_for(state.wake.wait(), timeout)
+            except asyncio.TimeoutError:
+                pass
+            if state.gone:
+                return
+
+        state.ended_fmt = datetime.now(tz).strftime("%d-%m-%Y %H:%M:%S")
+        view.disable_all()
+        timer_edits.submit(edit_key, _edit)
+
+        if state.phase == "ended":
+            await edits.run(lambda: channel.send(content=f"Times up {mention}"), label="timer-times-up")
+            # Independent task: starting the next timer must not swallow this message.
+            task = asyncio.get_running_loop().create_task(_pens_drop(channel, starter))
+            _pens_tasks.add(task)
+            task.add_done_callback(_pens_tasks.discard)
+        elif state.phase == "skipped":
+            who = getattr(state.skipped_by, "display_name", "someone")
+            await edits.run(lambda: channel.send(content=f"⏭ Timer skipped by {who} {mention}"),
+                            label="timer-skipped")
+    except asyncio.CancelledError:
+        # A newer timer replaced this one (or the bot is stopping).
+        state.phase = "replaced"
+        view.disable_all()
+        timer_edits.submit(edit_key, _edit)
+        raise
     finally:
-        # Only clear the slot if it is still ours (a newer timer may have replaced it).
         if _active_timers.get(channel.id) is asyncio.current_task():
             _active_timers.pop(channel.id, None)
 
