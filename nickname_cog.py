@@ -157,7 +157,6 @@ class NicknameCog(commands.Cog):
     # ── /nicknames: sync everyone already in the server ─────────────────────
 
     @app_commands.command(name="nicknames", description="Set the [O]/[CA]/[T]/[E]/[J]/[D]/[V] role tag in everyone's nickname")
-    @app_commands.default_permissions(administrator=True)
     @app_commands.guild_only()
     async def nicknames(self, interaction: discord.Interaction):
         user = interaction.user

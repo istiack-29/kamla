@@ -6,7 +6,7 @@ channel and DMs them to whoever ran the build. Each link grants exactly ONE role
 can only ever hold one KAMLA role; assignment goes through assign_kamla_role, which removes
 any other KAMLA role first):
 
-    [V] VISITOR   [CA] CAP   [T] TABBY   [O] ORG   [E] EQUITY     (CAP/TABBY/ORG/EQUITY are admin roles)
+    [V] VISITOR   [CA] CAP   [T] TABBY   [O] ORG   [E] EQUITY     (CAP/TABBY/ORG/EQUITY get organiser facilities, never Administrator)
 
 Discord invites cannot carry roles, so KAMLA works out which invite a new member used by
 comparing invite use-counts before/after the join, then assigns that invite's role(s).
@@ -41,7 +41,7 @@ GROUPS = [
     ("org",     "[O] Org",     ["ORG"]),
     ("equity",  "[E] Equity",  ["EQUITY"]),
 ]
-ADMIN_LABELS = "[CA], [T], [O] and [E]"
+ADMIN_LABELS = "[CA], [T], [O] and [E]"      # organiser roles (no Administrator permission)
 
 # guild_id -> {invite code: uses}. In memory only; rebuilt from Discord on startup.
 _uses: dict[int, dict[str, int]] = {}
@@ -96,8 +96,9 @@ def dm_text(tournament: str, links: list[dict]) -> str:
         lines.append("")
     lines.append("These links never expire and can be used any number of times. "
                  "Anyone who joins with a link gets the role shown above (one role per person).")
-    lines.append(f"⚠️ The {ADMIN_LABELS} links grant **administrator roles** — "
-                 "share them only with people you fully trust.")
+    lines.append("No link grants administrator permission, and members cannot create invites themselves.")
+    lines.append(f"The {ADMIN_LABELS} links give organiser facilities inside the tournament — "
+                 "send them only to the right people.")
     lines.append("")
     lines.append("Please send the links as per your need.")
     return "\n".join(lines)
@@ -187,7 +188,7 @@ class InviteRolesCog(commands.Cog):
         total = sum(deltas.values())
         # Strict rule: exactly ONE invite changed and its use count equals the joins we saw.
         # Anything else (several invites, joins we didn't witness, vanity URL joins mixed in) is
-        # ambiguous, and guessing wrong on the staff link would hand out administrator roles.
+        # ambiguous, and guessing wrong on an organiser link would hand out organiser facilities.
         if len(deltas) != 1 or total != len(members):
             log.warning("Ambiguous join in guild %s (%d member(s) seen, %d invite use(s) across %d invite(s)). "
                         "No invite roles were assigned.", guild.id, len(members), total, len(deltas))

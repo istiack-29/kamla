@@ -232,13 +232,20 @@ class AssignCog(commands.Cog):
 
     @app_commands.command(name="mention", description="Mention a user in a channel.")
     @app_commands.describe(user="User to mention", channel="Channel to mention them in")
-    @app_commands.default_permissions(administrator=True)
     async def mention(
         self,
         interaction: discord.Interaction,
         user: discord.Member,
         channel: discord.TextChannel,
     ):
+        # Organisers no longer hold the Administrator permission, so Discord's own
+        # "administrators only" command gate would hide this command from them. The same
+        # audience (owner / admins / ORG, CAP, TABBY, EQUITY) is enforced here instead.
+        actor = interaction.user
+        if not (actor.guild_permissions.administrator
+                or any(r.name in ADMIN_ROLE_NAMES for r in actor.roles)):
+            await interaction.response.send_message("⛔ Only ORG / CAP / TABBY / EQUITY can use this.", ephemeral=True)
+            return
         try:
             await channel.send(user.mention)
             await interaction.response.send_message(

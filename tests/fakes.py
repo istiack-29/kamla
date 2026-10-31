@@ -92,11 +92,18 @@ class FakeCategory(FakeChannel):
 
 
 class FakeRole:
-    def __init__(self, name, position=1, managed=False):
+    def __init__(self, name, position=1, managed=False, permissions=None):
         self.id = next(_ids)
         self.name = name
         self.position = position
         self.managed = managed
+        self.permissions = permissions if permissions is not None else discord.Permissions()
+        self.edit_calls = 0
+
+    async def edit(self, **kw):
+        self.edit_calls += 1
+        if "permissions" in kw:
+            self.permissions = kw["permissions"]
 
     def __hash__(self):
         return hash(self.id)
@@ -126,7 +133,9 @@ class FakeGuild:
         self.id = next(_ids)
         self.name = "g"
         self._channels: dict[int, FakeChannel] = {}
-        self.default_role = FakeRole("@everyone", 0)
+        self.default_role = FakeRole("@everyone", 0, permissions=discord.Permissions(
+            view_channel=True, send_messages=True, create_instant_invite=True))
+        self.owner_id = 4242
         self.me = FakeMe(self._noop)
         self.roles = [self.default_role]
         self.fail: dict[str, list] = {}
@@ -186,7 +195,7 @@ class FakeGuild:
     async def create_role(self, name, **kw):
         self.create_calls.append(("role", name))
         self._maybe_fail(name)
-        r = FakeRole(name, len(self.roles))
+        r = FakeRole(name, len(self.roles), permissions=kw.get("permissions"))
         self.roles.append(r)
         return r
 

@@ -263,7 +263,6 @@ class SetupCog(commands.Cog):
     )
     @app_commands.choices(format=FORMAT_CHOICES, as_role=ROLE_CHOICES)
     @app_commands.rename(as_role="as")
-    @app_commands.default_permissions(administrator=True)
     async def st(
         self,
         interaction: discord.Interaction,
@@ -319,10 +318,16 @@ class SetupCog(commands.Cog):
         )
 
     @app_commands.command(name="rebuild", description="Rebuild the tournament server structure.")
-    @app_commands.default_permissions(administrator=True)
     async def rebuild(self, interaction: discord.Interaction):
         if interaction.guild is None:
             await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+            return
+        # Same audience as /st (owner / admins / ORG, CAP, TABBY, EQUITY). This used to rely only on
+        # Discord's "administrators only" gate, which organisers no longer satisfy.
+        if not (interaction.user.guild_permissions.administrator
+                or any(r.name in ADMIN_ROLE_NAMES for r in interaction.user.roles)):
+            await interaction.response.send_message(
+                "⛔ You need an admin role (ORG/CAP/TABBY/EQUITY) or Administrator permission.", ephemeral=True)
             return
         cfg = await config_manager.get_config(interaction.guild)
         if not cfg:

@@ -15,16 +15,40 @@ log = logging.getLogger("kamla.builder")
 _building_guilds: set[int] = set()
 _restoring_guilds: set[int] = set()
 
+# NOBODY gets the Administrator permission. Every role is an ordinary member role; the
+# four organiser roles ("staff") additionally get a fixed set of moderation facilities that
+# the old Administrator flag used to imply inside tournament channels. Channel visibility and
+# posting rights come from the explicit per-channel overwrites below, not from a role bit.
 ROLE_CONFIG = [
-    {"name": "ORG",                    "color": discord.Color.red(),        "administrator": True,  "hoist": True},
-    {"name": "CAP",                    "color": discord.Color.orange(),     "administrator": True,  "hoist": True},
-    {"name": "TABBY",                  "color": discord.Color.yellow(),     "administrator": True,  "hoist": True},
-    {"name": "EQUITY",                 "color": discord.Color.green(),      "administrator": True,  "hoist": True},
-    {"name": "INVITED ADJUDICATOR",    "color": discord.Color.blue(),       "administrator": False, "hoist": True},
-    {"name": "INDEPENDENT ADJUDICATOR","color": discord.Color.purple(),     "administrator": False, "hoist": True},
-    {"name": "DEBATER",                "color": discord.Color.teal(),       "administrator": False, "hoist": True},
-    {"name": "VISITOR",                "color": discord.Color.light_grey(), "administrator": False, "hoist": False},
+    {"name": "ORG",                    "color": discord.Color.red(),        "staff": True,  "hoist": True},
+    {"name": "CAP",                    "color": discord.Color.orange(),     "staff": True,  "hoist": True},
+    {"name": "TABBY",                  "color": discord.Color.yellow(),     "staff": True,  "hoist": True},
+    {"name": "EQUITY",                 "color": discord.Color.green(),      "staff": True,  "hoist": True},
+    {"name": "INVITED ADJUDICATOR",    "color": discord.Color.blue(),       "staff": False, "hoist": True},
+    {"name": "INDEPENDENT ADJUDICATOR","color": discord.Color.purple(),     "staff": False, "hoist": True},
+    {"name": "DEBATER",                "color": discord.Color.teal(),       "staff": False, "hoist": True},
+    {"name": "VISITOR",                "color": discord.Color.light_grey(), "staff": False, "hoist": False},
 ]
+
+MEMBER_PERMISSIONS = dict(
+    view_channel=True, send_messages=True, read_message_history=True,
+    connect=True, speak=True, stream=True, use_voice_activation=True,
+    embed_links=True, attach_files=True, add_reactions=True,
+)
+# Moderation facilities of ORG / CAP / TABBY / EQUITY. Deliberately NOT included: administrator,
+# manage_guild / manage_roles / manage_channels, kick / ban, and create_instant_invite.
+STAFF_EXTRA_PERMISSIONS = dict(
+    manage_messages=True, mute_members=True, deafen_members=True,
+    move_members=True, priority_speaker=True, mention_everyone=True,
+)
+
+
+def role_permissions(staff: bool) -> discord.Permissions:
+    values = dict(MEMBER_PERMISSIONS)
+    if staff:
+        values.update(STAFF_EXTRA_PERMISSIONS)
+    return discord.Permissions(**values)
+
 
 ORG_ACCESS_ROLES = ["ORG", "CAP", "TABBY", "EQUITY", "INVITED ADJUDICATOR"]
 
@@ -410,30 +434,34 @@ async def wipe_server(guild: discord.Guild) -> None:
 
 
 async def _create_roles(guild: discord.Guild, report: BuildReport | None = None) -> dict[str, discord.Role]:
-    """Create (or reuse by exact name) every KAMLA role. A missing role would silently produce
-    channels without that role's permissions, so any failure here aborts the build."""
+    """Create (or reuse by exact name) every KAMLA role, with NO administrator permission.
+    Roles that already exist keep their identity but their permissions are brought in line, so a
+    resumed/re-run build also removes Administrator from roles created by an older version.
+    A missing role would silently produce channels without that role's permissions, so a failure
+    to create one aborts the build."""
     report = report if report is not None else BuildReport()
     roles: dict[str, discord.Role] = {}
     existing = {r.name: r for r in guild.roles}
     for cfg in reversed(ROLE_CONFIG):
         name = cfg["name"]
+        desired = role_permissions(cfg["staff"])
         if name in existing:
-            roles[name] = existing[name]
+            role = existing[name]
+            roles[name] = role
             report.reused.append(f"role {name}")
+            current = getattr(role, "permissions", None)
+            if current is not None and current != desired:
+                async def fix(r=role, p=desired, n=name):
+                    await bulk.run(lambda: r.edit(permissions=p, reason="KAMLA: no administrator permission"),
+                                   label=f"fix permissions of role {n}")
+                    report.reconciled.append(f"role {n} permissions")
+                await _step(report, f"fix permissions of role {name}", fix)
             continue
 
-        async def make(cfg=cfg, name=name):
-            if cfg["administrator"]:
-                perms = discord.Permissions(administrator=True)
-            else:
-                perms = discord.Permissions(
-                    view_channel=True, send_messages=True, read_message_history=True,
-                    connect=True, speak=True, stream=True, use_voice_activation=True,
-                    embed_links=True, attach_files=True, add_reactions=True,
-                )
+        async def make(cfg=cfg, name=name, desired=desired):
             role = await bulk.run(
                 lambda: guild.create_role(name=name, color=cfg["color"], hoist=cfg["hoist"],
-                                          permissions=perms, reason="KAMLA tournament setup"),
+                                          permissions=desired, reason="KAMLA tournament setup"),
                 label=f"create role {name}")
             roles[name] = role
             report.created.append(f"role {name}")
@@ -445,10 +473,29 @@ async def _create_roles(guild: discord.Guild, report: BuildReport | None = None)
     return roles
 
 
+async def _forbid_member_invites(guild: discord.Guild, report: BuildReport) -> None:
+    """Nobody may invite anybody: remove 'Create Invite' from @everyone (every KAMLA role is
+    created without it too). Only the server owner and KAMLA itself can still create invites."""
+    everyone = guild.default_role
+    perms = everyone.permissions
+    if not perms.create_instant_invite:
+        return
+    new = discord.Permissions(perms.value)
+    new.update(create_instant_invite=False)
+
+    async def go():
+        await bulk.run(lambda: everyone.edit(permissions=new, reason="KAMLA: members cannot create invites"),
+                       label="remove @everyone create-invite")
+        report.reconciled.append("@everyone: Create Invite removed")
+    await _step(report, "remove 'Create Invite' from @everyone", go)
+
+
 def _bot_ow(guild):
+    # create_instant_invite: members cannot invite (see _forbid_member_invites), but KAMLA
+    # itself must still be able to create the role-granting invite links.
     return _allow("view_channel", "send_messages", "read_message_history",
                   "manage_messages", "embed_links", "attach_files",
-                  "connect", "speak", "move_members")
+                  "connect", "speak", "move_members", "create_instant_invite")
 
 
 def _build_orgcom_overwrites(guild, roles):
@@ -668,6 +715,7 @@ async def _build_server_inner(
     report = BuildReport()
     await _tell(progress, "Creating roles…")
     roles = await _create_roles(guild, report)
+    await _forbid_member_invites(guild, report)
 
     await bulk.best_effort(lambda: guild.edit(name=tournament_name, reason="KAMLA tournament setup"),
                            label="rename server")
@@ -934,15 +982,22 @@ async def _post_get_role(guild: discord.Guild) -> None:
     if not channel:
         return
     from roles_cog import RoleSelectView
+    owner = f"<@{guild.owner_id}>" if getattr(guild, "owner_id", None) else "the tournament ORG"
     embed = discord.Embed(
         title="❓ Get Your Role",
         description=(
             "Click a button below to claim your role.\n\n"
-            "You may only hold **one role** at a time — your previous role will be removed automatically.\n\n"
-            "⚠️ If you are **ORG / CAP / TABBY / EQUITY**, do **not** click here — "
-            "contact the tournament ORG to change your role."
+            "You may only hold **one role** at a time — your previous role will be removed automatically."
         ),
         color=discord.Color.blurple(),
+    )
+    embed.add_field(
+        name="🎖️ CA · Equity · Tabby · Org",
+        value=(
+            "Please **do not** use the buttons above.\n"
+            f"Message the server owner {owner} and they will give you your role."
+        ),
+        inline=False,
     )
     await _send(channel, embed=embed, view=RoleSelectView())
 
