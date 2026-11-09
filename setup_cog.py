@@ -112,10 +112,20 @@ async def _do_build(interaction: discord.Interaction, setup_data: dict) -> None:
         ))
 
     async def show(embed: discord.Embed) -> None:
+        """Report the result without ever raising. The wipe deletes the channel /st was typed in, so
+        the status message (and the interaction's channel) no longer exist: editing it fails with
+        'Unknown Message' / 'Unknown Channel'. That must not look like a failed build, so fall back
+        to a DM, which always works."""
         try:
             await status_msg.edit(embed=embed)
-        except Exception:
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+        except discord.HTTPException:
+            pass
+        except Exception as e:
+            log.debug("Status edit failed: %s", describe(e))
+        from ratelimit import notify
+        if not await notify.best_effort(lambda: interaction.user.send(embed=embed), label="build-report-dm"):
+            log.warning("Could not deliver the build report to the user (status message gone, DMs closed).")
 
     try:
         async with building_job(guild):
@@ -135,6 +145,8 @@ async def _do_build(interaction: discord.Interaction, setup_data: dict) -> None:
                 creator_id=creator_id,
                 progress=progress,
             )
+
+            log.info("Build complete for guild %s: %s", guild.id, report.summary())
 
             # ── Assign creator role via assign channel (single source of truth) ──
             await _assign_creator_role(guild, interaction.user, role_name)
