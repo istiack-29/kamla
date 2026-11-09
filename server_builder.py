@@ -927,16 +927,14 @@ async def _post_meet_developer(channel: discord.TextChannel) -> None:
     embed = discord.Embed(
         title="👐 Meet the Developer",
         description=(
-            "KAMLA was built by **Istiack** — a passionate developer and debater.\n\n"
-            "Use the buttons below to get in touch, support the project, or create a tournament."
+            "KAMLA was built by **Istiack Ahamed Khan (Founder & Developer)** & **KM Mamunoor Islam (Developer)** — a passionate developer and debater.\n\n"
+            "Use the buttons below to get in touch or create a tournament."
         ),
         color=discord.Color.blurple(),
     )
     view = discord.ui.View(timeout=None)
-    view.add_item(discord.ui.Button(label="Developer Contact", style=discord.ButtonStyle.link,
-                                    url="https://istiack.ami.bd/#contact"))
-    view.add_item(discord.ui.Button(label="Donate", style=discord.ButtonStyle.link,
-                                    url="https://istiack.ami.bd/#donate"))
+    view.add_item(discord.ui.Button(label="Get In Touch", style=discord.ButtonStyle.link,
+                                    url="https://discord.gg/zKWJaMEHKf"))
     view.add_item(discord.ui.Button(label="Create Tournament", style=discord.ButtonStyle.link,
                                     url="https://kamla-bot.pages.dev"))
 
