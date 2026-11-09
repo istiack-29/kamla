@@ -927,7 +927,7 @@ async def _post_meet_developer(channel: discord.TextChannel) -> None:
     embed = discord.Embed(
         title="👐 Meet the Developer",
         description=(
-            "KAMLA was built by **Istiack Ahamed Khan (Founder & Developer)** & **KM Mamunoor Islam (Developer)** — a passionate developer and debater.\n\n"
+            "KAMLA was built by **Istiack Ahamed Khan (Founder & Developer)** & **KM Mamunoor Islam (Developer)**\n\n"
             "Use the buttons below to get in touch or create a tournament."
         ),
         color=discord.Color.blurple(),
