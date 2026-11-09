@@ -1,9 +1,8 @@
 """
 welcome_cog.py — Beautiful member welcome messages for KAMLA.
 
-Sends a rich embed to the 👋🏻︱welcome channel whenever a new member joins
-the server. The embed shows the member's avatar, a personalised greeting,
-role instructions, and a quick-start channel guide.
+Sends a short welcome embed to the 👋🏻︱welcome channel whenever a new member joins
+the server: the member's avatar, a personalised greeting and their member number.
 """
 
 from datetime import datetime, timezone
@@ -27,6 +26,8 @@ def _ordinal(n: int) -> str:
 
 
 def _build_welcome_embed(member: discord.Member) -> discord.Embed:
+    """Short on purpose: a greeting and the member number. Role / channel guidance lives in the
+    get-role and information channels instead of being repeated for every new member."""
     guild = member.guild
     now = datetime.now(timezone.utc)
     member_count = guild.member_count or 1
@@ -35,57 +36,20 @@ def _build_welcome_embed(member: discord.Member) -> discord.Embed:
         title=f"Welcome to {guild.name}! 🎉",
         description=(
             f"Hey {member.mention}, glad you're here!\n"
-            f"You are our **{_ordinal(member_count)} member**.\n\n"
-            "This server is powered by **KAMLA** — an automated debate tournament manager. "
-            "Everything is organised for you; just follow the steps below to get started."
+            f"You are our **{_ordinal(member_count)} member**."
         ),
         color=WELCOME_COLOR,
         timestamp=now,
     )
 
-    # Large avatar at the top
+    # Member avatar
     embed.set_thumbnail(url=member.display_avatar.url)
 
-    # Server banner / icon as a small image if available
+    # Server banner / icon if available
     if guild.banner:
         embed.set_image(url=guild.banner.url)
     elif guild.icon:
         embed.set_author(name=guild.name, icon_url=guild.icon.url)
-
-    # ── Step-by-step quick start ────────────────────────────────────────────
-    embed.add_field(
-        name="🚀  Quick Start",
-        value=(
-            "1️⃣  Go to **❓︱get-role** and click your role button\n"
-            "2️⃣  Read **📌︱information** for tournament rules\n"
-            "3️⃣  Join your assigned **ROOM** when rounds start"
-        ),
-        inline=False,
-    )
-
-    # ── Role guide ──────────────────────────────────────────────────────────
-    embed.add_field(
-        name="🎭  Roles",
-        value=(
-            "🔵 **Invited Adjudicator** — Officially invited judges\n"
-            "🟣 **Independent Adjudicator** — Self-registered judges\n"
-            "🩵 **Debater** — Competing speakers\n"
-            "⬜ **Visitor** — Observers & guests"
-        ),
-        inline=True,
-    )
-
-    # ── Key channels ────────────────────────────────────────────────────────
-    embed.add_field(
-        name="📡  Key Channels",
-        value=(
-            "**❓︱get-role** — Claim your role\n"
-            "**📌︱information** — Rules & docs\n"
-            "**🎙️︱grand-auditorium** — Main stage\n"
-            "**⏱️︱timer** — Speech countdown"
-        ),
-        inline=True,
-    )
 
     embed.set_footer(
         text=f"KAMLA  •  Joined {now.strftime('%d %b %Y')}",
