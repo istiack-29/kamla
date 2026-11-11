@@ -72,6 +72,8 @@ def interaction(user, guild=None, channel=None):
     i.response.send_message = mock.AsyncMock()
     i.response.send_modal = mock.AsyncMock()
     i.followup.send = mock.AsyncMock()
+    i.response.edit_message = mock.AsyncMock()
+    i.edit_original_response = mock.AsyncMock()
     return i
 
 
@@ -181,11 +183,23 @@ async def test_autocomplete_states(env):
     out = await choices(env, cog_mod.TabbycatCog._draw_ac, guild)
     assert out[0].value == cog_mod.NONE_VALUE and "/refresh" in out[0].name          # connected, data not loaded
     await env.cog._refresh(guild)
-    assert [c.name for c in await choices(env, cog_mod.TabbycatCog._draw_ac, guild)] == ["Round 1", "Round 3"]
-    assert [c.name for c in await choices(env, cog_mod.TabbycatCog._motion_ac, guild)] == ["Round 1"]
-    assert [c.name for c in await choices(env, cog_mod.TabbycatCog._result_ac, guild)] == ["Round 1"]
+    draw = [c.name for c in await choices(env, cog_mod.TabbycatCog._draw_ac, guild)]
+    assert draw[0].startswith("2 of 3 rounds have draw") and "/refresh" in draw[0]       # how many rounds have arrived
+    assert draw[1:] == ["Round 1 ✅", "Round 2 ⏳ not released yet — use /refresh", "Round 3 ✅"]
+    motion = await choices(env, cog_mod.TabbycatCog._motion_ac, guild)
+    assert motion[0].name.startswith("1 of 3 rounds have motions") and motion[0].value == cog_mod.NONE_VALUE
+    assert [c.name for c in motion[1:]][0] == "Round 1 ✅" and [c.value for c in motion[1:]] == [1, 2, 3]
     assert [c.name for c in await choices(env, cog_mod.TabbycatCog._break_ac, guild)] == ["Open"]
-    assert [c.name for c in await choices(env, cog_mod.TabbycatCog._draw_ac, guild, "3")] == ["Round 3"]
+    assert [c.name for c in await choices(env, cog_mod.TabbycatCog._draw_ac, guild, "3")][-1] == "Round 3 ✅"
+
+
+async def test_autocomplete_all_released_has_no_warning_line(env):
+    guild = FakeGuild()
+    await connect(env, guild)
+    for r in env.cog._cache[guild.id].rounds:
+        r.draw_status = "R"
+    out = [c.name for c in await choices(env, cog_mod.TabbycatCog._draw_ac, guild)]
+    assert out == ["Round 1 ✅", "Round 2 ✅", "Round 3 ✅"]
 
 
 async def test_autocomplete_none_released_points_to_refresh(env):
@@ -194,7 +208,8 @@ async def test_autocomplete_none_released_points_to_refresh(env):
     env.cog._cache[guild.id].rounds[:] = [r for r in env.cog._cache[guild.id].rounds if r.seq == 2]    # only a draft round
     for fn in (cog_mod.TabbycatCog._draw_ac, cog_mod.TabbycatCog._motion_ac, cog_mod.TabbycatCog._result_ac):
         out = await choices(env, fn, guild)
-        assert len(out) == 1 and "No " in out[0].name and "/refresh" in out[0].name
+        assert out[0].name.startswith("0 of 1 rounds have") and "/refresh" in out[0].name
+        assert "not released" in out[1].name and "/refresh" in out[1].name
 
 
 # ── the commands ──────────────────────────────────────────────────────────────
@@ -216,12 +231,60 @@ async def test_each_command_goes_to_its_own_channel(env):
     guild = FakeGuild()
     await connect(env, guild)
     cog = env.cog
+    for rnd in env.cog._cache[guild.id].rounds:
+        for m in rnd.motions:
+            m.info_slide = ""                                          # no info slide → /motion posts straight away
     plan = [("motion", "motion", (1,)), ("result", "result", (1,)), ("break_", "break", ("Open",))]
     for method, kind, args in plan:
         i = interaction(member("ORG"), guild)
         await getattr(cog, method).callback(cog, i, *args)
         chan = guild.channels_by[kind]
         assert len(chan.sent) >= 1 and chan.sent[-1]["content"] is None and chan.sent[-1]["files"], kind
+
+
+def sent_view(i):
+    return i.followup.send.await_args.kwargs.get("view")
+
+
+async def test_motion_with_info_slide_offers_two_buttons_and_posts_nothing_yet(env):
+    guild = FakeGuild()
+    await connect(env, guild)
+    i = interaction(member("CAP"), guild)
+    await env.cog.motion.callback(env.cog, i, 1)                      # the fixture's motion has an info slide
+    view = sent_view(i)
+    assert isinstance(view, cog_mod.MotionRevealView)
+    assert [b.label for b in view.children] == ["Reveal Info", "Reveal Motion"]
+    assert not guild.channels_by["motion"].sent and "info slide" in last_text(i)
+
+
+async def test_reveal_buttons_post_info_and_motion_separately(env):
+    guild = FakeGuild()
+    await connect(env, guild)
+    i = interaction(member("CAP"), guild)
+    await env.cog.motion.callback(env.cog, i, 1)
+    view = sent_view(i)
+
+    press = interaction(member("CAP"), guild)                         # (each fake interaction brings its own channels)
+    await view.reveal_info.callback(press)
+    chan = guild.channels_by["motion"]
+    assert len(chan.sent) == 1 and chan.sent[0]["files"][0].filename.startswith("info-")
+    assert view.reveal_info.disabled and not view.reveal_motion.disabled     # greyed out after use
+    press.response.edit_message.assert_awaited()
+
+    press2 = interaction(member("CAP"), guild)
+    await view.reveal_motion.callback(press2)
+    chan2 = guild.channels_by["motion"]
+    assert len(chan2.sent) == 1 and chan2.sent[0]["files"][0].filename.startswith("motion-")
+    assert view.reveal_motion.disabled
+
+
+async def test_reveal_buttons_are_for_operators_only(env):
+    guild = FakeGuild()
+    await connect(env, guild)
+    view = cog_mod.MotionRevealView(env.cog, env.cog._cache[guild.id].rounds[0], "T")
+    bad = interaction(member("DEBATER"), guild)
+    assert await view.interaction_check(bad) is False and "Only CAP" in last_text(bad)
+    assert await view.interaction_check(interaction(member("ORG"), guild)) is True
 
 
 async def test_unavailable_choice_tells_the_user_to_refresh(env):
@@ -256,6 +319,7 @@ async def test_tabbycat_outage_uses_cached_data_or_reports(env):
     env.cog._cache[guild.id].fetched -= cog_mod.CACHE_TTL + 1         # cache is stale
     i = interaction(member("CAP"), guild)
     await env.cog.motion.callback(env.cog, i, 1)                       # motion needs no live request: served from cache
+    await sent_view(i).reveal_motion.callback(interaction(member("CAP"), guild))
     assert guild.channels_by["motion"].sent
     i2 = interaction(member("CAP"), guild)
     await env.cog.draw.callback(env.cog, i2, 1)                        # draw needs the site -> friendly error

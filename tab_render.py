@@ -2,10 +2,18 @@
 tab_render.py — renders Tabbycat data as clean PNG images (no text output).
 
 Fonts:  B.ttf  = Bangla (Kohinur Bangla)      E.ttf = English (Times-style serif)
-        Both are looked up in the project root (next to this file). If one is missing KAMLA falls back to
-        a system font and logs a warning once — images are still produced, they just look different.
+        NotoColorEmoji.ttf = colour emoji (team emoji in draws / results / breaks)
+        All are looked up in the project root (next to this file). If one is missing KAMLA falls back to
+        a system font (for emoji: the emoji are simply left out) and logs a warning once.
 Bengali needs the RAQM layout engine (libraqm + FriBiDi + HarfBuzz) to shape conjuncts correctly. Without
         it Pillow would draw broken letters, so a loud warning is logged at start-up (see check_fonts()).
+
+Quality / size:
+  * Everything is drawn at SCALE x the logical layout size (default 2x → 2800 px wide images), so text and
+    emoji stay sharp when Discord shows or zooms the image.
+  * There is NO fixed height and NO line limit: a draw, info slide or motion is as tall as its content.
+    Only Discord's upload limit is respected — if a PNG would be too big (or absurdly tall) the scale is
+    lowered step by step until it fits.
 
 Every function returns a list of PNG byte strings (one per page) and is synchronous: call it with
 asyncio.to_thread() so the event loop is never blocked.
@@ -15,14 +23,16 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from PIL import Image, ImageDraw, ImageFont, features
 
-from tabbycat_client import BreakCategoryInfo, BreakTeam, DebateInfo, MotionInfo, ResultInfo, RoundInfo
+from tabbycat_client import (EMOJI_RE, BreakCategoryInfo, BreakTeam, DebateInfo, MotionInfo, ResultInfo, RoundInfo,
+                             strip_emoji)
 
 log = logging.getLogger("kamla.render")
 
@@ -33,6 +43,11 @@ E_CANDIDATES = [ROOT / "E.ttf",
 B_CANDIDATES = [ROOT / "B.ttf",
                 Path("/usr/share/fonts/truetype/noto/NotoSansBengali-Regular.ttf"),
                 Path("/usr/share/fonts/truetype/lohit-bengali/Lohit-Bengali.ttf")]
+M_CANDIDATES = [ROOT / "NotoColorEmoji.ttf",
+                Path("/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf"),
+                Path("/usr/share/fonts/noto/NotoColorEmoji.ttf"),
+                Path("/usr/share/fonts/google-noto-emoji/NotoColorEmoji.ttf")]
+BUNDLED = {"B.ttf", "E.ttf", "NotoColorEmoji.ttf"}
 
 # palette
 BG, CARD, BORDER = "#EEF1F8", "#FFFFFF", "#D5DBEA"
@@ -41,9 +56,21 @@ TEXT, MUTED, ZEBRA = "#1B1F2A", "#6B7280", "#F3F5FB"
 SIDE_COLORS = {"Gov": "#1D4ED8", "Opp": "#B91C1C", "OG": "#047857", "OO": "#B45309", "CG": "#1D4ED8", "CO": "#7E22CE"}
 GOLD, GREEN = "#B7791F", "#047857"
 
+# logical layout units (everything below is multiplied by the render scale when drawn)
 WIDTH, MARGIN, PAD_X, PAD_Y = 1400, 36, 20, 16
 HEADER_H, COLHEAD_H, FOOTER_H = 176, 74, 70
-MAX_PAGE_H = 2100
+MAX_PAGE_H: Optional[int] = None          # None = never split a table into several pages
+
+try:
+    SCALE = max(1, min(4, int(os.environ.get("KAMLA_RENDER_SCALE", "2"))))
+except ValueError:
+    SCALE = 2
+MEASURE = 2                                # text is measured at this scale so layout never depends on SCALE
+MAX_BYTES = 9 * 1024 * 1024                # Discord's default upload limit is 10 MB
+MAX_SIDE_PX = 16000                        # keep images displayable; lower the scale instead of cutting content
+
+EMOJI_TILE_W, EMOJI_TILE_H, EMOJI_GLYPH_BOTTOM = 136, 128, 120    # NotoColorEmoji bitmap strike (size 109)
+EMOJI_HEIGHT = 1.15                        # emoji tile height as a multiple of the font size
 
 
 # ── fonts ─────────────────────────────────────────────────────────────────────
@@ -63,22 +90,42 @@ def raqm_available() -> bool:
 
 @lru_cache(maxsize=None)
 def _first_existing(kind: str) -> Optional[str]:
-    for path in (B_CANDIDATES if kind == "B" else E_CANDIDATES):
+    cands = {"B": B_CANDIDATES, "E": E_CANDIDATES, "M": M_CANDIDATES}[kind]
+    for path in cands:
         if path.exists():
-            if path.name not in ("B.ttf", "E.ttf"):
-                _warn_once(f"fallback-{kind}", f"{kind}.ttf not found in the project root; using fallback font {path.name}.")
+            if path.name not in BUNDLED:
+                _warn_once(f"fallback-{kind}", f"{kind} font not found in the project root; using fallback font {path.name}.")
             return str(path)
-    _warn_once(f"missing-{kind}", f"No usable {kind} font found (add {kind}.ttf to the project root).")
+    _warn_once(f"missing-{kind}", f"No usable {kind} font found (add {'NotoColorEmoji' if kind == 'M' else kind}.ttf "
+                                  f"to the project root).")
     return None
 
 
 @lru_cache(maxsize=None)
-def _font(kind: str, size: int) -> ImageFont.FreeTypeFont:
+def _font(kind: str, px: int) -> ImageFont.FreeTypeFont:
     path = _first_existing(kind) or _first_existing("E" if kind == "B" else "B")
     if path is None:
-        return ImageFont.load_default(size)
+        return ImageFont.load_default(px)
     engine = ImageFont.Layout.RAQM if raqm_available() else ImageFont.Layout.BASIC
-    return ImageFont.truetype(path, size, layout_engine=engine)
+    return ImageFont.truetype(path, px, layout_engine=engine)
+
+
+@lru_cache(maxsize=1)
+def _emoji_font() -> Optional[ImageFont.FreeTypeFont]:
+    """The colour-bitmap emoji font at its only size (109). None if it is missing or unusable."""
+    path = _first_existing("M")
+    if path is None:
+        return None
+    try:
+        engine = ImageFont.Layout.RAQM if raqm_available() else ImageFont.Layout.BASIC
+        return ImageFont.truetype(path, 109, layout_engine=engine)
+    except Exception as exc:  # noqa: BLE001  (e.g. a vector emoji font that has no 109px strike)
+        _warn_once("emoji-load", f"Emoji font could not be used ({type(exc).__name__}); emoji will be left out.")
+        return None
+
+
+def emoji_available() -> bool:
+    return _emoji_font() is not None
 
 
 def check_fonts() -> dict[str, bool]:
@@ -87,6 +134,7 @@ def check_fonts() -> dict[str, bool]:
         "E.ttf": (ROOT / "E.ttf").exists(),
         "B.ttf": (ROOT / "B.ttf").exists(),
         "raqm": raqm_available(),
+        "emoji": emoji_available(),
     }
     if not info["raqm"]:
         log.error("Pillow has no RAQM support: Bengali text would be drawn with broken letters. "
@@ -95,54 +143,100 @@ def check_fonts() -> dict[str, bool]:
         log.warning("B.ttf (Bangla font) is not in the project root yet; a fallback font will be used.")
     if not info["E.ttf"]:
         log.warning("E.ttf (English font) is not in the project root yet; a fallback font will be used.")
+    if not info["emoji"]:
+        log.warning("NotoColorEmoji.ttf is not in the project root; team emoji will be left out of the images.")
     return info
 
+
+def _prep(text: str) -> str:
+    return text if emoji_available() else strip_emoji(text)
+
+
+# ── text engine ───────────────────────────────────────────────────────────────
 
 def _is_bengali(ch: str) -> bool:
     return "\u0980" <= ch <= "\u09FF"
 
 
 def split_runs(text: str) -> list[tuple[str, str]]:
-    """Split into (script, run). Neutral characters (space, digits, punctuation, ZWJ/ZWNJ) stay with the
-    surrounding run so Bengali words are never cut in the middle of a conjunct."""
+    """Split into (script, run): "B" Bengali, "E" everything else, "M" one emoji cluster per run.
+    Neutral characters (space, digits, punctuation, ZWJ/ZWNJ) stay with the surrounding text run so Bengali
+    words are never cut in the middle of a conjunct."""
     runs: list[tuple[str, str]] = []
-    for ch in text:
-        if _is_bengali(ch):
-            script = "B"
-        elif ch.isalpha():
-            script = "E"
-        else:
-            script = runs[-1][0] if runs else "E"
-        if runs and runs[-1][0] == script:
-            runs[-1] = (script, runs[-1][1] + ch)
-        else:
-            runs.append((script, ch))
+    last_text_script = "E"
+
+    def add_text(chunk: str) -> None:
+        nonlocal last_text_script
+        for ch in chunk:
+            if _is_bengali(ch):
+                script = "B"
+            elif ch.isalpha():
+                script = "E"
+            else:
+                script = last_text_script
+            last_text_script = script
+            if runs and runs[-1][0] == script:
+                runs[-1] = (script, runs[-1][1] + ch)
+            else:
+                runs.append((script, ch))
+
+    pos = 0
+    for m in EMOJI_RE.finditer(text):
+        add_text(text[pos:m.start()])
+        runs.append(("M", m.group()))
+        pos = m.end()
+    add_text(text[pos:])
     return runs
 
 
+@lru_cache(maxsize=2048)
+def _emoji_tile(cluster: str, tile_h: int) -> Optional[Image.Image]:
+    font = _emoji_font()
+    if font is None:
+        return None
+    tile = Image.new("RGBA", (EMOJI_TILE_W + 24, EMOJI_TILE_H + 24), (0, 0, 0, 0))
+    ImageDraw.Draw(tile).text((0, 0), cluster, font=font, embedded_color=True)
+    tile = tile.crop((0, 0, EMOJI_TILE_W, EMOJI_TILE_H))
+    tile_w = max(1, round(tile_h * EMOJI_TILE_W / EMOJI_TILE_H))
+    return tile.resize((tile_w, tile_h), Image.LANCZOS)
+
+
+def _emoji_tile_h(size: float, scale: int) -> int:
+    return max(2, round(size * scale * EMOJI_HEIGHT))
+
+
+def _run_width(script: str, run: str, size: float) -> float:
+    """Logical width of one run."""
+    if script == "M":
+        tile = _emoji_tile(run, _emoji_tile_h(size, MEASURE))
+        return (tile.width if tile else 0) / MEASURE
+    return _font(script, round(size * MEASURE)).getlength(run) / MEASURE
+
+
 def text_width(text: str, size: int) -> float:
-    return sum(_font(script, size).getlength(run) for script, run in split_runs(text))
+    return sum(_run_width(script, run, size) for script, run in split_runs(_prep(text)))
 
 
-def draw_text(draw: ImageDraw.ImageDraw, xy: tuple[float, float], text: str, size: int, fill: str,
-              bold: bool = False, anchor_right: bool = False) -> None:
-    x, y = xy
-    if anchor_right:
-        x -= text_width(text, size)
-    # One shared baseline for every run, so Bengali and English text never sit at different heights.
-    baseline = y + _font("E", size).getmetrics()[0]
-    for script, run in split_runs(text):
-        font = _font(script, size)
-        if bold:
-            draw.text((x, baseline), run, font=font, fill=fill, anchor="ls", stroke_width=1, stroke_fill=fill)
-        else:
-            draw.text((x, baseline), run, font=font, fill=fill, anchor="ls")
-        x += font.getlength(run)
+def wrap_paragraphs(text: str, size: int, max_width: float, max_lines: Optional[int] = None) -> list[str]:
+    """wrap() that keeps the author's line breaks: every paragraph is wrapped on its own and a blank paragraph
+    becomes an empty line (used for info slides)."""
+    lines: list[str] = []
+    for para in (text or "").split("\n"):
+        lines.extend([""] if not para.strip() else wrap(para, size, max_width))
+    while lines and lines[-1] == "":
+        lines.pop()
+    while lines and lines[0] == "":
+        lines.pop(0)
+    if max_lines is not None and len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = lines[-1].rstrip() + "…"
+    return lines or [""]
 
 
-def wrap(text: str, size: int, max_width: float, max_lines: int = 3) -> list[str]:
-    """Greedy word wrap; over-long words are broken by character; the last line gets an ellipsis."""
-    words = (text or "").split()
+def wrap(text: str, size: int, max_width: float, max_lines: Optional[int] = None) -> list[str]:
+    """Greedy word wrap; over-long words are broken by character. max_lines=None (default) never truncates;
+    with a limit the last line gets an ellipsis."""
+    words = _prep(text or "").split()
     if not words:
         return [""]
     lines: list[str] = []
@@ -164,13 +258,86 @@ def wrap(text: str, size: int, max_width: float, max_lines: int = 3) -> list[str
         cur = word
     if cur:
         lines.append(cur)
-    if len(lines) > max_lines:
+    if max_lines is not None and len(lines) > max_lines:
         lines = lines[:max_lines]
         last = lines[-1]
         while last and text_width(last + "…", size) > max_width:
             last = last[:-1]
         lines[-1] = last.rstrip() + "…"
     return lines
+
+
+class Canvas:
+    """A drawing surface addressed in logical units; the pixels are scale x bigger."""
+
+    def __init__(self, width: int, height: int, bg: str, scale: int) -> None:
+        self.w, self.h, self.scale = width, height, scale
+        self.img = Image.new("RGB", (width * scale, height * scale), bg)
+        self.d = ImageDraw.Draw(self.img)
+
+    def _p(self, v: float) -> int:
+        return int(round(v * self.scale))
+
+    def rect(self, box, fill) -> None:
+        self.d.rectangle([self._p(v) for v in box], fill=fill)
+
+    def rrect(self, box, radius, fill=None, outline=None, width=1) -> None:
+        self.d.rounded_rectangle([self._p(v) for v in box], radius=self._p(radius), fill=fill, outline=outline,
+                                 width=max(1, self._p(width)))
+
+    def line(self, pts, fill, width=1) -> None:
+        self.d.line([self._p(v) for v in pts], fill=fill, width=max(1, self._p(width)))
+
+    def paste_rounded(self, other: "Canvas", xy, radius) -> None:
+        mask = Image.new("L", other.img.size, 0)
+        ImageDraw.Draw(mask).rounded_rectangle([0, 0, other.img.width - 1, other.img.height - 1],
+                                               radius=self._p(radius), fill=255)
+        self.img.paste(other.img, (self._p(xy[0]), self._p(xy[1])), mask)
+
+    def text(self, xy: tuple[float, float], text: str, size: int, fill: str, bold: bool = False,
+             anchor_right: bool = False) -> None:
+        text = _prep(text)
+        x, y = xy
+        if anchor_right:
+            x -= text_width(text, size)
+        S = self.scale
+        px = round(size * S)
+        # One shared baseline for every run, so Bengali, English and emoji never sit at different heights.
+        baseline = self._p(y) + _font("E", px).getmetrics()[0]
+        xp = float(self._p(x))
+        stroke = max(1, S // 2) if bold else 0
+        for script, run in split_runs(text):
+            if script == "M":
+                tile = _emoji_tile(run, _emoji_tile_h(size, S))
+                if tile is not None:
+                    top = baseline + 0.05 * px - tile.height * EMOJI_GLYPH_BOTTOM / EMOJI_TILE_H
+                    self.img.paste(tile, (int(round(xp)), int(round(top))), tile)
+                    xp += tile.width
+                continue
+            font = _font(script, px)
+            if stroke:
+                self.d.text((xp, baseline), run, font=font, fill=fill, anchor="ls", stroke_width=stroke, stroke_fill=fill)
+            else:
+                self.d.text((xp, baseline), run, font=font, fill=fill, anchor="ls")
+            xp += font.getlength(run)
+
+
+def _encode(img: Image.Image) -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def _fit(build: Callable[[int], Canvas]) -> bytes:
+    """Render at the highest scale that stays displayable and under Discord's upload limit."""
+    scale = SCALE
+    while True:
+        canvas = build(scale)
+        too_big_px = max(canvas.img.size) > MAX_SIDE_PX
+        data = None if too_big_px and scale > 1 else _encode(canvas.img)
+        if scale <= 1 or (data is not None and len(data) <= MAX_BYTES):
+            return data if data is not None else _encode(canvas.img)
+        scale -= 1
 
 
 # ── table engine ──────────────────────────────────────────────────────────────
@@ -214,7 +381,7 @@ def _layout_rows(columns: list[Column], rows: list[list[Cell]], inner_w: int) ->
             avail = widths[col_idx] - 2 * PAD_X
             wrapped, h = [], 0
             for ln in cell_lines:
-                for piece in wrap(ln.text, ln.size, avail, max_lines=3):
+                for piece in wrap(ln.text, ln.size, avail):          # never truncated
                     wrapped.append((piece, ln))
                     h += int(ln.size * 1.38)
             out_cells.append(wrapped)
@@ -224,6 +391,9 @@ def _layout_rows(columns: list[Column], rows: list[list[Cell]], inner_w: int) ->
 
 
 def _paginate(laid: list[_LaidRow]) -> list[list[_LaidRow]]:
+    """One page unless MAX_PAGE_H is set (it is not by default: a table is as tall as it needs to be)."""
+    if MAX_PAGE_H is None:
+        return [laid]
     budget = MAX_PAGE_H - HEADER_H - COLHEAD_H - FOOTER_H - 2 * MARGIN
     pages, cur, used = [], [], 0
     for row in laid:
@@ -237,25 +407,19 @@ def _paginate(laid: list[_LaidRow]) -> list[list[_LaidRow]]:
     return pages
 
 
-def _png(img: Image.Image) -> bytes:
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
-    return buf.getvalue()
-
-
-def _header(draw: ImageDraw.ImageDraw, width: int, kicker: str, title: str, subtitle: str = "") -> None:
-    draw.rectangle([0, 0, width, HEADER_H], fill=NAVY)
-    draw_text(draw, (MARGIN + 6, 24), kicker.upper(), 24, "#AEB8D6")
-    draw_text(draw, (MARGIN + 6, 56), title, 58, "#FFFFFF", bold=True)
+def _header(c: Canvas, width: int, kicker: str, title: str, subtitle: str = "") -> None:
+    c.rect([0, 0, width, HEADER_H], fill=NAVY)
+    c.text((MARGIN + 6, 24), kicker.upper(), 24, "#AEB8D6")
+    c.text((MARGIN + 6, 56), title, 58, "#FFFFFF", bold=True)
     if subtitle:
-        draw_text(draw, (MARGIN + 6, 128), subtitle, 26, "#C9D2EE")
-    draw_text(draw, (width - MARGIN - 6, 30), "KAMLA", 30, "#FFFFFF", bold=True, anchor_right=True)
+        c.text((MARGIN + 6, 128), subtitle, 26, "#C9D2EE")
+    c.text((width - MARGIN - 6, 30), "KAMLA", 30, "#FFFFFF", bold=True, anchor_right=True)
 
 
-def _footer(draw: ImageDraw.ImageDraw, width: int, y: int, page: int, pages: int) -> None:
-    draw_text(draw, (MARGIN + 6, y + 18), "Generated by KAMLA", 24, MUTED)
+def _footer(c: Canvas, width: int, y: int, page: int, pages: int) -> None:
+    c.text((MARGIN + 6, y + 18), "Generated by KAMLA", 24, MUTED)
     if pages > 1:
-        draw_text(draw, (width - MARGIN - 6, y + 18), f"Page {page} / {pages}", 24, MUTED, anchor_right=True)
+        c.text((width - MARGIN - 6, y + 18), f"Page {page} / {pages}", 24, MUTED, anchor_right=True)
 
 
 def render_table(kicker: str, title: str, subtitle: str, columns: list[Column], rows: list[list[Cell]]) -> list[bytes]:
@@ -266,44 +430,41 @@ def render_table(kicker: str, title: str, subtitle: str, columns: list[Column], 
     for number, page_rows in enumerate(pages, 1):
         body_h = sum(r.height for r in page_rows)
         height = HEADER_H + MARGIN + COLHEAD_H + body_h + MARGIN + FOOTER_H
-        img = Image.new("RGB", (WIDTH, height), BG)
-        d = ImageDraw.Draw(img)
-        _header(d, WIDTH, kicker, title, subtitle)
-
-        top = HEADER_H + MARGIN
         card_w, card_h = WIDTH - 2 * MARGIN, COLHEAD_H + body_h
-        card = Image.new("RGB", (card_w, card_h), CARD)
-        c = ImageDraw.Draw(card)
 
-        # column headings
-        x = 0
-        for col, w in zip(columns, widths):
-            c.rectangle([x, 0, x + w, COLHEAD_H], fill=col.color)
-            draw_text(c, (x + PAD_X, (COLHEAD_H - 34) // 2 - 2), col.header, 30, "#FFFFFF", bold=True)
-            x += w
+        def build(scale: int, page_rows=page_rows, height=height, card_w=card_w, card_h=card_h, number=number) -> Canvas:
+            cv = Canvas(WIDTH, height, BG, scale)
+            _header(cv, WIDTH, kicker, title, subtitle)
+            top = HEADER_H + MARGIN
+            card = Canvas(card_w, card_h, CARD, scale)
 
-        y = COLHEAD_H
-        for idx, row in enumerate(page_rows):
-            if idx % 2 == 1:
-                c.rectangle([0, y, card_w, y + row.height], fill=ZEBRA)
             x = 0
-            for col_cells, w in zip(row.cells, widths):
-                cy = y + PAD_Y
-                for text, ln in col_cells:
-                    draw_text(c, (x + PAD_X, cy), text, ln.size, ln.color, ln.bold)
-                    cy += int(ln.size * 1.38)
+            for col, w in zip(columns, widths):                       # column headings
+                card.rect([x, 0, x + w, COLHEAD_H], fill=col.color)
+                card.text((x + PAD_X, (COLHEAD_H - 34) // 2 - 2), col.header, 30, "#FFFFFF", bold=True)
                 x += w
-            y += row.height
-            if idx < len(page_rows) - 1:
-                c.line([0, y, card_w, y], fill=BORDER, width=1)
 
-        # the card is composited through a rounded mask so the header cells get clean rounded corners
-        mask = Image.new("L", (card_w, card_h), 0)
-        ImageDraw.Draw(mask).rounded_rectangle([0, 0, card_w - 1, card_h - 1], radius=22, fill=255)
-        img.paste(card, (MARGIN, top), mask)
-        d.rounded_rectangle([MARGIN, top, MARGIN + card_w - 1, top + card_h - 1], radius=22, outline=BORDER, width=2)
-        _footer(d, WIDTH, height - FOOTER_H, number, len(pages))
-        images.append(_png(img))
+            y = COLHEAD_H
+            for idx, row in enumerate(page_rows):
+                if idx % 2 == 1:
+                    card.rect([0, y, card_w, y + row.height], fill=ZEBRA)
+                x = 0
+                for col_cells, w in zip(row.cells, widths):
+                    cy = y + PAD_Y
+                    for text, ln in col_cells:
+                        card.text((x + PAD_X, cy), text, ln.size, ln.color, ln.bold)
+                        cy += int(ln.size * 1.38)
+                    x += w
+                y += row.height
+                if idx < len(page_rows) - 1:
+                    card.line([0, y, card_w, y], fill=BORDER, width=1)
+
+            cv.paste_rounded(card, (MARGIN, top), 22)                 # rounded mask → clean corners on the heading cells
+            cv.rrect([MARGIN, top, MARGIN + card_w - 1, top + card_h - 1], 22, outline=BORDER, width=2)
+            _footer(cv, WIDTH, height - FOOTER_H, number, len(pages))
+            return cv
+
+        images.append(_fit(build))
     return images
 
 
@@ -395,39 +556,78 @@ def render_break(tournament: str, category: BreakCategoryInfo, teams: list[Break
     return render_table(tournament or "Tournament", f"Break  ·  {category.name}", f"{size}{len(teams)} teams", columns, rows)
 
 
-# ── motions ───────────────────────────────────────────────────────────────────
+# ── motions & info slides ─────────────────────────────────────────────────────
 
-def render_motions(tournament: str, rnd: RoundInfo, motions: list[MotionInfo]) -> list[bytes]:
-    images = []
-    inner_w = 1200 - 2 * MARGIN - 2 * 44
-    for idx, m in enumerate(motions, 1):
-        text_lines = wrap(m.text or "—", 54, inner_w, max_lines=14)
-        slide_lines = wrap(m.info_slide, 32, inner_w, max_lines=22) if m.info_slide else []
-        body_h = 44 + len(text_lines) * int(54 * 1.42) + 40
-        if slide_lines:
-            body_h += 40 + 36 + len(slide_lines) * int(32 * 1.45) + 30
-        width = 1200
-        height = HEADER_H + MARGIN + body_h + MARGIN + FOOTER_H
-        img = Image.new("RGB", (width, height), BG)
-        d = ImageDraw.Draw(img)
-        label = "Motion" if len(motions) == 1 else f"Motion {idx}"
-        _header(d, width, tournament or "Tournament", f"{rnd.name}  ·  {label}")
+MOTION_W = 1200
+CARD_PAD = 44
+
+
+@dataclass
+class Block:
+    lines: list[str]
+    size: int
+    color: str = TEXT
+    bold: bool = False
+    gap_before: int = 0
+    divider: bool = False          # thin rule drawn in the gap above this block
+
+
+def _inner_w() -> int:
+    return MOTION_W - 2 * MARGIN - 2 * CARD_PAD - 12
+
+
+def _text_card(tournament: str, title: str, blocks: list[Block], accent: str = "#3B6BFF") -> bytes:
+    """One card, exactly as tall as its text — no line limit, no height limit."""
+    body_h = 2 * CARD_PAD + sum(b.gap_before + len(b.lines) * int(b.size * 1.42) for b in blocks)
+    height = HEADER_H + MARGIN + body_h + MARGIN + FOOTER_H
+
+    def build(scale: int) -> Canvas:
+        cv = Canvas(MOTION_W, height, BG, scale)
+        _header(cv, MOTION_W, tournament or "Tournament", title)
         top = HEADER_H + MARGIN
-        d.rounded_rectangle([MARGIN, top, width - MARGIN, top + body_h], radius=22, fill=CARD, outline=BORDER, width=2)
-        d.rounded_rectangle([MARGIN, top, MARGIN + 12, top + body_h], radius=6, fill="#3B6BFF")
-        y = top + 44
-        for line in text_lines:
-            draw_text(d, (MARGIN + 44, y), line, 54, TEXT, bold=True)
-            y += int(54 * 1.42)
-        if slide_lines:
-            y += 40
-            d.line([MARGIN + 44, y, width - MARGIN - 44, y], fill=BORDER, width=2)
-            y += 24
-            draw_text(d, (MARGIN + 44, y), "INFO SLIDE", 24, MUTED, bold=True)
-            y += 40
-            for line in slide_lines:
-                draw_text(d, (MARGIN + 44, y), line, 32, "#374151")
-                y += int(32 * 1.45)
-        _footer(d, width, height - FOOTER_H, 1, 1)
-        images.append(_png(img))
+        cv.rrect([MARGIN, top, MOTION_W - MARGIN, top + body_h], 22, fill=CARD, outline=BORDER, width=2)
+        cv.rrect([MARGIN, top, MARGIN + 12, top + body_h], 6, fill=accent)
+        x, y = MARGIN + CARD_PAD, top + CARD_PAD
+        for b in blocks:
+            if b.divider:
+                cv.line([x, y + b.gap_before // 2, MOTION_W - MARGIN - CARD_PAD, y + b.gap_before // 2],
+                        fill=BORDER, width=2)
+            y += b.gap_before
+            for line in b.lines:
+                if line:
+                    cv.text((x, y), line, b.size, b.color, b.bold)
+                y += int(b.size * 1.42)
+        _footer(cv, MOTION_W, height - FOOTER_H, 1, 1)
+        return cv
+
+    return _fit(build)
+
+
+def motion_label(idx: int, total: int) -> str:
+    return "Motion" if total == 1 else f"Motion {idx}"
+
+
+def render_motions(tournament: str, rnd: RoundInfo, motions: list[MotionInfo], show_info: bool = True) -> list[bytes]:
+    """One image per motion. show_info=False leaves the info slide out (organisers can post it separately
+    with render_info_slides)."""
+    images = []
+    for idx, m in enumerate(motions, 1):
+        blocks = [Block(wrap_paragraphs(m.text or "—", 54, _inner_w()), 54, TEXT, True)]
+        if show_info and m.info_slide:
+            blocks.append(Block(["INFO SLIDE"], 24, MUTED, True, gap_before=48, divider=True))
+            blocks.append(Block(wrap_paragraphs(m.info_slide, 34, _inner_w()), 34, "#374151", False, gap_before=8))
+        images.append(_text_card(tournament, f"{rnd.name}  ·  {motion_label(idx, len(motions))}", blocks))
+    return images
+
+
+def render_info_slides(tournament: str, rnd: RoundInfo, motions: list[MotionInfo]) -> list[bytes]:
+    """One image per motion that has an info slide."""
+    images = []
+    for idx, m in enumerate(motions, 1):
+        if not m.info_slide:
+            continue
+        suffix = "" if len(motions) == 1 else f"  ·  {motion_label(idx, len(motions))}"
+        images.append(_text_card(tournament, f"{rnd.name}  ·  Info Slide{suffix}",
+                                 [Block(wrap_paragraphs(m.info_slide, 38, _inner_w()), 38, TEXT, False)],
+                                 accent="#B7791F"))
     return images

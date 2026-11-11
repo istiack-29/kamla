@@ -6,10 +6,13 @@ tabbycat_cog.py — Tabbycat integration for KAMLA.
   /refresh    CAP / ORG / TABBY. Re-reads rounds, motions, draws, results and breaks from Tabbycat and
               reports what is available.
   /draw  /motion  /result  /break
-              CAP / ORG / TABBY. Choose from the options that are actually available (rounds whose draw /
-              motions / results are released, break categories that have a break). Each command can be used
-              in ANY channel; the result is rendered as an image (no text) and posted in the right channel
-              (matchup / motion / ballot / break). If nothing is available the command says so and points to /refresh.
+              CAP / ORG / TABBY. The round list shows EVERY round with its state (released ✅ or not yet ⏳) and a
+              first line "k of n rounds have <draw|motions|results>", so it is clear what has arrived. Picking a round
+              that has nothing yet tells the user to run /refresh. Each command can be used in ANY channel; the result
+              is rendered as an image (no text) and posted in the right channel (matchup / motion / ballot / break).
+  /motion     If the round's motions have an info slide the command first shows two buttons — [Reveal Info] and
+              [Reveal Motion] — so the organiser decides what is posted and when. Without an info slide the motion is
+              posted straight away.
 
 Where the connection lives: in the server's hidden kamla-config channel (readable only by KAMLA and
 administrators), never in logs and never shown back. Old copies of the config are deleted when the token changes.
@@ -116,6 +119,48 @@ class TabModal(discord.ui.Modal, title="Connect Tabbycat"):
         log.error("Tab modal failed: %s", describe(error))
         try:
             await interaction.followup.send("❌ Something went wrong while saving. Please try again.", ephemeral=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class MotionRevealView(discord.ui.View):
+    """[Reveal Info] / [Reveal Motion] — shown by /motion when the round has an info slide. Only CAP / ORG / TABBY
+    can press them, and each button works once (it greys out as soon as it is pressed)."""
+
+    def __init__(self, cog: "TabbycatCog", rnd: RoundInfo, tournament: str) -> None:
+        super().__init__(timeout=900)
+        self.cog, self.rnd, self.tournament = cog, rnd, tournament
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if is_operator(interaction.user):
+            return True
+        await interaction.response.send_message("⛔ Only CAP, ORG and TABBY can use this.", ephemeral=True)
+        return False
+
+    async def _reveal(self, interaction: discord.Interaction, button: discord.ui.Button, *, info: bool) -> None:
+        button.disabled = True                                   # also stops a double click
+        await interaction.response.edit_message(view=self)
+        ok = await self.cog._post_motion_images(interaction, self.rnd, self.tournament,
+                                                show_info=False, info_only=info)
+        if not ok:
+            button.disabled = False
+            try:
+                await interaction.edit_original_response(view=self)
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.button(label="Reveal Info", style=discord.ButtonStyle.primary, emoji="📄")
+    async def reveal_info(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._reveal(interaction, button, info=True)
+
+    @discord.ui.button(label="Reveal Motion", style=discord.ButtonStyle.success, emoji="🎯")
+    async def reveal_motion(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._reveal(interaction, button, info=False)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        log.error("Motion reveal failed: %s", describe(error))
+        try:
+            await interaction.followup.send("❌ Something went wrong. Please run /motion again.", ephemeral=True)
         except Exception:  # noqa: BLE001
             pass
 
@@ -260,7 +305,8 @@ class TabbycatCog(commands.Cog):
                         value=cache.summary() if cache else "Not loaded yet — run `/refresh`.", inline=False)
         embed.add_field(name="Image fonts",
                         value=(f"E.ttf {'✓' if fonts['E.ttf'] else '✗ (fallback)'}  ·  B.ttf {'✓' if fonts['B.ttf'] else '✗ (fallback)'}"
-                               f"  ·  Bengali shaping {'✓' if fonts['raqm'] else '✗ MISSING'}"), inline=False)
+                               f"  ·  Bengali shaping {'✓' if fonts['raqm'] else '✗ MISSING'}"
+                               f"  ·  Emoji {'✓' if fonts['emoji'] else '✗ (left out)'}"), inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     async def _disconnect(self, interaction: discord.Interaction, current: Optional[dict]) -> None:
@@ -347,12 +393,19 @@ class TabbycatCog(commands.Cog):
         cache = self._cache.get(guild.id)
         if cache is None:
             return [app_commands.Choice(name="Data not loaded — use /refresh", value=NONE_VALUE)]
-        rounds = [r for r in cache.available_rounds(kind) if current.lower() in r.name.lower()]
-        if not rounds:
-            if cache.available_rounds(kind):
-                return []
-            return [app_commands.Choice(name=f"No {label} released yet — use /refresh", value=NONE_VALUE)]
-        return [app_commands.Choice(name=r.name[:100], value=r.seq) for r in rounds[:25]]
+        if not cache.rounds:
+            return [app_commands.Choice(name="No rounds found in Tabbycat — use /refresh", value=NONE_VALUE)]
+        have = {r.seq for r in cache.available_rounds(kind)}
+        choices = []
+        if len(have) < len(cache.rounds):
+            note = f"{len(have)} of {len(cache.rounds)} rounds have {label} — use /refresh for updates"
+            choices.append(app_commands.Choice(name=note[:100], value=NONE_VALUE))
+        for r in cache.rounds:
+            if current.lower() not in r.name.lower():
+                continue
+            name = f"{r.name} ✅" if r.seq in have else f"{r.name} ⏳ not released yet — use /refresh"
+            choices.append(app_commands.Choice(name=name[:100], value=r.seq))
+        return choices[:25]
 
     async def _draw_ac(self, i: discord.Interaction, current: str):
         return await self._round_choices(i, current, "draw")
@@ -407,13 +460,11 @@ class TabbycatCog(commands.Cog):
     async def _post(self, interaction: discord.Interaction, kind: str, files: list[tuple[str, bytes]]) -> None:
         guild = interaction.guild
         channel = discord.utils.get(guild.text_channels, name=CHANNELS[kind]) or interaction.channel
-        sent = 0
         for start in range(0, len(files), MAX_FILES_PER_MESSAGE):
             chunk = files[start:start + MAX_FILES_PER_MESSAGE]
             await notify.run(
                 lambda c=chunk: channel.send(files=[discord.File(io.BytesIO(data), filename=name) for name, data in c]),
                 label=f"tab-{kind}")
-            sent += len(chunk)
         where = channel.mention if hasattr(channel, "mention") else "this channel"
         await interaction.followup.send(f"✅ Posted in {where}.", ephemeral=True)
 
@@ -421,11 +472,11 @@ class TabbycatCog(commands.Cog):
     def _pick_round(cache: Cache, kind: str, seq: int) -> Optional[RoundInfo]:
         return next((r for r in cache.available_rounds(kind) if r.seq == seq), None)
 
-    async def _none_available(self, interaction: discord.Interaction, kind: str) -> None:
+    async def _none_available(self, interaction: discord.Interaction, kind: str, rnd: Optional[RoundInfo] = None) -> None:
         label = {"draw": "draw", "motion": "motions", "result": "results", "break": "break"}[kind]
+        what = f"No {label} for {rnd.name}" if rnd is not None else f"No {label} is available for that choice"
         await interaction.followup.send(
-            f"No {label} is available for that choice. Use `/refresh` to update from Tabbycat, then try again.",
-            ephemeral=True)
+            f"{what} yet. Use `/refresh` to update from Tabbycat, then try again.", ephemeral=True)
 
     async def _run(self, interaction: discord.Interaction, kind: str, seq: int, build) -> None:
         prepared = await self._prepare(interaction)
@@ -434,7 +485,7 @@ class TabbycatCog(commands.Cog):
         client, cache = prepared
         rnd = self._pick_round(cache, kind, seq) if seq != NONE_VALUE else None
         if rnd is None:
-            await self._none_available(interaction, kind)
+            await self._none_available(interaction, kind, next((r for r in cache.rounds if r.seq == seq), None))
             return
         try:
             pages = await build(client, cache, rnd)
@@ -454,7 +505,7 @@ class TabbycatCog(commands.Cog):
     # ── /draw  /motion  /result  /break ───────────────────────────────────────
 
     @app_commands.command(name="draw", description="Post a round's draw as an image.")
-    @app_commands.describe(round_="Round (only rounds with a released draw are listed)")
+    @app_commands.describe(round_="Round (every round is listed; ✅ = draw released)")
     @app_commands.rename(round_="round")
     @app_commands.autocomplete(round_=_draw_ac)
     @app_commands.guild_only()
@@ -466,18 +517,51 @@ class TabbycatCog(commands.Cog):
             return await asyncio.to_thread(tab_render.render_draw, cache.tournament, rnd, debates)
         await self._run(interaction, "draw", round_, build)
 
-    @app_commands.command(name="motion", description="Post a round's motion as an image.")
-    @app_commands.describe(round_="Round (only rounds with released motions are listed)")
+    @app_commands.command(name="motion", description="Post a round's motion (and info slide) as an image.")
+    @app_commands.describe(round_="Round (every round is listed; ✅ = motions released)")
     @app_commands.rename(round_="round")
     @app_commands.autocomplete(round_=_motion_ac)
     @app_commands.guild_only()
     async def motion(self, interaction: discord.Interaction, round_: int):
-        async def build(client, cache, rnd):
-            return await asyncio.to_thread(tab_render.render_motions, cache.tournament, rnd, rnd.motions)
-        await self._run(interaction, "motion", round_, build)
+        prepared = await self._prepare(interaction)
+        if prepared is None:
+            return
+        _, cache = prepared
+        rnd = self._pick_round(cache, "motion", round_) if round_ != NONE_VALUE else None
+        if rnd is None:
+            await self._none_available(interaction, "motion", next((r for r in cache.rounds if r.seq == round_), None))
+            return
+        if any(m.info_slide for m in rnd.motions):
+            view = MotionRevealView(self, rnd, cache.tournament)
+            await interaction.followup.send(
+                f"**{rnd.name}** has an info slide. Choose what to post — each button can be used once.",
+                view=view, ephemeral=True)
+            return
+        await self._post_motion_images(interaction, rnd, cache.tournament, show_info=True)
+
+    async def _post_motion_images(self, interaction: discord.Interaction, rnd: RoundInfo, tournament: str,
+                                  *, show_info: bool, info_only: bool = False) -> bool:
+        """Render + post the motion (or only the info slides). Returns True when something was posted."""
+        try:
+            if info_only:
+                pages = await asyncio.to_thread(tab_render.render_info_slides, tournament, rnd, rnd.motions)
+                prefix = "info"
+            else:
+                pages = await asyncio.to_thread(tab_render.render_motions, tournament, rnd, rnd.motions, show_info)
+                prefix = "motion"
+        except Exception:  # noqa: BLE001
+            log.exception("Rendering /motion failed")
+            await interaction.followup.send("❌ Could not build the image. Please try again.", ephemeral=True)
+            return False
+        if not pages:
+            await self._none_available(interaction, "motion", rnd)
+            return False
+        slug = rnd.name.lower().replace(" ", "-")
+        await self._post(interaction, "motion", [(f"{prefix}-{slug}-{i}.png", png) for i, png in enumerate(pages, 1)])
+        return True
 
     @app_commands.command(name="result", description="Post a round's results as an image.")
-    @app_commands.describe(round_="Round (only rounds with results are listed)")
+    @app_commands.describe(round_="Round (every round is listed; ✅ = results released)")
     @app_commands.rename(round_="round")
     @app_commands.autocomplete(round_=_result_ac)
     @app_commands.guild_only()

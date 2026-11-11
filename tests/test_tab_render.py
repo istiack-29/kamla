@@ -28,22 +28,67 @@ def bp(i):
 
 def test_ap_draw_is_a_valid_png():
     pages = tr.render_draw("Open", RND, [ap(1), ap(2)])
-    assert len(pages) == 1 and size_of(pages[0])[0] == tr.WIDTH
+    assert len(pages) == 1 and size_of(pages[0])[0] == tr.WIDTH * tr.SCALE
 
 
 def test_bp_draw_and_teams_only_draw():
     assert len(tr.render_draw("Open", RND, [bp(1), bp(2)])) == 1
     teams_only = RoundInfo(seq=2, name="Round 2", draw_status="T")
     png = tr.render_draw("Open", teams_only, [ap(1, chair="Hidden")])[0]            # adjudicator columns omitted
-    assert size_of(png)[0] == tr.WIDTH
+    assert size_of(png)[0] == tr.WIDTH * tr.SCALE
 
 
-def test_many_debates_paginate_without_exceeding_page_height():
+def test_many_debates_stay_one_image_as_tall_as_needed():
     t0 = time.monotonic()
     pages = tr.render_draw("Open", RND, [ap(i) for i in range(1, 121)])
-    assert len(pages) > 1
-    assert all(size_of(p)[1] <= tr.MAX_PAGE_H + 20 for p in pages)
-    assert time.monotonic() - t0 < 15
+    assert len(pages) == 1                                              # no fixed page height any more
+    w, h = size_of(pages[0])
+    assert h > 2100 and max(w, h) <= tr.MAX_SIDE_PX                     # tall, but the scale was lowered to stay displayable
+    assert len(pages[0]) <= tr.MAX_BYTES
+    assert time.monotonic() - t0 < 30
+
+
+def test_default_resolution_is_high():
+    assert tr.SCALE >= 2
+    w, _ = size_of(tr.render_draw("Open", RND, [ap(1)])[0])
+    assert w >= 2800
+
+
+def test_team_emoji_are_drawn_not_dropped():
+    assert tr.emoji_available()
+    with_emoji = tr.render_draw("Open", RND, [ap(1, a="\U0001F98A Foxes", b="\U0001F1E7\U0001F1E9 Tigers")])[0]
+    without = tr.render_draw("Open", RND, [ap(1, a="Foxes", b="Tigers")])[0]
+    assert with_emoji != without
+    img = Image.open(io.BytesIO(with_emoji)).convert("RGB")
+    colours = {p for p in img.resize((300, 100)).getdata()}
+    assert any(abs(r - g) > 90 or abs(g - b) > 90 for r, g, b in colours if (r, g, b) not in ((255, 255, 255),))  # colour pixels
+    assert tr.text_width("\U0001F98A A", 28) > tr.text_width(" A", 28)    # emoji take space in the layout
+
+
+def test_emoji_runs_are_whole_clusters():
+    runs = tr.split_runs("A \U0001F1E7\U0001F1E9 \U0001F469\u200d\U0001F4BB \u09b0\u200d\u09cd\u09af")
+    assert [r for s, r in runs if s == "M"] == ["\U0001F1E7\U0001F1E9", "\U0001F469\u200d\U0001F4BB"]
+    assert any(s == "B" and "\u200d" in r for s, r in runs)             # Bengali ZWJ is not taken for an emoji joiner
+
+
+def test_info_slide_is_never_truncated_and_keeps_paragraphs():
+    long_info = "\n\n".join(f"Paragraph {i}. " + "word " * 60 for i in range(40))
+    lines = tr.wrap_paragraphs(long_info, 34, 900)
+    assert "…" not in "".join(lines) and lines.count("") == 39            # blank line between the 40 paragraphs
+    short = tr.render_info_slides("Open", RND, [MotionInfo(1, "M", "Short info")])[0]
+    tall = tr.render_info_slides("Open", RND, [MotionInfo(1, "M", long_info)])[0]
+    assert size_of(tall)[1] > 4 * size_of(short)[1]
+
+
+def test_info_slides_only_for_motions_that_have_one():
+    ms = [MotionInfo(1, "A", "info A"), MotionInfo(2, "B", ""), MotionInfo(3, "C", "info C")]
+    assert len(tr.render_info_slides("Open", RND, ms)) == 2
+    assert tr.render_info_slides("Open", RND, [MotionInfo(1, "A", "")]) == []
+
+
+def test_motion_without_info_option_is_shorter():
+    m = [MotionInfo(1, "THW ban X.", "Some info " * 50)]
+    assert size_of(tr.render_motions("Open", RND, m, show_info=False)[0])[1] < size_of(tr.render_motions("Open", RND, m)[0])[1]
 
 
 def test_hostile_content_never_crashes():
@@ -78,6 +123,11 @@ def test_script_runs_keep_bengali_words_whole():
     assert "".join(r for _, r in runs) == "Team বাংলা দল, A1"
 
 
+def test_wrap_never_truncates_by_default():
+    lines = tr.wrap("word " * 300, 28, 300)
+    assert len(lines) > 10 and not any(l.endswith("…") for l in lines)
+
+
 def test_wrap_respects_width_and_ellipsises():
     lines = tr.wrap("word " * 80, 28, 300, max_lines=3)
     assert len(lines) == 3 and lines[-1].endswith("…")
@@ -89,4 +139,4 @@ def test_wrap_respects_width_and_ellipsises():
 
 def test_fonts_status_reports_raqm():
     info = tr.check_fonts()
-    assert set(info) == {"E.ttf", "B.ttf", "raqm"} and info["raqm"] is True
+    assert set(info) == {"E.ttf", "B.ttf", "raqm", "emoji"} and info["raqm"] is True and info["emoji"] is True

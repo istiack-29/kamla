@@ -181,7 +181,7 @@ async def test_rounds_and_availability(server):
     assert r1.draw_available and r1.adjudicators_released and r1.motions_available and r1.results_available
     assert not r2.draw_available and not r2.motions_available and not r2.results_available     # draft: nothing public
     assert r3.draw_available and not r3.adjudicators_released and not r3.results_available      # teams only, silent
-    assert r1.motions[0].text == "THW ban X" and r1.motions[0].info_slide == "Info here"          # emoji stripped
+    assert r1.motions[0].text == "THW ban X 🙂" and r1.motions[0].info_slide == "Info here"      # emoji kept for the renderer
     assert state["auth_seen"][0] == "Token secret-token"
     await c.close()
 
@@ -300,8 +300,10 @@ async def test_pagination(monkeypatch):
 
 # ── pure helpers ──────────────────────────────────────────────────────────────
 
-def test_clean_text_keeps_bengali_joiners_and_drops_emoji():
-    assert tc.clean_text("  Team 🎉  ✨ A  ") == "Team A"
+def test_clean_text_keeps_bengali_joiners_and_emoji():
+    assert tc.clean_text("  Team 🎉  ✨ A  ") == "Team 🎉 ✨ A"
+    assert tc.strip_emoji("  Team 🎉  ✨ A  ") == "Team A"
+    assert tc.clean_block("a  b\n\n\n\nc\r\nd") == "a b\n\nc\nd"
     assert tc.clean_text("র\u200d্য") == "র\u200d্য"                    # ZWJ is part of the Bengali letter
 
 

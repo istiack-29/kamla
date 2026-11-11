@@ -107,14 +107,37 @@ class SafeResolver(aiohttp.abc.AbstractResolver):
 # ── result models ─────────────────────────────────────────────────────────────
 
 SIDE_LABELS = {"aff": "Gov", "neg": "Opp", "og": "OG", "oo": "OO", "cg": "CG", "co": "CO", "bye": "Bye"}
-# NOTE: U+200D (ZWJ) is deliberately kept: Bengali needs it (e.g. র‍্য).
-_EMOJI_RE = re.compile("[\U0001F000-\U0001FFFF\u2600-\u27BF\uFE0F\u2B50\u2B06\u2B07\u2934\u2935\u00A9\u00AE]")
+# Emoji (incl. flags, skin tones, ZWJ sequences, keycaps). U+200D (ZWJ) is only part of an emoji when it sits
+# between two emoji; on its own it is kept because Bengali needs it (e.g. র‍্য).
+_EBASE = ("[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B50\u2B55\u2B06\u2B07\u2B1B\u2B1C\u2934\u2935\u231A\u231B"
+          "\u23E9-\u23FA\u24C2\u3030\u303D\u3297\u3299]")
+_EMOD = "[\uFE0F\U0001F3FB-\U0001F3FF\U000E0020-\U000E007F]"
+EMOJI_RE = re.compile(
+    "[\U0001F1E6-\U0001F1FF]{2}"                                  # flags
+    "|[0-9#*]\uFE0F?\u20E3"                                       # keycaps
+    f"|{_EBASE}{_EMOD}*(?:\u200D{_EBASE}{_EMOD}*)*"               # pictographs, modifiers, ZWJ sequences
+    "|[\u00A9\u00AE]\uFE0F"                                        # (c) / (R) only when asked to look like emoji
+)
+_STRAY_RE = re.compile("[\uFE0F\u20E3]")
+
+
+def strip_emoji(value: Any) -> str:
+    """Text with every emoji removed (used when no emoji font is installed)."""
+    text = _STRAY_RE.sub("", EMOJI_RE.sub("", str(value or "")))
+    return re.sub(r"[ \t]+", " ", text).strip()
 
 
 def clean_text(value: Any) -> str:
-    """Display-safe text: strip emoji (the table fonts have no glyphs for them) and tidy whitespace."""
-    text = _EMOJI_RE.sub("", str(value or ""))
-    return re.sub(r"\s+", " ", text).strip()
+    """Display-safe single-line text: emoji are KEPT (the renderer draws them with a colour emoji font),
+    whitespace is tidied."""
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def clean_block(value: Any) -> str:
+    """Like clean_text but keeps the author's paragraph structure (used for info slides)."""
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").replace("\u00A0", " ")
+    lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in text.split("\n")]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
 
 
 def side_label(side: Any, n_teams: int = 2) -> str:
@@ -233,6 +256,17 @@ def _safe_parse(fn):
             log.warning("Unexpected Tabbycat data in %s: %s", fn.__name__, type(exc).__name__)
             raise TabbycatError("badresponse", "Tabbycat returned data in an unexpected format.")
     return wrapper
+
+
+_BR_RE = re.compile(r"(?i)<\s*br\s*/?\s*>|</\s*(p|div|li|h[1-6])\s*>")
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _html_to_text(value: Any) -> str:
+    """info_slide (HTML/markdown) → plain text with paragraph breaks, used only when info_slide_plain is missing."""
+    import html
+    text = _BR_RE.sub("\n", str(value or ""))
+    return html.unescape(_TAG_RE.sub("", text))
 
 
 class TabbycatClient:
@@ -356,9 +390,12 @@ class TabbycatClient:
             self._get(self.root + "/teams"), self._get(self.root + "/adjudicators"), self._get(self.root + "/venues"))
         out: dict[str, dict[str, str]] = {"teams": {}, "adjs": {}, "venues": {}}
         for t in teams if isinstance(teams, list) else []:
-            name = (t.get("short_name") or t.get("long_name") or t.get("reference")
-                    or t.get("code_name") or f"Team {t.get('id', '?')}")
-            out["teams"][self._key(t.get("url"))] = clean_text(name)
+            name = clean_text(t.get("short_name") or t.get("long_name") or t.get("reference")
+                              or t.get("code_name") or f"Team {t.get('id', '?')}")
+            emoji = clean_text(t.get("emoji"))
+            if emoji and not EMOJI_RE.search(name):               # Tabbycat keeps the team emoji in its own field
+                name = f"{emoji} {name}"
+            out["teams"][self._key(t.get("url"))] = name
         for a in adjs if isinstance(adjs, list) else []:
             out["adjs"][self._key(a.get("url"))] = clean_text(a.get("name") or "")
         for v in venues if isinstance(venues, list) else []:
@@ -381,7 +418,7 @@ class TabbycatClient:
             motions = [
                 MotionInfo(seq=int(m.get("seq") or i + 1),
                            text=clean_text(m.get("text")),
-                           info_slide=clean_text(m.get("info_slide_plain") or m.get("info_slide")))
+                           info_slide=clean_block(m.get("info_slide_plain") or _html_to_text(m.get("info_slide"))))
                 for i, m in enumerate(r.get("motions") or []) if isinstance(m, dict)
             ]
             rounds.append(RoundInfo(
