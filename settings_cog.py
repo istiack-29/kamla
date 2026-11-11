@@ -113,6 +113,9 @@ class SettingsView(discord.ui.View):
             await _create_rooms(guild, roles, fmt, 1, start_index=new_count)
 
             cfg = await config_manager.update_config(guild, rooms=new_count)
+            if cfg.get("locked"):
+                import lockdown
+                lockdown.start_slowmode(guild, lockdown.SLOWMODE_SECONDS)    # the new room's chats join the lock
             schedule_join_log_edit(guild, cfg)
             return cfg, f"✅ Room **{new_count:02d}** added."
 
@@ -188,13 +191,17 @@ class SettingsView(discord.ui.View):
         new_locked = not was_locked
         cfg = await config_manager.update_config(guild, locked=new_locked)
 
+        import lockdown
+        lockdown.start_slowmode(guild, lockdown.SLOWMODE_SECONDS if new_locked else 0)
+
         if new_locked:
             note = (
                 "🔒 **Server is now LOCKED.**\n"
-                "Any new channel created by a non-bot will be deleted automatically."
+                "New channels are deleted automatically (ORG members are notified by DM) and every "
+                f"chat gets a {lockdown.SLOWMODE_SECONDS}-second slowmode (applied in the background)."
             )
         else:
-            note = "🔓 **Server is now UNLOCKED.** Members may create channels normally."
+            note = "🔓 **Server is now UNLOCKED.** Members may create channels normally and the slowmode is being removed."
 
         schedule_join_log_edit(guild, cfg)
         await _refresh_panel(interaction, cfg, note)

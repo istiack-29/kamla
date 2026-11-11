@@ -37,6 +37,7 @@ COGS = [
     "welcome_cog",
     "nickname_cog",
     "invite_roles_cog",
+    "tabbycat_cog",
 ]
 
 
@@ -63,6 +64,11 @@ class KamlaBot(commands.Bot):
             log.warning("setup_hook called again on the same bot instance; skipping duplicate initialisation.")
             return
         self._setup_done = True
+
+        import devtools
+        import webhook
+        webhook.bind_bot(self)
+        self.add_dynamic_items(devtools.LeaveButton)      # developer's "Leave the server" button survives restarts
 
         for cog in COGS:
             try:
@@ -238,28 +244,42 @@ class KamlaBot(commands.Bot):
         if not cfg.get("locked", False):
             return
 
-        # Check audit log — if KAMLA itself created the channel, allow it
-        try:
-            async for entry in guild.audit_logs(
-                action=discord.AuditLogAction.channel_create, limit=5
-            ):
-                if entry.target and entry.target.id == channel.id:
-                    if entry.user and entry.user.id == self.user.id:
-                        return  # KAMLA created it — skip lock enforcement
-                    break
-        except discord.Forbidden:
-            pass
+        # Who created it? (the audit log can lag a moment behind the gateway event)
+        creator = None
+        for attempt in range(3):
+            try:
+                async for entry in guild.audit_logs(
+                    action=discord.AuditLogAction.channel_create, limit=10
+                ):
+                    if entry.target and entry.target.id == channel.id:
+                        creator = entry.user
+                        break
+            except Exception:
+                break
+            if creator is not None:
+                break
+            await asyncio.sleep(0.7)
 
+        import lockdown
+        if creator is not None and creator.id == self.user.id:
+            # KAMLA created it (e.g. restoring a protected channel): allowed, but keep the lock's slowmode
+            await lockdown.apply_to_channel(channel, lockdown.SLOWMODE_SECONDS)
+            return
+
+        channel_name = channel.name
         try:
             await channel.delete(reason="🔒 KAMLA — Server is locked. Channel auto-removed.")
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("Could not delete a channel created while the server is locked: %s", describe(e))
+
+        # Tell every ORG member (batched into one DM when several attempts happen together)
+        lockdown.report_blocked_channel(guild, creator, channel_name)
 
         try:
             settings_ch = discord.utils.get(guild.text_channels, name="⚙️︱settings")
             if settings_ch and settings_ch.permissions_for(guild.me).send_messages:
                 await settings_ch.send(
-                    f"🔒 A new channel **#{channel.name}** was automatically deleted "
+                    f"🔒 A new channel **#{channel_name}** was automatically deleted "
                     "because the server is locked.",
                     delete_after=30,
                 )

@@ -1,4 +1,5 @@
-discord.py[voice]>=2.3.2
+discord.py[voice]>=2.4.0
 python-dotenv>=1.0.0
 flask>=3.0.0
 aiohttp>=3.9.0
+Pillow>=10.1.0

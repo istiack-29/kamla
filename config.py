@@ -89,9 +89,14 @@ class ConfigManager:
     async def set_config(self, guild: discord.Guild, data: dict) -> None:
         self._cache[guild.id] = dict(data)
         self._miss_until.pop(guild.id, None)
+        payload = json.dumps(data, ensure_ascii=False)
+        if len(payload) > 1990:
+            # Discord messages are limited to 2000 characters; a silent failure here would lose settings.
+            log.error("Config for guild %s is too large to store (%d chars).", guild.id, len(payload))
+            return
         try:
             channel = await self.ensure_config_channel(guild)
-            await channel.send(json.dumps(data, ensure_ascii=False))
+            await channel.send(payload)
         except Exception as e:
             log.warning("set_config error for guild %s: %s", guild.id, describe(e))
 
@@ -103,6 +108,33 @@ class ConfigManager:
 
     def get_cached(self, guild_id: int) -> dict:
         return dict(self._cache.get(guild_id, {}))
+
+    async def compact(self, guild: discord.Guild) -> None:
+        """Delete every older copy of the config, keeping only the newest. Old copies can contain
+        secrets (e.g. a Tabbycat API token) that must not linger after the value changed or was removed."""
+        try:
+            channel = await self.ensure_config_channel(guild)
+            newest_seen, stale = False, []
+            async for msg in channel.history(limit=500):          # newest first
+                if msg.author.id == guild.me.id and msg.content.startswith("{"):
+                    if newest_seen:
+                        stale.append(msg)
+                    newest_seen = True
+            cutoff = discord.utils.utcnow() - timedelta(days=13)
+            recent = [m for m in stale if m.created_at > cutoff]
+            old = [m for m in stale if m.created_at <= cutoff]
+            for start in range(0, len(recent), 100):
+                batch = recent[start:start + 100]
+                if len(batch) == 1:
+                    await notify.best_effort(lambda m=batch[0]: m.delete(), label="config-compact")
+                else:
+                    await notify.best_effort(lambda b=batch: channel.delete_messages(b), label="config-compact")
+            for m in old:                                          # bulk delete refuses messages older than 14 days
+                await notify.best_effort(lambda m=m: m.delete(), label="config-compact")
+            if stale:
+                log.info("Removed %d old config message(s) in guild %s.", len(stale), guild.id)
+        except Exception as e:
+            log.warning("Could not compact the config channel of guild %s: %s", guild.id, describe(e))
 
     def invalidate(self, guild_id: int) -> None:
         self._cache.pop(guild_id, None)

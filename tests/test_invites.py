@@ -36,7 +36,7 @@ class InviteGuild(FakeGuild):
         self.invite_calls = 0
         self.n = 0
         for name in ("VISITOR", "CAP", "TABBY", "ORG", "EQUITY"):
-            self.roles.append(types.SimpleNamespace(name=name, id=hash(name)))
+            self.roles.append(types.SimpleNamespace(name=name, id=hash(name), managed=False))
 
     async def invites(self):
         self.invite_calls += 1

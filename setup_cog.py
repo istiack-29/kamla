@@ -165,7 +165,8 @@ async def _do_build(interaction: discord.Interaction, setup_data: dict) -> None:
                 log.warning("Could not create post-build invite: %s", describe(e))
 
             # ── Edit webhook log ──────────────────────────────────────────────────
-            from webhook import edit_join_log
+            from webhook import edit_join_log, forget_dev_invite
+            forget_dev_invite(guild.id)          # the wipe removed the developer invite and role
             cfg = await config_manager.get_config(guild)
             await edit_join_log(guild, cfg)
 

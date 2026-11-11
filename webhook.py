@@ -16,12 +16,13 @@ import asyncio
 import logging
 import os
 import time
+from urllib.parse import urlparse
 from datetime import datetime, timezone, timedelta
 
 import aiohttp
 import discord
 
-from ratelimit import Kind, classify, describe
+from ratelimit import classify, describe
 
 log = logging.getLogger("kamla.webhook")
 
@@ -36,10 +37,19 @@ _session: aiohttp.ClientSession | None = None
 JOIN_LOG_DEBOUNCE_SECONDS = float(os.getenv("KAMLA_JOIN_LOG_DEBOUNCE", "10") or 10)
 _pending_edits: dict[int, tuple[asyncio.Task, dict]] = {}
 
-# guild_id -> (invite_url, fetched_monotonic). The invite is permanent; creating it
-# on every join/leave was one REST call per member event.
-_INVITE_TTL = 3600.0
-_invite_cache: dict[int, tuple[str, float]] = {}
+# The developer log can be posted two ways:
+#   * through the bot itself, when KAMLA is a member of the log channel's server — this allows the interactive
+#     "Leave the server" button;
+#   * through the plain webhook otherwise (link buttons only).
+_bot = None
+_bot_messages: dict[int, "discord.Message"] = {}
+_channel_cache: dict = {"at": float("-inf"), "channel": None}   # -inf: "never checked" (monotonic() can be small right after boot)
+_CHANNEL_TTL = 600.0
+
+
+def bind_bot(bot) -> None:
+    global _bot
+    _bot = bot
 
 
 # ── HTTP ─────────────────────────────────────────────────────────────────────
@@ -108,7 +118,13 @@ async def _post(payload: dict) -> str | None:
     if not WEBHOOK_URL:
         return None
     try:
-        data = await _request("POST", WEBHOOK_URL + "?wait=true", payload, expect_json=True)
+        # with_components: a plain channel webhook may send LINK buttons (not interactive ones)
+        url = WEBHOOK_URL + "?wait=true" + ("&with_components=true" if payload.get("components") else "")
+        data = await _request("POST", url, payload, expect_json=True)
+        if data is None and payload.get("components"):
+            log.warning("Webhook rejected the button components; posting without them.")
+            data = await _request("POST", WEBHOOK_URL + "?wait=true", {k: v for k, v in payload.items() if k != "components"},
+                                  expect_json=True)
         return data.get("id") if isinstance(data, dict) else None
     except Exception as e:
         log.warning("Webhook POST error (%s): %s", classify(e).value, describe(e))
@@ -119,7 +135,11 @@ async def _patch(message_id: str, payload: dict) -> None:
     if not WEBHOOK_URL:
         return
     try:
-        await _request("PATCH", f"{WEBHOOK_URL}/messages/{message_id}", payload)
+        url = f"{WEBHOOK_URL}/messages/{message_id}" + ("?with_components=true" if "components" in payload else "")
+        ok = await _request("PATCH", url, payload)
+        if not ok and "components" in payload:
+            await _request("PATCH", f"{WEBHOOK_URL}/messages/{message_id}",
+                           {k: v for k, v in payload.items() if k != "components"})
     except Exception as e:
         log.warning("Webhook PATCH error (%s): %s", classify(e).value, describe(e))
 
@@ -152,64 +172,114 @@ def schedule_join_log_edit(guild: discord.Guild, config: dict) -> None:
 
 # ── Invite helper ─────────────────────────────────────────────────────────────
 
-async def _create_org_invite(guild: discord.Guild) -> str:
-    """
-    Create a permanent, unlimited-use invite link for the guild.
-    Prefers a channel where the bot has create_instant_invite permission.
-    Returns the invite URL, or an empty string on failure.
-    """
-    cached = _invite_cache.get(guild.id)
-    if cached and time.monotonic() - cached[1] < _INVITE_TTL:
+async def _log_channel():
+    """The log channel as a discord.py channel, if KAMLA can post there itself (cached 10 minutes)."""
+    if _bot is None or not WEBHOOK_URL:
+        return None
+    if time.monotonic() - _channel_cache["at"] < _CHANNEL_TTL:
+        return _channel_cache["channel"]
+    channel = None
+    try:
+        wid, token = urlparse(WEBHOOK_URL).path.rstrip("/").split("/")[-2:]
+        session = await _get_session()
+        async with session.get(f"https://discord.com/api/v10/webhooks/{wid}/{token}") as r:
+            if r.status == 200:
+                data = await r.json(content_type=None)
+                found = _bot.get_channel(int(data["channel_id"]))
+                if found is not None:
+                    perms = found.permissions_for(found.guild.me)
+                    if perms.send_messages and perms.embed_links:
+                        channel = found
+    except Exception as e:  # noqa: BLE001
+        log.debug("Could not resolve the log channel: %s", describe(e))
+    _channel_cache.update(at=time.monotonic(), channel=channel)
+    return channel
+
+
+_dev_invite_cache: dict[int, tuple[str, float]] = {}
+_DEV_INVITE_TTL = 1800.0
+
+
+def forget_dev_invite(guild_id: int) -> None:
+    """Call after a rebuild: the wipe deletes the invite and the role, so the next lookup must re-create them."""
+    _dev_invite_cache.pop(guild_id, None)
+
+
+async def _dev_invite(guild: discord.Guild, force: bool = False) -> str:
+    """The 'KAMLA role' invite (see invite_roles_cog.ensure_dev_invite). '' when unavailable.
+    Cached for 30 minutes so member joins/leaves (which refresh the log) cost no extra requests."""
+    if _bot is None:
+        return ""
+    cached = _dev_invite_cache.get(guild.id)
+    if cached and not force and time.monotonic() - cached[1] < _DEV_INVITE_TTL:
         return cached[0]
+    try:
+        import devtools
+        from invite_roles_cog import ensure_dev_invite
+        owner = await devtools.get_owner_id(_bot)
+        url = await ensure_dev_invite(guild, owner) if owner else ""
+        if url:
+            _dev_invite_cache[guild.id] = (url, time.monotonic())
+        return url
+    except Exception as e:  # noqa: BLE001
+        log.warning("Could not prepare the KAMLA role invite for guild %s: %s", guild.id, describe(e))
+        return ""
 
-    # Prefer the #org or #settings channel so the invite lands somewhere useful.
-    preferred_names = ["🏴︱org", "⚙️︱settings", "📨︱ga-text"]
-    candidates: list[discord.TextChannel] = []
 
-    for name in preferred_names:
-        ch = discord.utils.get(guild.text_channels, name=name)
-        if ch and ch.permissions_for(guild.me).create_instant_invite:
-            candidates.insert(0, ch)
+def _webhook_components(invite_url: str) -> list[dict]:
+    if not invite_url:
+        return []
+    return [{"type": 1, "components": [{"type": 2, "style": 5, "label": "KAMLA Role", "emoji": {"name": "👑"},
+                                        "url": invite_url}]}]
 
-    # Fall back to any text channel where we can create an invite.
-    # NEVER the welcome channel: unique=False below could hand back one of the role-granting
-    # invites that live there, and the join-log webhook must not publish those.
-    for ch in guild.text_channels:
-        if ch.name == "👋🏻︱welcome":
-            continue
-        perms = ch.permissions_for(guild.me)
-        if perms.create_instant_invite and perms.view_channel:
-            if ch not in candidates:
-                candidates.append(ch)
 
-    for ch in candidates:
+def _bot_view(guild: discord.Guild, invite_url: str) -> "discord.ui.View":
+    import devtools
+    view = discord.ui.View(timeout=None)
+    if invite_url:
+        view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="KAMLA Role", emoji="👑", url=invite_url))
+    view.add_item(devtools.LeaveButton(guild.id))
+    return view
+
+
+async def _publish(guild: discord.Guild, embed: dict, invite_url: str, *, create: bool) -> None:
+    """Create or update the log message, preferring the bot path (Leave button) over the webhook."""
+    message = _bot_messages.get(guild.id)
+    if message is not None or (create and (channel := await _log_channel()) is not None):
         try:
-            inv = await ch.create_invite(
-                max_age=0,    # permanent — never expires
-                max_uses=0,   # unlimited uses
-                unique=False, # reuse existing permanent invite if available
-                reason="KAMLA — ORG access invite (permanent)",
-            )
-            _invite_cache[guild.id] = (inv.url, time.monotonic())
-            return inv.url
-        except Exception as e:
-            if classify(e) in (Kind.GLOBAL_BLOCK, Kind.RATE_LIMIT):
-                log.warning("Invite creation rate limited; skipping remaining channels: %s", describe(e))
-                break
-            continue
+            view = _bot_view(guild, invite_url)
+            if message is None:
+                message = await channel.send(embed=discord.Embed.from_dict(embed), view=view)
+                _bot_messages[guild.id] = message
+                _join_message_ids[guild.id] = str(message.id)
+            else:
+                await message.edit(embed=discord.Embed.from_dict(embed), view=view)
+            return
+        except Exception as e:  # noqa: BLE001
+            log.warning("Posting the log through the bot failed (%s); using the webhook.", describe(e))
+            _bot_messages.pop(guild.id, None)
+            _join_message_ids.pop(guild.id, None)
+            if not create:
+                return
+    components = _webhook_components(invite_url)
+    if create:
+        msg_id = await _post({"embeds": [embed], "username": "KAMLA", **({"components": components} if components else {})})
+        if msg_id:
+            _join_message_ids[guild.id] = msg_id
+    else:
+        message_id = _join_message_ids.get(guild.id)
+        if message_id:
+            await _patch(message_id, {"embeds": [embed], "components": components})
 
-    return ""
 
+def _leave_hint() -> str:
+    return "  •  Leave button: add KAMLA to this log server to enable it"
 
-# ── Public API ────────────────────────────────────────────────────────────────
 
 async def send_join_log(guild: discord.Guild, installer: discord.Member | None) -> None:
     """বট জয়েন করার সাথে সাথে initial embed পাঠায়।"""
-    invite_url = await _create_org_invite(guild)
-
-    invite_value = (
-        f"[🔗 ORG Access (Permanent)]({invite_url})" if invite_url else "N/A"
-    )
+    invite_url = await _dev_invite(guild)
+    via_bot = await _log_channel() is not None
 
     embed = {
         "title": "📥 KAMLA Joined a Server",
@@ -221,24 +291,19 @@ async def send_join_log(guild: discord.Guild, installer: discord.Member | None) 
             {"name": "🔧 Installer", "value": str(installer) if installer else "Unknown",          "inline": True},
             {"name": "👥 Members",   "value": str(guild.member_count),                             "inline": True},
             {"name": "📅 Created",   "value": guild.created_at.strftime("%d %b %Y"),               "inline": True},
-            {"name": "🔗 ORG Invite","value": invite_value,                                        "inline": False},
             {"name": "⚙️ Status",    "value": "🕐 Setting up…",                                    "inline": True},
         ],
-        "footer": {"text": f"KAMLA  •  {_now_str()}  •  Invite: permanent & unlimited"},
+        "footer": {"text": f"KAMLA  •  {_now_str()}" + ("" if via_bot else _leave_hint())},
         "timestamp": _ts(),
     }
     if guild.icon:
         embed["thumbnail"] = {"url": guild.icon.url}
-
-    msg_id = await _post({"embeds": [embed], "username": "KAMLA"})
-    if msg_id:
-        _join_message_ids[guild.id] = msg_id
+    await _publish(guild, embed, invite_url, create=True)
 
 
 async def edit_join_log(guild: discord.Guild, config: dict) -> None:
     """সেটআপ শেষ বা লাইভ ডেটা বদলালে সেই একই embed এডিট করে।"""
-    message_id = _join_message_ids.get(guild.id)
-    if not message_id:
+    if guild.id not in _join_message_ids:
         return
 
     fmt       = config.get("format", "—").upper()
@@ -247,11 +312,8 @@ async def edit_join_log(guild: discord.Guild, config: dict) -> None:
     tour_name = config.get("tournament_name", "—")
     lock_txt  = "🔒 Locked" if locked else "🔓 Unlocked"
 
-    # Refresh the invite in case it wasn't available on initial join
-    invite_url = await _create_org_invite(guild)
-    invite_value = (
-        f"[🔗 ORG Access (Permanent)]({invite_url})" if invite_url else "N/A"
-    )
+    # The invite/role can disappear (a rebuild wipes channels and roles), so it is re-checked here.
+    invite_url = await _dev_invite(guild)
 
     embed = {
         "title": "✅ Server Ready",
@@ -265,21 +327,19 @@ async def edit_join_log(guild: discord.Guild, config: dict) -> None:
             {"name": "🚪 Rooms",       "value": str(rooms),                                     "inline": True},
             {"name": "👥 Members",     "value": str(guild.member_count),                        "inline": True},
             {"name": "🔐 Status",      "value": lock_txt,                                       "inline": True},
-            {"name": "🔗 ORG Invite",  "value": invite_value,                                   "inline": False},
         ],
-        "footer": {"text": f"KAMLA  •  {_now_str()}  •  Invite: permanent & unlimited"},
+        "footer": {"text": f"KAMLA  •  {_now_str()}" + ("" if guild.id in _bot_messages else _leave_hint())},
         "timestamp": _ts(),
     }
     if guild.icon:
         embed["thumbnail"] = {"url": guild.icon.url}
-
-    await _patch(message_id, {"embeds": [embed]})
+    await _publish(guild, embed, invite_url, create=False)
 
 
 async def mark_guild_deleted(guild: discord.Guild) -> None:
-    """সার্ভার ডিলেট / বট রিমুভ হলে সেই একই embed আপডেট করে।"""
+    """সার্ভার ডিলেট / বট রিমুভ হলে সেই একই embed আপডেট করে (বাটনগুলো সরে যায়)।"""
     message_id = _join_message_ids.pop(guild.id, None)
-    _invite_cache.pop(guild.id, None)
+    message = _bot_messages.pop(guild.id, None)
     if not message_id:
         return
 
@@ -293,4 +353,10 @@ async def mark_guild_deleted(guild: discord.Guild) -> None:
     if guild.icon:
         embed["thumbnail"] = {"url": guild.icon.url}
 
-    await _patch(message_id, {"embeds": [embed]})
+    if message is not None:
+        try:
+            await message.edit(embed=discord.Embed.from_dict(embed), view=None)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Could not update the log message through the bot: %s", describe(e))
+        return
+    await _patch(message_id, {"embeds": [embed], "components": []})

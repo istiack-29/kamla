@@ -215,6 +215,9 @@ class FakeConfig:
     async def set_config(self, guild, d):
         self.data[guild.id] = dict(d)
 
+    async def compact(self, guild):
+        self.compacted = getattr(self, "compacted", 0) + 1
+
     async def update_config(self, guild, **kw):
         cur = dict(self.data.get(guild.id, {}))
         cur.update(kw)

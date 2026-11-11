@@ -10,17 +10,18 @@ import main
 import keep_alive
 import webhook
 import timer_cog
-import assign_cog
 from tests.fakes import http_error, FakeGuild, FakeChannel, FakeCategory
 
 BASELINE = {
     "cogs": ["AllInCog", "AssignCog", "DMNotifyCog", "GamesCog", "PoiCog", "PollsCog", "RolesCog",
-             "SettingsCog", "SetupCog", "TimerCog", "TossCog", "WelcomeCog", "NicknameCog", "InviteRolesCog"],
-    "commands": ["close", "mention", "newpoll", "nicknames", "play", "rebuild", "st", "toss"],
+             "SettingsCog", "SetupCog", "TimerCog", "TossCog", "WelcomeCog", "NicknameCog", "InviteRolesCog", "TabbycatCog"],
+    "commands": ["break", "close", "draw", "mention", "motion", "newpoll", "nicknames", "play", "rebuild",
+                 "refresh", "result", "st", "tab", "toss"],
     "custom_ids": ["kamla:allin:push_back", "kamla:on_join:create_now", "kamla:role:debater",
                    "kamla:role:independent_adj", "kamla:role:invited_adj", "kamla:role:visitor",
                    "kamla:s:add", "kamla:s:del", "kamla:s:fmt", "kamla:s:lock"],
-    "listeners": {"on_member_join": 3, "on_ready": 1, "on_invite_create": 1, "on_invite_delete": 1, "on_member_remove": 2, "on_member_update": 3, "on_message": 7},
+    "listeners": {"on_member_join": 3, "on_member_remove": 1, "on_member_update": 2, "on_message": 6,
+                  "on_ready": 2, "on_invite_create": 1, "on_invite_delete": 1},
     "views": ["AllInView", "OnJoinView", "RoleSelectView", "SettingsView"],
 }
 
@@ -173,19 +174,3 @@ async def test_timer_tasks_not_duplicated_and_cleaned():
     assert len(timer_cog._active_timers) == 1
     await cog.cog_unload()
     assert not timer_cog._active_timers
-
-
-# assign cleanup: scans only the previous role's channel (was: every other channel)
-async def test_assign_cleanup_is_targeted():
-    g = FakeGuild()
-    cat = FakeCategory(g, "🛅︱ASSIGN"); g._channels[cat.id] = cat
-    chans = {}
-    for n in ["org", "cap", "debater", "visitor"]:
-        c = FakeChannel(g, n, cat); g._channels[c.id] = c; chans[n] = c
-    member = object()
-    m = await chans["visitor"].send("x"); m.mentions = [member]
-    targets = assign_cog._channels_for_roles(cat, ["VISITOR"])
-    await assign_cog._cleanup_old_mentions(cat, member, chans["debater"].id, only_channels=targets)
-    assert m.deleted
-    assert chans["visitor"].history_calls == 1
-    assert all(chans[n].history_calls == 0 for n in ("org", "cap", "debater"))

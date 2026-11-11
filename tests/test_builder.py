@@ -128,9 +128,9 @@ async def test_resume_marker_matches_params():
 
 
 def test_capacity_limits():
-    assert sb.max_rooms_for_fresh_build("ap") == 45 and sb.max_rooms_for_fresh_build("bp") == 45
+    assert sb.max_rooms_for_fresh_build("ap") == 46 and sb.max_rooms_for_fresh_build("bp") == 46
     assert sb.capacity_problem_fresh_build("ap", 1000)
-    assert sb.capacity_problem_fresh_build("bp", 45) is None
+    assert sb.capacity_problem_fresh_build("bp", 46) is None
 
 
 async def test_switch_format_idempotent():

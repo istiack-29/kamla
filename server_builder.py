@@ -56,7 +56,6 @@ ORG_ACCESS_ROLES = ["ORG", "CAP", "TABBY", "EQUITY", "INVITED ADJUDICATOR"]
 
 PROTECTED_CATEGORIES = {
     "⚜️︱ORGCOM",
-    "🛅︱ASSIGN",
     "🏟️︱GRAND AUDITORIUM",
     "🎮︱PLAY",
     "ℹ️︱INFORMATION",
@@ -73,11 +72,6 @@ CATEGORY_CHANNEL_STRUCTURE: dict[str, dict] = {
     "⚜️︱ORGCOM": {
         "text":  ["⚙️︱settings", "🏴︱org", "📂︱document"],
         "voice": ["ORG", "Control Room"],
-    },
-    "🛅︱ASSIGN": {
-        "text":  ["org", "cap", "tabby", "equity", "debater", "visitor",
-                  "independent-adjudicator", "invited-adjudicator"],
-        "voice": [],
     },
     "🏟️︱GRAND AUDITORIUM": {
         "text":  ["📨︱ga-text", "🎓︱motion", "🎓︱announcement", "🎓︱break",
@@ -130,8 +124,6 @@ TOP_LEVEL_CHANNELS = [
     "❓︱get-role",
     "🦧︱how-to-use-this-server",
 ]
-ASSIGN_ROLE_ORDER = ["ORG", "CAP", "TABBY", "EQUITY", "DEBATER", "VISITOR",
-                     "INDEPENDENT ADJUDICATOR", "INVITED ADJUDICATOR"]
 INFO_CHANNELS = ["schedule", "important-forms", "debater-briefing",
                  "judge-briefing", "equity-briefing"]
 GA_ANNOUNCE_CHANNELS = ["🎓︱motion", "🎓︱announcement", "🎓︱break",
@@ -733,11 +725,6 @@ async def _build_server_inner(
         ("voice", "ORG", orgcom_ow), ("voice", "Control Room", orgcom_ow),
     ])
 
-    assign_ow = _build_orgcom_overwrites(guild, roles)
-    await _ensure_tree(guild, report, "🛅︱ASSIGN", assign_ow, [
-        ("text", rn.lower().replace(" ", "-"), assign_ow) for rn in ASSIGN_ROLE_ORDER
-    ])
-
     ga_all_ow = _build_all_role_overwrites(guild, roles, send=True)
     ga_ann_ow = _build_announce_overwrites(guild, roles)
     ga_entries = [("text", "📨︱ga-text", ga_all_ow)]
@@ -1076,7 +1063,11 @@ async def restore_if_protected(
     """
     async with _guard_lock(guild):
         try:
-            return await _restore_if_protected_locked(guild, channel_name, is_category, parent_category_name)
+            restored = await _restore_if_protected_locked(guild, channel_name, is_category, parent_category_name)
+            if restored and (await _saved_config(guild)).get("locked"):
+                import lockdown
+                lockdown.start_slowmode(guild, lockdown.SLOWMODE_SECONDS)     # restored chats join the lock's slowmode
+            return restored
         except Exception as exc:  # noqa: BLE001
             log.error("Restore of %r failed (%s): %s", channel_name, classify(exc).value, describe(exc))
             return False
@@ -1356,7 +1347,6 @@ async def normalize_kamla_order(guild: discord.Guild) -> None:
 async def _normalize_once(guild: discord.Guild) -> None:
     desired_category_names = [
         "⚜️︱ORGCOM",
-        "🛅︱ASSIGN",
         "🏟️︱GRAND AUDITORIUM",
         "🎮︱PLAY",
         "ℹ️︱INFORMATION",
@@ -1408,7 +1398,7 @@ async def _normalize_once(guild: discord.Guild) -> None:
 
 
 def _category_overwrites(guild: discord.Guild, roles: dict, cat_name: str) -> dict:
-    if cat_name in ("⚜️︱ORGCOM", "🛅︱ASSIGN"):
+    if cat_name == "⚜️︱ORGCOM":
         return _build_orgcom_overwrites(guild, roles)
     elif cat_name == "🏟️︱GRAND AUDITORIUM":
         return _build_all_role_overwrites(guild, roles)
@@ -1420,7 +1410,7 @@ def _category_overwrites(guild: discord.Guild, roles: dict, cat_name: str) -> di
 
 
 def _channel_overwrites(guild: discord.Guild, roles: dict, cat_name: str, ch_name: str) -> dict:
-    if cat_name in ("⚜️︱ORGCOM", "🛅︱ASSIGN"):
+    if cat_name == "⚜️︱ORGCOM":
         return _build_orgcom_overwrites(guild, roles)
     elif cat_name == "🏟️︱GRAND AUDITORIUM":
         announce_channels = ["🎓︱motion", "🎓︱announcement", "🎓︱break",
@@ -1443,9 +1433,7 @@ async def _repost_channel_content(
     cat: discord.CategoryChannel,
 ) -> None:
     """Re-post embedded bot messages in channels that need them after restoration."""
-    if cat_name == "🛅︱ASSIGN":
-        pass  # Assign channels don't need initial content
-    elif cat_name == "⚜️︱ORGCOM":
+    if cat_name == "⚜️︱ORGCOM":
         settings_ch = discord.utils.get(cat.text_channels, name="⚙️︱settings")
         if settings_ch:
             from config import config_manager
