@@ -607,11 +607,15 @@ def motion_label(idx: int, total: int) -> str:
     return "Motion" if total == 1 else f"Motion {idx}"
 
 
-def render_motions(tournament: str, rnd: RoundInfo, motions: list[MotionInfo], show_info: bool = True) -> list[bytes]:
+def render_motions(tournament: str, rnd: RoundInfo, motions: list[MotionInfo], show_info: bool = True,
+                   only: Optional[list[int]] = None) -> list[bytes]:
     """One image per motion. show_info=False leaves the info slide out (organisers can post it separately
-    with render_info_slides)."""
+    with render_info_slides). only = 1-based positions to render (default: all); the "Motion n" numbering
+    always follows the position in the full list."""
     images = []
     for idx, m in enumerate(motions, 1):
+        if only is not None and idx not in only:
+            continue
         blocks = [Block(wrap_paragraphs(m.text or "—", 54, _inner_w()), 54, TEXT, True)]
         if show_info and m.info_slide:
             blocks.append(Block(["INFO SLIDE"], 24, MUTED, True, gap_before=48, divider=True))
@@ -620,11 +624,12 @@ def render_motions(tournament: str, rnd: RoundInfo, motions: list[MotionInfo], s
     return images
 
 
-def render_info_slides(tournament: str, rnd: RoundInfo, motions: list[MotionInfo]) -> list[bytes]:
-    """One image per motion that has an info slide."""
+def render_info_slides(tournament: str, rnd: RoundInfo, motions: list[MotionInfo],
+                       only: Optional[list[int]] = None) -> list[bytes]:
+    """One image per motion that has an info slide (only = 1-based positions, default: all)."""
     images = []
     for idx, m in enumerate(motions, 1):
-        if not m.info_slide:
+        if not m.info_slide or (only is not None and idx not in only):
             continue
         suffix = "" if len(motions) == 1 else f"  ·  {motion_label(idx, len(motions))}"
         images.append(_text_card(tournament, f"{rnd.name}  ·  Info Slide{suffix}",

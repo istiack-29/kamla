@@ -1,3 +1,5 @@
+import asyncio
+import time
 import types
 from unittest import mock
 
@@ -181,8 +183,7 @@ async def test_autocomplete_states(env):
     await connect(env, guild)
     env.cog._cache.pop(guild.id)
     out = await choices(env, cog_mod.TabbycatCog._draw_ac, guild)
-    assert out[0].value == cog_mod.NONE_VALUE and "/refresh" in out[0].name          # connected, data not loaded
-    await env.cog._refresh(guild)
+    assert out[0].name == "Round 1"                                                  # connected, nothing cached → loaded on the spot
     draw = await choices(env, cog_mod.TabbycatCog._draw_ac, guild)
     assert [c.name for c in draw[:-1]] == ["Round 1", "Round 3"]                  # only rounds whose draw is released
     assert [c.value for c in draw[:-1]] == [1, 3]
@@ -193,6 +194,81 @@ async def test_autocomplete_states(env):
     assert [c.name for c in result[:-1]] == ["Round 1"]
     assert [c.name for c in await choices(env, cog_mod.TabbycatCog._break_ac, guild)] == ["Open"]
     assert [c.name for c in (await choices(env, cog_mod.TabbycatCog._draw_ac, guild, "3"))[:-1]] == ["Round 3"]
+
+
+def counting_refresh(env, monkeypatch, delay=0.0):
+    calls = []
+    real = env.cog._refresh
+
+    async def wrapper(guild):
+        calls.append(guild.id)
+        if delay:
+            await asyncio.sleep(delay)
+        return await real(guild)
+    monkeypatch.setattr(env.cog, "_refresh", wrapper)
+    return calls
+
+
+async def test_dropdown_reloads_stale_data_but_not_fresh_data(env, monkeypatch):
+    guild = FakeGuild()
+    await connect(env, guild)
+    calls = counting_refresh(env, monkeypatch)
+    cache = env.cog._cache[guild.id]
+    for r in cache.rounds:                                             # pretend Tabbycat changed since we cached it
+        r.motions_released = False
+    out = await choices(env, cog_mod.TabbycatCog._motion_ac, guild)
+    assert not calls and len(out) == 1                                 # fresh cache → no request, nothing released
+    cache.fetched -= cog_mod.AUTO_TTL + 1
+    out = await choices(env, cog_mod.TabbycatCog._motion_ac, guild)
+    assert len(calls) == 1 and out[0].name == "Round 1"                # stale → re-read, the released round shows up
+    for fn in (cog_mod.TabbycatCog._draw_ac, cog_mod.TabbycatCog._result_ac, cog_mod.TabbycatCog._break_ac):
+        env.cog._cache[guild.id].fetched -= cog_mod.AUTO_TTL + 1       # every dropdown refreshes, not only /motion and /draw
+        await choices(env, fn, guild)
+    assert len(calls) == 4
+
+
+async def test_many_dropdowns_at_once_share_one_refresh(env, monkeypatch):
+    guild = FakeGuild()
+    await connect(env, guild)
+    calls = counting_refresh(env, monkeypatch, delay=0.05)
+    env.cog._cache[guild.id].fetched -= cog_mod.AUTO_TTL + 1
+    outs = await asyncio.gather(*(choices(env, cog_mod.TabbycatCog._draw_ac, guild) for _ in range(8)))
+    assert len(calls) == 1 and all(o[0].name == "Round 1" for o in outs)
+
+
+async def test_slow_refresh_never_blocks_the_dropdown_and_finishes_in_background(env, monkeypatch):
+    guild = FakeGuild()
+    await connect(env, guild)
+    monkeypatch.setattr(cog_mod, "AUTOCOMPLETE_WAIT", 0.05)
+    counting_refresh(env, monkeypatch, delay=0.3)
+    cache = env.cog._cache[guild.id]
+    cache.fetched -= cog_mod.AUTO_TTL + 1
+    t0 = time.monotonic()
+    out = await choices(env, cog_mod.TabbycatCog._draw_ac, guild)
+    assert time.monotonic() - t0 < 0.25 and out[0].name == "Round 1"   # answered from the old data, quickly
+    await asyncio.sleep(0.6)
+    assert env.cog._cache[guild.id] is not cache                       # the refresh finished by itself
+
+
+async def test_site_down_dropdown_uses_old_data_and_backs_off(env, monkeypatch):
+    guild = FakeGuild()
+    await connect(env, guild)
+    await env.srv.close()
+    calls = counting_refresh(env, monkeypatch)
+    env.cog._cache[guild.id].fetched -= cog_mod.AUTO_TTL + 1
+    for _ in range(3):
+        out = await choices(env, cog_mod.TabbycatCog._draw_ac, guild)
+        assert out[0].name == "Round 1"                                # still usable from the last good data
+    assert len(calls) == 1                                             # no hammering of a site that is down
+
+
+async def test_site_down_and_no_data_shows_a_refresh_warning(env):
+    guild = FakeGuild()
+    await connect(env, guild)
+    await env.srv.close()
+    env.cog._cache.pop(guild.id)
+    out = await choices(env, cog_mod.TabbycatCog._draw_ac, guild)
+    assert len(out) == 1 and "/refresh" in out[0].name
 
 
 async def test_autocomplete_none_released_only_shows_the_refresh_warning(env):
@@ -292,6 +368,73 @@ async def test_reveal_buttons_are_for_operators_only(env):
     bad = interaction(member("DEBATER"), guild)
     assert await view.interaction_check(bad) is False and "Only CAP" in last_text(bad)
     assert await view.interaction_check(interaction(member("ORG"), guild)) is True
+
+
+def multi_round(infos):
+    from tabbycat_client import MotionInfo, RoundInfo
+    return RoundInfo(seq=1, name="Round 1", draw_status="R", motions_released=True,
+                     motions=[MotionInfo(i, f"Motion text {i}", info) for i, info in enumerate(infos, 1)])
+
+
+async def test_several_motions_get_one_button_each_plus_all_buttons(env):
+    view = cog_mod.MotionRevealView(env.cog, multi_round(["info 1", "", "info 3"]), "T")
+    info = [b.label for b in view.info_buttons.values()]
+    motion = [b.label for b in view.motion_buttons.values()]
+    assert info == ["Info 1", "Info 3", "All info slides"]             # only motions that have an info slide
+    assert motion == ["Motion 1", "Motion 2", "Motion 3", "All motions"]
+    locked = {b.label: b.disabled for b in view.motion_buttons.values()}
+    assert locked == {"Motion 1": True, "Motion 2": False, "Motion 3": True, "All motions": True}
+    assert all(b.row <= 4 for b in view.children)
+
+
+async def test_several_motions_reveal_individually_then_all(env):
+    guild = FakeGuild()
+    await connect(env, guild)
+    view = cog_mod.MotionRevealView(env.cog, multi_round(["info 1", "", "info 3"]), "T")
+
+    _, chan = await press(env, guild, view, view.info_buttons[1])
+    assert [f.filename for f in chan.sent[0]["files"]] == ["info-round-1-1.png"]
+    assert not view.motion_buttons[1].disabled and view.motion_buttons[3].disabled       # Motion 1 unlocked, 3 still locked
+    assert view.motion_buttons[None].disabled                                           # "all" waits for every info slide
+
+    _, chan = await press(env, guild, view, view.motion_buttons[2])                      # no info slide → available at once
+    assert [f.filename for f in chan.sent[0]["files"]] == ["motion-round-1-2.png"]
+
+    _, chan = await press(env, guild, view, view.info_buttons[None])                     # "all info" = what is still missing
+    assert [f.filename for f in chan.sent[0]["files"]] == ["info-round-1-3.png"]
+    assert view.info_buttons[None].disabled and view.info_buttons[3].disabled
+    assert not view.motion_buttons[None].disabled
+
+    _, chan = await press(env, guild, view, view.motion_buttons[None])                   # remaining motions 1 and 3
+    assert [f.filename for f in chan.sent[0]["files"]] == ["motion-round-1-1.png", "motion-round-1-3.png"]
+    assert all(b.disabled for b in view.children)
+
+
+async def test_release_all_from_the_start_when_nothing_is_locked(env):
+    guild = FakeGuild()
+    await connect(env, guild)
+    view = cog_mod.MotionRevealView(env.cog, multi_round(["", "", ""]), "T")
+    assert [b.label for b in view.children] == ["Motion 1", "Motion 2", "Motion 3", "All motions"]
+    _, chan = await press(env, guild, view, view.motion_buttons[None])
+    assert len(chan.sent[0]["files"]) == 3
+
+
+async def test_failed_reveal_unlocks_the_button_again(env, monkeypatch):
+    guild = FakeGuild()
+    await connect(env, guild)
+    view = cog_mod.MotionRevealView(env.cog, multi_round(["info 1", "info 2"]), "T")
+
+    def boom(*a, **k):
+        raise RuntimeError("render failed")
+    monkeypatch.setattr(cog_mod.tab_render, "render_info_slides", boom)
+    i, _ = await press(env, guild, view, view.info_buttons[None])
+    assert not view.info_buttons[None].disabled and not view.info_buttons[1].disabled
+    assert "❌" in last_text(i)
+
+
+async def test_very_many_motions_still_fit_discords_button_limit(env):
+    view = cog_mod.MotionRevealView(env.cog, multi_round(["i"] * 12), "T")
+    assert [b.label for b in view.children] == ["All info slides", "All motions"]
 
 
 async def test_unavailable_choice_tells_the_user_to_refresh(env):

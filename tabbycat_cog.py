@@ -46,7 +46,10 @@ def _new_client(url: str, slug: str, token: str) -> TabbycatClient:
 
 TAB_ROLE = "TABBY"
 OPERATOR_ROLES = ("CAP", "ORG", "TABBY")
-CACHE_TTL = 600.0
+CACHE_TTL = 60.0              # commands re-read Tabbycat when their data is older than this
+AUTO_TTL = 30.0               # a round dropdown being opened re-reads Tabbycat when data is older than this
+AUTOCOMPLETE_WAIT = 2.3       # Discord gives autocomplete 3 s; slower refreshes continue in the background
+FAIL_BACKOFF = 15.0           # after a failed auto-refresh don't hammer the site again for this long
 MAX_FILES_PER_MESSAGE = 10
 CHANNELS = {
     "draw": "🎓︱matchup",
@@ -125,17 +128,103 @@ class TabModal(discord.ui.Modal, title="Connect Tabbycat"):
             pass
 
 
-class MotionRevealView(discord.ui.View):
-    """Buttons shown by /motion. With an info slide: [Reveal Info Slide] then [Reveal Motion] (locked until the info
-    slide is out). Without one: just [Reveal Motion]. Only CAP / ORG / TABBY can press them; each works once."""
+class _RevealButton(discord.ui.Button):
+    def __init__(self, kind: str, idx: Optional[int], **kw) -> None:
+        super().__init__(**kw)
+        self.kind, self.idx = kind, idx                 # kind: "info" | "motion"; idx: 1-based motion, None = all
 
-    def __init__(self, cog: "TabbycatCog", rnd: RoundInfo, tournament: str, has_info: bool = False) -> None:
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.view.press(interaction, self)
+
+
+class MotionRevealView(discord.ui.View):
+    """Buttons shown by /motion (nothing is posted until one is pressed; only CAP / ORG / TABBY can press).
+
+    One motion:   [Reveal Info Slide] (only if it has one) then [Reveal Motion] (locked until the info slide is out).
+    Several:      row(s) of  [Info 1] [Info 2] ... [All info slides]   and   [Motion 1] [Motion 2] ... [All motions].
+                  Each motion unlocks after its own info slide (if it has one). The "All" buttons post whatever has
+                  not been revealed yet, in one go. Every button works once and greys out when used."""
+
+    def __init__(self, cog: "TabbycatCog", rnd: RoundInfo, tournament: str, has_info: Optional[bool] = None) -> None:
         super().__init__(timeout=900)
-        self.cog, self.rnd, self.tournament, self.has_info = cog, rnd, tournament, has_info
-        if has_info:
-            self.reveal_motion.disabled = True
+        self.cog, self.rnd, self.tournament = cog, rnd, tournament
+        self.total = len(rnd.motions)
+        self.with_info = [i for i, m in enumerate(rnd.motions, 1) if m.info_slide]
+        self.info_done: set[int] = set()
+        self.motion_done: set[int] = set()
+        self.info_buttons: dict[Optional[int], _RevealButton] = {}
+        self.motion_buttons: dict[Optional[int], _RevealButton] = {}
+        self._build()
+        self._sync()
+
+    # -- layout ------------------------------------------------------------------
+
+    def _build(self) -> None:
+        single = self.total <= 1
+        info_specs, motion_specs = [], []
+        if single:
+            if self.with_info:
+                info_specs.append((1, "Reveal Info Slide"))
+            motion_specs.append((1, "Reveal Motion"))
         else:
-            self.remove_item(self.reveal_info)
+            per_motion = len(self.with_info) + self.total + 2 <= 20            # always fits 5 rows; else only the "All" buttons
+            if self.with_info:
+                if per_motion:
+                    info_specs += [(i, f"Info {i}") for i in self.with_info]
+                info_specs.append((None, "All info slides"))
+            if per_motion:
+                motion_specs += [(i, f"Motion {i}") for i in range(1, self.total + 1)]
+            motion_specs.append((None, "All motions"))
+        row = 0
+        for specs, kind, store, style, emoji in ((info_specs, "info", self.info_buttons, discord.ButtonStyle.primary, "📄"),
+                                                 (motion_specs, "motion", self.motion_buttons, discord.ButtonStyle.success, "🎯")):
+            for pos, (idx, label) in enumerate(specs):
+                btn = _RevealButton(kind, idx, label=label, row=row + pos // 5,
+                                    style=discord.ButtonStyle.secondary if (idx is None and len(specs) > 1) else style,
+                                    emoji=emoji)
+                store[idx] = btn
+                self.add_item(btn)
+            row += (len(specs) + 4) // 5
+
+    @property
+    def reveal_info(self) -> _RevealButton:                  # the single-motion buttons (kept for convenience)
+        return next(iter(self.info_buttons.values()))
+
+    @property
+    def reveal_motion(self) -> _RevealButton:
+        return next(iter(self.motion_buttons.values()))
+
+    def intro(self) -> str:
+        name = f"**{self.rnd.name}**"
+        if self.total <= 1:
+            return (f"{name} has an info slide. Press **Reveal Info Slide** first, then **Reveal Motion**."
+                    if self.with_info else f"{name} — press **Reveal Motion** to post the motion.")
+        extra = " Each motion unlocks after its info slide." if self.with_info else ""
+        return (f"{name} has {self.total} motions. Reveal them one by one, or use the **All** buttons.{extra}"
+                " Each button works once.")
+
+    # -- state -------------------------------------------------------------------
+
+    def _locked(self, idx: int) -> bool:
+        return idx in self.with_info and idx not in self.info_done
+
+    def _sync(self) -> None:
+        for idx, btn in self.info_buttons.items():
+            remaining = [i for i in self.with_info if i not in self.info_done]
+            btn.disabled = (not remaining) if idx is None else idx in self.info_done
+        for idx, btn in self.motion_buttons.items():
+            remaining = [i for i in range(1, self.total + 1) if i not in self.motion_done]
+            if idx is None:
+                btn.disabled = not remaining or any(self._locked(i) for i in remaining)
+            else:
+                btn.disabled = idx in self.motion_done or self._locked(idx)
+
+    def _targets(self, button: _RevealButton) -> list[int]:
+        if button.kind == "info":
+            pool = [i for i in self.with_info if i not in self.info_done]
+        else:
+            pool = [i for i in range(1, self.total + 1) if i not in self.motion_done and not self._locked(i)]
+        return pool if button.idx is None else [i for i in pool if i == button.idx]
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if is_operator(interaction.user):
@@ -143,29 +232,21 @@ class MotionRevealView(discord.ui.View):
         await interaction.response.send_message("⛔ Only CAP, ORG and TABBY can use this.", ephemeral=True)
         return False
 
-    async def _reveal(self, interaction: discord.Interaction, button: discord.ui.Button, *, info: bool) -> None:
-        button.disabled = True                                   # also stops a double click
-        if info:
-            self.reveal_motion.disabled = False                  # the motion can follow now
+    async def press(self, interaction: discord.Interaction, button: _RevealButton) -> None:
+        targets = self._targets(button)
+        done = self.info_done if button.kind == "info" else self.motion_done
+        done.update(targets)                                      # greys the button(s) out at once: no double click
+        self._sync()
         await interaction.response.edit_message(view=self)
-        ok = await self.cog._post_motion_images(interaction, self.rnd, self.tournament,
-                                                show_info=False, info_only=info)
+        ok = bool(targets) and await self.cog._post_motion_images(
+            interaction, self.rnd, self.tournament, info_only=button.kind == "info", only=targets)
         if not ok:
-            button.disabled = False
-            if info:
-                self.reveal_motion.disabled = True
+            done.difference_update(targets)
+            self._sync()
             try:
                 await interaction.edit_original_response(view=self)
             except discord.HTTPException:
                 pass
-
-    @discord.ui.button(label="Reveal Info Slide", style=discord.ButtonStyle.primary, emoji="📄")
-    async def reveal_info(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await self._reveal(interaction, button, info=True)
-
-    @discord.ui.button(label="Reveal Motion", style=discord.ButtonStyle.success, emoji="🎯")
-    async def reveal_motion(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await self._reveal(interaction, button, info=False)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
         log.error("Motion reveal failed: %s", describe(error))
@@ -183,6 +264,8 @@ class TabbycatCog(commands.Cog):
         self._locks: dict[int, asyncio.Lock] = {}
         self._warm_task: Optional[asyncio.Task] = None
         self._warmed = False
+        self._auto_tasks: dict[int, asyncio.Task] = {}
+        self._backoff: dict[int, float] = {}
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
@@ -190,8 +273,10 @@ class TabbycatCog(commands.Cog):
         tab_render.check_fonts()
 
     async def cog_unload(self) -> None:
-        if self._warm_task and not self._warm_task.done():
-            self._warm_task.cancel()
+        for task in [self._warm_task, *self._auto_tasks.values()]:
+            if task and not task.done():
+                task.cancel()
+        self._auto_tasks.clear()
         for _, client in list(self._clients.values()):
             await client.close()
         self._clients.clear()
@@ -277,6 +362,36 @@ class TabbycatCog(commands.Cog):
                     return cache          # keep working from the last good data
                 raise
         return cache
+
+    async def _autocomplete_cache(self, guild: discord.Guild) -> Optional[Cache]:
+        """Data for a dropdown: re-read Tabbycat when it is older than AUTO_TTL, but never make Discord wait
+        more than AUTOCOMPLETE_WAIT (a slow refresh keeps running and the next keystroke gets its result).
+        One refresh at a time per server, and a short back-off after a failure. Falls back to the last good data."""
+        cache = self._cache.get(guild.id)
+        now = time.monotonic()
+        if cache is not None and now - cache.fetched < AUTO_TTL:
+            return cache
+        task = self._auto_tasks.get(guild.id)
+        if task is None or task.done():
+            if now < self._backoff.get(guild.id, 0.0):
+                return cache
+            task = asyncio.get_running_loop().create_task(self._refresh(guild))
+            task.add_done_callback(lambda t, gid=guild.id: self._auto_done(gid, t))
+            self._auto_tasks[guild.id] = task
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), AUTOCOMPLETE_WAIT)
+        except asyncio.TimeoutError:
+            return self._cache.get(guild.id)
+        except Exception:  # noqa: BLE001  (already logged by _auto_done)
+            return self._cache.get(guild.id)
+
+    def _auto_done(self, guild_id: int, task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()                                  # also marks it as retrieved
+        if exc is not None:
+            self._backoff[guild_id] = time.monotonic() + FAIL_BACKOFF
+            log.info("Auto-refresh failed for guild %s: %s", guild_id, describe(exc))
 
     # ── /tab ──────────────────────────────────────────────────────────────────
 
@@ -400,9 +515,10 @@ class TabbycatCog(commands.Cog):
         label = {"draw": "draw", "motion": "motions", "result": "results"}[kind]
         if not await self._tab_config(guild):
             return [app_commands.Choice(name="Not connected — a TABBY must run /tab", value=NONE_VALUE)]
-        cache = self._cache.get(guild.id)
+        cache = await self._autocomplete_cache(guild)
         if cache is None:
-            return [app_commands.Choice(name="⚠️ Data not loaded — please /refresh to get latest update!", value=NONE_VALUE)]
+            return [app_commands.Choice(name="⚠️ Could not load from Tabbycat — please /refresh to get latest update!",
+                                        value=NONE_VALUE)]
         rounds = [r for r in cache.available_rounds(kind) if current.lower() in r.name.lower()]
         choices = [app_commands.Choice(name=r.name[:100], value=r.seq) for r in rounds[:24]]
         if not cache.available_rounds(kind):
@@ -424,13 +540,14 @@ class TabbycatCog(commands.Cog):
     async def _break_ac(self, interaction: discord.Interaction, current: str):
         if not await self._tab_config(interaction.guild):
             return [app_commands.Choice(name="Not connected — a TABBY must run /tab", value="-")]
-        cache = self._cache.get(interaction.guild.id)
+        cache = await self._autocomplete_cache(interaction.guild)
         if cache is None:
-            return [app_commands.Choice(name="Data not loaded — use /refresh", value="-")]
+            return [app_commands.Choice(name="⚠️ Could not load from Tabbycat — please /refresh to get latest update!",
+                                        value="-")]
         cats = [c for c, n in cache.breaks if n and current.lower() in c.name.lower()]
         if not cats:
             return [] if any(n for _, n in cache.breaks) else [
-                app_commands.Choice(name="No break released yet — use /refresh", value="-")]
+                app_commands.Choice(name="⚠️ No break released yet — please /refresh to get latest update!", value="-")]
         return [app_commands.Choice(name=c.name[:100], value=c.name[:100]) for c in cats[:25]]
 
     # ── shared command plumbing ───────────────────────────────────────────────
@@ -537,22 +654,22 @@ class TabbycatCog(commands.Cog):
         if rnd is None:
             await self._none_available(interaction, "motion", next((r for r in cache.rounds if r.seq == round_), None))
             return
-        has_info = any(m.info_slide for m in rnd.motions)
-        view = MotionRevealView(self, rnd, cache.tournament, has_info)
-        text = (f"**{rnd.name}** has an info slide. Press **Reveal Info Slide** first, then **Reveal Motion**."
-                if has_info else f"**{rnd.name}** — press **Reveal Motion** to post the motion.")
-        await interaction.followup.send(text, view=view, ephemeral=True)
+        view = MotionRevealView(self, rnd, cache.tournament)
+        await interaction.followup.send(view.intro(), view=view, ephemeral=True)
 
     async def _post_motion_images(self, interaction: discord.Interaction, rnd: RoundInfo, tournament: str,
-                                  *, show_info: bool, info_only: bool = False) -> bool:
-        """Render + post the motion (or only the info slides). Returns True when something was posted."""
+                                  *, info_only: bool, only: Optional[list[int]] = None) -> bool:
+        """Render + post the motions (or only the info slides) of a round; `only` = 1-based positions.
+        Returns True when something was posted."""
         try:
             if info_only:
-                pages = await asyncio.to_thread(tab_render.render_info_slides, tournament, rnd, rnd.motions)
+                pages = await asyncio.to_thread(tab_render.render_info_slides, tournament, rnd, rnd.motions, only)
                 prefix = "info"
+                numbers = [i for i, m in enumerate(rnd.motions, 1) if m.info_slide and (only is None or i in only)]
             else:
-                pages = await asyncio.to_thread(tab_render.render_motions, tournament, rnd, rnd.motions, show_info)
+                pages = await asyncio.to_thread(tab_render.render_motions, tournament, rnd, rnd.motions, False, only)
                 prefix = "motion"
+                numbers = [i for i in range(1, len(rnd.motions) + 1) if only is None or i in only]
         except Exception:  # noqa: BLE001
             log.exception("Rendering /motion failed")
             await interaction.followup.send("❌ Could not build the image. Please try again.", ephemeral=True)
@@ -561,7 +678,7 @@ class TabbycatCog(commands.Cog):
             await self._none_available(interaction, "motion", rnd)
             return False
         slug = rnd.name.lower().replace(" ", "-")
-        await self._post(interaction, "motion", [(f"{prefix}-{slug}-{i}.png", png) for i, png in enumerate(pages, 1)])
+        await self._post(interaction, "motion", [(f"{prefix}-{slug}-{n}.png", png) for n, png in zip(numbers, pages)])
         return True
 
     @app_commands.command(name="result", description="Post a round's results as an image.")
