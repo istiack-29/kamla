@@ -237,14 +237,15 @@ class MotionRevealView(discord.ui.View):
         done = self.info_done if button.kind == "info" else self.motion_done
         done.update(targets)                                      # greys the button(s) out at once: no double click
         self._sync()
-        await interaction.response.edit_message(view=self)
+        finished = all(b.disabled for b in self.children)
+        await interaction.response.edit_message(content="✅ All revealed." if finished else self.intro(), view=self)
         ok = bool(targets) and await self.cog._post_motion_images(
             interaction, self.rnd, self.tournament, info_only=button.kind == "info", only=targets)
         if not ok:
             done.difference_update(targets)
             self._sync()
             try:
-                await interaction.edit_original_response(view=self)
+                await interaction.edit_original_response(content=self.intro(), view=self)
             except discord.HTTPException:
                 pass
 

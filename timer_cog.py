@@ -17,6 +17,9 @@ _pens_tasks: set[asyncio.Task] = set()
 # Module constants (tests shrink them so a "minute" takes a fraction of a second).
 MINUTE = 60.0
 PENS_DROP_DELAY = 15.0
+# A debate timer never needs more than a day. Without a cap a message like `99999d` made the countdown build a
+# list with one entry per minute (over 100 million) and froze / crashed the whole bot.
+MAX_SECONDS = 24 * 3600
 
 # Strict time format: only digits + lowercase d/h/m/s (e.g. 1d2h3m4s, 10m, 30s)
 _TIME_STRICT = re.compile(r'^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$')
@@ -133,6 +136,14 @@ class TimerCog(commands.Cog):
                 f"⚠️ {message.author.mention} — invalid format. "
                 "Don't use special characters or capital letters.\n"
                 "Use exactly like: `10s` · `7m` · `1h30m` · `10m30s`",
+                delete_after=10,
+            )
+            return
+
+        if duration > MAX_SECONDS:
+            await message.channel.send(
+                f"⚠️ {message.author.mention} — the longest timer is {fmt_human(MAX_SECONDS)} (`1d`). "
+                "Please use a shorter time.",
                 delete_after=10,
             )
             return

@@ -6,6 +6,7 @@ import pytest
 import discord
 from ratelimit import Kind, classify, retry_call, RequestCoordinator, CoalescingSender, SecretScrubber
 from tests.fakes import http_error
+import ratelimit as rl
 
 
 async def _nosleep(_):
@@ -145,3 +146,30 @@ def test_secret_scrubber():
     assert token not in s.scrub(f"login with {token}")
     assert "REDACTED" in s.scrub("Authorization: Bot abcdefghijklmnopqrstuvwxyz012345")
     assert "tok123" not in s.scrub("https://discord.com/api/webhooks/123456/tok123456789abcdef")
+
+
+def test_scrubber_hides_tabbycat_and_bearer_tokens():
+    scrub = rl.SecretScrubber().scrub
+    tab = "0123456789abcdef0123456789abcdef01234567"
+    assert tab not in scrub(f"headers={{'Authorization': 'Token {tab}'}}")
+    assert tab not in scrub(f"sent Token {tab} to server")
+    assert tab not in scrub(f"Bearer {tab}")
+    assert scrub("Token ring game ended") == "Token ring game ended"           # ordinary text is untouched
+
+
+async def test_spawn_keeps_the_task_alive_and_logs_failures(caplog):
+    import asyncio, gc
+    done = []
+
+    async def work():
+        await asyncio.sleep(0.01)
+        done.append(1)
+
+    async def boom():
+        raise RuntimeError("nope")
+    rl.spawn(work())
+    rl.spawn(boom(), name="boom-task")
+    gc.collect()                                   # nothing else references the tasks
+    await asyncio.sleep(0.05)
+    assert done == [1] and not rl._background
+    assert any("boom-task" in r.message for r in caplog.records)

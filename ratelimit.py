@@ -212,6 +212,25 @@ async def retry_call(
     raise last
 
 
+# ── Background tasks ─────────────────────────────────────────────────────────
+
+_background: set[asyncio.Task] = set()
+
+
+def spawn(coro: Awaitable[Any], *, name: Optional[str] = None) -> asyncio.Task:
+    """Fire-and-forget that is safe: the event loop only keeps a WEAK reference to a task, so an unreferenced
+    one can be garbage-collected half-way. This keeps a strong reference until it finishes and logs failures."""
+    task = asyncio.get_running_loop().create_task(coro, name=name)
+    _background.add(task)
+
+    def _done(t: asyncio.Task) -> None:
+        _background.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            log.warning("Background task %s failed: %s", t.get_name(), describe(t.exception()))
+    task.add_done_callback(_done)
+    return task
+
+
 # ── Coordinator ──────────────────────────────────────────────────────────────
 
 class RequestCoordinator:
@@ -378,6 +397,7 @@ class SecretScrubber(logging.Filter):
         re.compile(r"(?i)\bBot\s+[A-Za-z0-9._\-]{20,}"),
         re.compile(r"(discord(?:app)?\.com/api/(?:v\d+/)?webhooks/\d+/)[A-Za-z0-9._\-]+"),
         re.compile(r"[A-Za-z0-9_\-]{23,28}\.[A-Za-z0-9_\-]{6,7}\.[A-Za-z0-9_\-]{27,}"),
+        re.compile(r"(?i)\b(Token|Bearer)\s+[A-Za-z0-9._\-]{20,}"),       # Tabbycat API token / other bearer tokens
     ]
 
     def __init__(self, extra_secrets: Optional[list[str]] = None) -> None:
@@ -391,6 +411,7 @@ class SecretScrubber(logging.Filter):
         text = self._PATTERNS[1].sub("Bot [REDACTED]", text)
         text = self._PATTERNS[2].sub(r"\1[REDACTED]", text)
         text = self._PATTERNS[3].sub("[REDACTED]", text)
+        text = self._PATTERNS[4].sub(r"\1 [REDACTED]", text)
         return text
 
     def filter(self, record: logging.LogRecord) -> bool:

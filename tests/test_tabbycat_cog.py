@@ -470,6 +470,16 @@ async def test_several_motions_reveal_individually_then_all(env):
     assert all(b.disabled for b in view.children)
 
 
+async def test_message_says_all_revealed_when_everything_is_out(env):
+    guild = FakeGuild()
+    await connect(env, guild)
+    view = cog_mod.MotionRevealView(env.cog, multi_round(["info 1", ""]), "T")
+    first, _ = await press(env, guild, view, view.info_buttons[None])
+    assert first.response.edit_message.await_args.kwargs["content"] != "✅ All revealed."      # still motions to go
+    last, _ = await press(env, guild, view, view.motion_buttons[None])
+    assert last.response.edit_message.await_args.kwargs["content"] == "✅ All revealed."
+
+
 async def test_release_all_from_the_start_when_nothing_is_locked(env):
     guild = FakeGuild()
     await connect(env, guild)

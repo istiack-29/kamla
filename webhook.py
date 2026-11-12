@@ -22,7 +22,7 @@ from datetime import datetime, timezone, timedelta
 import aiohttp
 import discord
 
-from ratelimit import classify, describe
+from ratelimit import _env_float, classify, describe
 
 log = logging.getLogger("kamla.webhook")
 
@@ -34,7 +34,7 @@ _join_message_ids: dict[int, str] = {}
 _session: aiohttp.ClientSession | None = None
 
 # Join-log edits are debounced: a burst of joins/leaves produces ONE edit.
-JOIN_LOG_DEBOUNCE_SECONDS = float(os.getenv("KAMLA_JOIN_LOG_DEBOUNCE", "10") or 10)
+JOIN_LOG_DEBOUNCE_SECONDS = _env_float("KAMLA_JOIN_LOG_DEBOUNCE", 10.0)     # a typo in the env must not crash start-up
 _pending_edits: dict[int, tuple[asyncio.Task, dict]] = {}
 
 # The developer log can be posted two ways:

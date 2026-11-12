@@ -1439,7 +1439,7 @@ async def protect_tab_channels(guild: discord.Guild) -> int:
                 if getattr(current, attr) is want:
                     continue
                 setattr(current, attr, want)
-                await bulk.best_effort(lambda t=target, c=current: ch.set_permissions(t, overwrite=c, reason="KAMLA — protected channel"),
+                await bulk.best_effort(lambda ch=ch, t=target, c=current: ch.set_permissions(t, overwrite=c, reason="KAMLA — protected channel"),
                                        label=f"protect {name}")
         except Exception as e:  # noqa: BLE001
             log.warning("Could not harden #%s in guild %s: %s", name, guild.id, describe(e))

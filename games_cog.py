@@ -323,10 +323,13 @@ async def _handle_ttt_challenge(interaction: discord.Interaction, opponent: disc
         return
 
     _mark_busy(guild.id, challenger.id, opponent.id)
-
-    embed = _challenge_embed(challenger, opponent, "❌⭕ Tic-Tac-Toe Challenge")
-    view = TTTChallengeView(challenger, opponent)
-    msg = await _send_challenge_and_cleanup_response(interaction, embed, view)
+    try:
+        embed = _challenge_embed(challenger, opponent, "❌⭕ Tic-Tac-Toe Challenge")
+        view = TTTChallengeView(challenger, opponent)
+        msg = await _send_challenge_and_cleanup_response(interaction, embed, view)
+    except BaseException:                 # the challenge could not be posted: nobody stays 'busy' forever
+        _clear_busy(guild.id, challenger.id, opponent.id)
+        raise
     view.message = msg
 
 
@@ -354,10 +357,13 @@ async def _handle_ttt_challenge_from_message(message: discord.Message, opponent:
         return
 
     _mark_busy(guild.id, challenger.id, opponent.id)
-
-    embed = _challenge_embed(challenger, opponent, "❌⭕ Tic-Tac-Toe Challenge")
-    view = TTTChallengeView(challenger, opponent)
-    msg = await message.channel.send(embed=embed, view=view)
+    try:
+        embed = _challenge_embed(challenger, opponent, "❌⭕ Tic-Tac-Toe Challenge")
+        view = TTTChallengeView(challenger, opponent)
+        msg = await message.channel.send(embed=embed, view=view)
+    except BaseException:                 # the challenge could not be posted: nobody stays 'busy' forever
+        _clear_busy(guild.id, challenger.id, opponent.id)
+        raise
     view.message = msg
 
 
@@ -551,11 +557,14 @@ async def _handle_rps_challenge_from_message(message: discord.Message, opponent:
         return
 
     _mark_busy(guild.id, challenger.id, opponent.id)
-
-    embed = _challenge_embed(challenger, opponent, "✊📰✌️ Rock-Paper-Scissors Challenge")
-    embed.add_field(name="Rounds", value=str(times), inline=True)
-    view = RPSChallengeView(challenger, opponent, times)
-    msg = await message.channel.send(embed=embed, view=view)
+    try:
+        embed = _challenge_embed(challenger, opponent, "✊📰✌️ Rock-Paper-Scissors Challenge")
+        embed.add_field(name="Rounds", value=str(times), inline=True)
+        view = RPSChallengeView(challenger, opponent, times)
+        msg = await message.channel.send(embed=embed, view=view)
+    except BaseException:                 # the challenge could not be posted: nobody stays 'busy' forever
+        _clear_busy(guild.id, challenger.id, opponent.id)
+        raise
     view.message = msg
 
 
@@ -581,11 +590,14 @@ async def _handle_rps_challenge(interaction: discord.Interaction, opponent: disc
         return
 
     _mark_busy(guild.id, challenger.id, opponent.id)
-
-    embed = _challenge_embed(challenger, opponent, "✊📰✌️ Rock-Paper-Scissors Challenge")
-    embed.add_field(name="Rounds", value=str(times), inline=True)
-    view = RPSChallengeView(challenger, opponent, times)
-    msg = await _send_challenge_and_cleanup_response(interaction, embed, view)
+    try:
+        embed = _challenge_embed(challenger, opponent, "✊📰✌️ Rock-Paper-Scissors Challenge")
+        embed.add_field(name="Rounds", value=str(times), inline=True)
+        view = RPSChallengeView(challenger, opponent, times)
+        msg = await _send_challenge_and_cleanup_response(interaction, embed, view)
+    except BaseException:                 # the challenge could not be posted: nobody stays 'busy' forever
+        _clear_busy(guild.id, challenger.id, opponent.id)
+        raise
     view.message = msg
 
 

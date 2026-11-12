@@ -14,7 +14,7 @@ import keep_alive as keep_alive_mod
 from keep_alive import keep_alive
 from config import config_manager
 import ratelimit
-from ratelimit import Kind, classify, describe, retry_after_of
+from ratelimit import Kind, classify, describe, retry_after_of, spawn
 
 load_dotenv()
 
@@ -139,7 +139,7 @@ class KamlaBot(commands.Bot):
         self._ready_logged = True
         keep_alive_mod.set_status("connected")
         log.info("Ready — logged in as %s (ID: %s) in %d guild(s).", self.user, self.user.id, len(self.guilds))
-        asyncio.create_task(self._protect_tab_channels_everywhere())
+        spawn(self._protect_tab_channels_everywhere(), name="protect-tab-channels")
 
     async def _protect_tab_channels_everywhere(self) -> None:
         """Startup sweep: matchup/motion/ballot/break deleted while KAMLA was offline come back, and older
@@ -220,7 +220,7 @@ class KamlaBot(commands.Bot):
 
     async def on_guild_remove(self, guild: discord.Guild) -> None:
         from webhook import mark_guild_deleted
-        asyncio.create_task(mark_guild_deleted(guild))
+        spawn(mark_guild_deleted(guild), name="mark-guild-deleted")
 
     async def on_member_join(self, member: discord.Member) -> None:
         from webhook import schedule_join_log_edit
@@ -332,11 +332,8 @@ class KamlaBot(commands.Bot):
         if not is_category:
             category = getattr(channel, "category", None)
             parent = category.name if category else None
-        asyncio.create_task(
-            restore_if_protected(
-                guild, channel.name, is_category, parent_category_name=parent
-            )
-        )
+        spawn(restore_if_protected(guild, channel.name, is_category, parent_category_name=parent),
+              name="restore-protected-channel")
 
     async def on_guild_channel_update(self, before: discord.abc.GuildChannel, after: discord.abc.GuildChannel) -> None:
         """matchup / motion / ballot / break must keep their names (KAMLA posts by name): rename them back."""

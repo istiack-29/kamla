@@ -25,6 +25,9 @@ POLL_CHANNEL_NAME = "📊︱poll"
 YESNO_CHANNEL_NAME = "📊︱yes-no-voting"
 POLL_ADMIN_ROLES = {"CAP", "TABBY", "ORG"}
 MAX_OPTIONS = 9
+MAX_TOPIC = 250          # Discord: embed title <= 256 characters
+MAX_OPTION = 100         # an option appears in a field name (<= 256) together with its vote count
+EMBED_BUDGET = 5600      # Discord: an embed may hold 6000 characters in total; keep a safety margin
 
 NUM_EMOJI = ["0️⃣", "1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣"]
 
@@ -119,24 +122,34 @@ def _option_emoji(poll: Poll, idx: int) -> str:
     return NUM_EMOJI[idx + 1]
 
 
+def _voters_text(voters: set[int], budget: int) -> str:
+    """Public-vote list that always fits a field: as many mentions as fit, then '… and N more'."""
+    if not voters:
+        return "None"
+    ids = sorted(voters)
+    full = "\n".join(f"<@{uid}>" for uid in ids)
+    if len(full) <= budget:
+        return full
+    kept, used = [], 0
+    for n, uid in enumerate(ids):
+        mention = f"<@{uid}>"
+        suffix = f"\n… and {len(ids) - n} more"
+        if used + len(mention) + 1 + len(suffix) > budget:
+            return "\n".join(kept) + f"\n… and {len(ids) - n} more" if kept else f"{len(ids)} votes"
+        kept.append(mention)
+        used += len(mention) + 1
+    return "\n".join(kept)
+
+
 def _build_poll_embed(poll: Poll) -> discord.Embed:
     embed = discord.Embed(
-        title=poll.topic,
+        title=poll.topic[:256],
         color=discord.Color.dark_grey() if poll.closed else discord.Color.blurple(),
         timestamp=datetime.now(timezone.utc),
     )
     embed.description = "\n".join(
         f"{_option_emoji(poll, idx)} {option}" for idx, option in enumerate(poll.options)
-    )
-
-    for idx, option in enumerate(poll.options):
-        voters = poll.votes[idx]
-        header = f"{_option_emoji(poll, idx)} {option} — {len(voters)} vote{'s' if len(voters) != 1 else ''}"
-        if poll.anonymous:
-            value = "\u200b"
-        else:
-            value = "\n".join(f"<@{uid}>" for uid in voters) if voters else "None"
-        embed.add_field(name=header, value=value, inline=True)
+    )[:4000]
 
     footer_bits = [
         "Multiple votes allowed" if poll.multiple_votes else "Single vote",
@@ -144,7 +157,22 @@ def _build_poll_embed(poll: Poll) -> discord.Embed:
     ]
     if poll.closed:
         footer_bits.append("CLOSED")
-    embed.set_footer(text=" • ".join(footer_bits))
+    footer = " • ".join(footer_bits)
+
+    headers = []
+    for idx, option in enumerate(poll.options):
+        n = len(poll.votes[idx])
+        headers.append(f"{_option_emoji(poll, idx)} {option} — {n} vote{'s' if n != 1 else ''}"[:256])
+    # An embed has a total size limit as well: share what is left between the options.
+    fixed = len(embed.title or "") + len(embed.description or "") + len(footer) + sum(len(h) for h in headers)
+    per_option = max(40, min(1024, (EMBED_BUDGET - fixed) // max(1, len(poll.options))))
+
+    for idx, header in enumerate(headers):
+        voters = poll.votes[idx]
+        value = "\u200b" if poll.anonymous else _voters_text(voters, per_option)
+        embed.add_field(name=header, value=value, inline=True)
+
+    embed.set_footer(text=footer)
     return embed
 
 
@@ -334,6 +362,11 @@ class PollsCog(commands.Cog):
 
         is_yesno = channel.name == YESNO_CHANNEL_NAME
 
+        if len(topic) > MAX_TOPIC:
+            await interaction.response.send_message(
+                f"⚠️ The topic is too long ({len(topic)} characters). Please keep it under {MAX_TOPIC}.", ephemeral=True)
+            return
+
         if is_yesno:
             if options:
                 await interaction.response.send_message(
@@ -356,13 +389,17 @@ class PollsCog(commands.Cog):
                     f"⚠️ A poll may have at most {MAX_OPTIONS} options.", ephemeral=True
                 )
                 return
+            if any(len(o) > MAX_OPTION for o in option_list):
+                await interaction.response.send_message(
+                    f"⚠️ Every option must be at most {MAX_OPTION} characters long.", ephemeral=True)
+                return
 
         role_ids, user_ids, audience = _parse_targets(guild, for_)
 
         if is_yesno:
             multiple_votes = False
             anonymous = True
-            await interaction.response.send_message("✅ Yes/No vote created below.", ephemeral=True)
+            await interaction.response.defer(ephemeral=True)
         else:
             mv_view = YesNoAskView(interaction.user.id)
             await interaction.response.send_message("**Allow multiple votes?**", view=mv_view, ephemeral=True)
@@ -379,7 +416,6 @@ class PollsCog(commands.Cog):
                 await interaction.followup.send("⌛ Timed out waiting for an answer. Run `/newpoll` again.", ephemeral=True)
                 return
             anonymous = anon_view.value
-            await interaction.followup.send("✅ Poll created below.", ephemeral=True)
 
         poll = Poll(
             guild_id=guild.id,
@@ -393,10 +429,16 @@ class PollsCog(commands.Cog):
             role_ids=role_ids,
             user_ids=user_ids,
         )
-        _active_polls[poll.id] = poll
-
-        msg = await channel.send(embed=_build_poll_embed(poll), view=PollView(poll))
+        try:
+            msg = await channel.send(embed=_build_poll_embed(poll), view=PollView(poll))
+        except Exception:  # noqa: BLE001  (missing permission, Discord error ...): don't keep a poll nobody can see
+            await interaction.followup.send(
+                "❌ KAMLA could not post the poll in this channel. Check its permissions and try again.", ephemeral=True)
+            return
         poll.message_id = msg.id
+        _active_polls[poll.id] = poll
+        await interaction.followup.send("✅ Yes/No vote created below." if is_yesno else "✅ Poll created below.",
+                                        ephemeral=True)
 
         # DM fan-out (can be hundreds of members when a role is targeted): sequential and
         # paced through the shared coordinator; closed DMs are expected and not retried.

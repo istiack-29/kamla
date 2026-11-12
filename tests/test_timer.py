@@ -181,3 +181,48 @@ async def test_replaced_timer_marks_old_message_and_leaves_no_slot():
 def test_mins_text():
     assert tc._mins_text(0.4) == "4 mins"
     assert tc._mins_text(0.15) in ("1m 30s", "1m 29s", "1m 31s")
+
+
+# ── an absurd length must not freeze the bot ──────────────────────────────────
+
+def _timer_message(content):
+    import discord
+    chan = mock.MagicMock(spec=discord.TextChannel)
+    chan.name, chan.id = "timer", 77
+    chan.send = mock.AsyncMock()
+    msg = mock.MagicMock()
+    msg.author.bot, msg.author.mention, msg.guild, msg.channel, msg.content = False, "@u", types.SimpleNamespace(id=9), chan, content
+    msg.delete = mock.AsyncMock()
+    return msg, chan
+
+
+@pytest.mark.parametrize("text", ["99999d", "25h", "86401s", "999999999999d"])
+async def test_too_long_a_timer_is_refused_and_nothing_starts(text):
+    cog = tc.TimerCog(bot=None)
+    msg, chan = _timer_message(text)
+    await cog.on_message(msg)
+    assert chan.send.await_count == 1 and "longest timer" in chan.send.await_args.args[0]
+    assert 77 not in tc._active_timers
+
+
+async def test_one_day_is_the_longest_allowed(monkeypatch):
+    from tests.fakes import FakeConfig
+    monkeypatch.setattr(tc, "config_manager", FakeConfig())
+    started = []
+
+    async def fake_run(channel, starter, total, *a):
+        started.append(total)
+        await asyncio.sleep(10)
+    monkeypatch.setattr(tc, "_run_countdown", fake_run)
+    cog = tc.TimerCog(bot=None)
+    msg, chan = _timer_message("1d")
+    await cog.on_message(msg)
+    await asyncio.sleep(0.01)
+    assert started == [86400] and 77 in tc._active_timers
+    tc._active_timers[77].cancel()
+
+
+def test_the_longest_timer_only_has_a_small_schedule():
+    total = float(tc.MAX_SECONDS)
+    marks = [k * 60.0 for k in range(1, int(total // 60.0) + 1) if k * 60.0 < total - 1e-6]
+    assert len(marks) < 1500                                           # not millions
