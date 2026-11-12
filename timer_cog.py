@@ -177,7 +177,7 @@ class TimerState:
 
     _seq = 0
 
-    def __init__(self, channel, starter, total, started_fmt, tz_label, clock=time.monotonic):
+    def __init__(self, channel, starter, total, started_fmt, tz_label, clock=time.monotonic, wall=time.time):
         TimerState._seq += 1
         self.id = TimerState._seq
         self.channel = channel
@@ -187,8 +187,12 @@ class TimerState:
         self.tz_label = tz_label
         self.ended_fmt = ""
         self._clock = clock
+        self._wall = wall
         self._acc = 0.0
         self._since = clock()
+        # Unix time at which the timer ends if nobody pauses. Discord draws a live countdown from it on every
+        # viewer's screen (<t:..:R>), so the message needs NO extra edits to "tick". Re-anchored on resume.
+        self.end_epoch = int(wall() + total)
         self.paused = False
         self.phase = "running"          # running | ended | skipped | replaced
         self.skipped_by = None
@@ -207,10 +211,14 @@ class TimerState:
             self.paused = True
             self.wake.set()
 
+    def remaining(self) -> float:
+        return max(0.0, self.total - self.running())
+
     def resume(self) -> None:
         if self.paused and self.phase == "running":
             self._since = self._clock()
             self.paused = False
+            self.end_epoch = int(self._wall() + self.remaining())
             self.wake.set()
 
     def skip(self, by) -> None:
@@ -220,10 +228,19 @@ class TimerState:
             self.wake.set()
 
 
+def _bar(state: TimerState, width: int = 10) -> str:
+    frac = state.running() / state.total if state.total else 1.0
+    filled = max(0, min(width, round(frac * width)))
+    return "▰" * filled + "▱" * (width - filled)
+
+
 def render(state: TimerState) -> discord.Embed:
-    """Status only — deliberately NO live clock (so it needs one edit per minute, not per second)."""
+    """Status only. There is deliberately NO per-second clock in the text: the live countdown is Discord's own
+    relative timestamp (<t:..:R>), drawn by each viewer's client, so the message is edited once a minute / on
+    pause / resume / end only — the rate-limit budget is unchanged."""
     minutes = int(state.running() // MINUTE)
-    if state.phase == "running":
+    live = state.phase == "running"
+    if live:
         if state.paused:
             status, color = f"⏸ **Paused** · POI · {minutes} min run so far", discord.Color.orange()
         else:
@@ -231,6 +248,7 @@ def render(state: TimerState) -> discord.Embed:
             color = (discord.Color.green() if frac < 0.5 else
                      discord.Color.gold() if frac < 0.75 else discord.Color.red())
             status = f"▶ **{minutes} min running**"
+        status += f"\n{_bar(state)}"
     elif state.phase == "ended":
         status, color = "✅ **Time's up**", discord.Color.dark_grey()
     elif state.phase == "skipped":
@@ -240,11 +258,18 @@ def render(state: TimerState) -> discord.Embed:
     embed = discord.Embed(title="⏱ Timer", description=status, color=color)
     embed.add_field(name="Length", value=fmt_human(int(state.total)), inline=True)
     embed.add_field(name="Commander", value=state.starter.display_name, inline=True)
+    if live and state.paused:
+        embed.add_field(name="Time left", value=f"⏸ {fmt_human(int(state.remaining()))} (paused)", inline=True)
+    elif live:
+        embed.add_field(name="Ends", value=f"<t:{state.end_epoch}:T> · <t:{state.end_epoch}:R>", inline=True)
     footer = f"Started {state.started_fmt} ({state.tz_label})"
     if state.ended_fmt:
         footer += f"  •  Ended {state.ended_fmt}"
     embed.set_footer(text=footer)
     return embed
+
+
+PAUSE_ID, SKIP_ID = "kamla:timer:pause", "kamla:timer:skip"
 
 
 class TimerView(discord.ui.View):
@@ -272,7 +297,7 @@ class TimerView(discord.ui.View):
                 "Only the timer's commander or an admin can use these buttons.", ephemeral=True)
         return ok
 
-    @discord.ui.button(label="Pause (POI)", emoji="⏸", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Pause (POI)", emoji="⏸", style=discord.ButtonStyle.secondary, custom_id=PAUSE_ID)
     async def pause_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._allowed(interaction):
             return
@@ -288,7 +313,7 @@ class TimerView(discord.ui.View):
             button.label, button.emoji = "Resume", "▶"
         await interaction.response.edit_message(embed=render(st), view=self)
 
-    @discord.ui.button(label="Skip", emoji="⏭", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Skip", emoji="⏭", style=discord.ButtonStyle.danger, custom_id=SKIP_ID)
     async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._allowed(interaction):
             return
@@ -299,6 +324,27 @@ class TimerView(discord.ui.View):
         st.skip(interaction.user)
         self.disable_all()
         await interaction.response.edit_message(embed=render(st), view=self)
+
+
+class OrphanTimerView(discord.ui.View):
+    """Registered once at start-up. A timer's buttons are bound to its message while it runs; after a restart
+    the countdown is gone but its buttons are still on screen — they land here instead of showing Discord's
+    "This interaction failed". One user-triggered edit, nothing automatic."""
+
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    async def _lost(self, interaction: discord.Interaction) -> None:
+        await interaction.response.edit_message(
+            content="⌛ This timer stopped because KAMLA restarted. Send the time again to start a new one.", view=None)
+
+    @discord.ui.button(label="Pause (POI)", emoji="⏸", style=discord.ButtonStyle.secondary, custom_id=PAUSE_ID)
+    async def pause_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._lost(interaction)
+
+    @discord.ui.button(label="Skip", emoji="⏭", style=discord.ButtonStyle.danger, custom_id=SKIP_ID)
+    async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._lost(interaction)
 
 
 async def _pens_drop(channel, starter) -> None:
@@ -410,7 +456,9 @@ async def _run_countdown(
     finally:
         if _active_timers.get(channel.id) is asyncio.current_task():
             _active_timers.pop(channel.id, None)
+        view.stop()          # a finished timer's view must not stay registered in memory for ever
 
 
 async def setup(bot: commands.Bot):
+    bot.add_view(OrphanTimerView())
     await bot.add_cog(TimerCog(bot))

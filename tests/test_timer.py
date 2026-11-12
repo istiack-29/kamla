@@ -226,3 +226,93 @@ def test_the_longest_timer_only_has_a_small_schedule():
     total = float(tc.MAX_SECONDS)
     marks = [k * 60.0 for k in range(1, int(total // 60.0) + 1) if k * 60.0 < total - 1e-6]
     assert len(marks) < 1500                                           # not millions
+
+
+# ── live countdown without extra edits, progress bar, restart-proof buttons ───
+
+def fake_state(total=600, now=1_000_000.0):
+    t = {"clock": 0.0, "wall": now}
+    st = tc.TimerState(Chan(), commander(), total, "01-01-2026 10:00:00", "GMT +6",
+                       clock=lambda: t["clock"], wall=lambda: t["wall"])
+    return st, t
+
+
+def field(embed, name):
+    return next((f.value for f in embed.fields if f.name == name), None)
+
+
+def test_running_timer_shows_a_live_discord_countdown_and_a_progress_bar():
+    st, t = fake_state(600)
+    e = tc.render(st)
+    assert field(e, "Ends") == "<t:1000600:T> · <t:1000600:R>"          # Discord renders the countdown itself
+    assert "▱▱▱▱▱▱▱▱▱▱" in e.description and "▰" not in e.description
+    t["clock"] = 300.0                                                  # halfway
+    assert "▰▰▰▰▰▱▱▱▱▱" in tc.render(st).description
+    t["clock"] = 600.0
+    assert "▰▰▰▰▰▰▰▰▰▰" in tc.render(st).description
+
+
+def test_the_text_never_contains_a_ticking_clock():
+    st, t = fake_state(125)
+    t["clock"] = 61.0
+    e = tc.render(st)
+    assert not re.search(r"\d+:\d{2}", e.description)                   # the only countdown is the <t:..:R> field
+
+
+def test_paused_shows_static_time_left_and_resume_re_anchors_the_end():
+    st, t = fake_state(600)
+    t["clock"] = 100.0
+    st.pause()
+    e = tc.render(st)
+    assert field(e, "Ends") is None and "paused" in field(e, "Time left")
+    t["clock"], t["wall"] = 400.0, 1_000_400.0                          # five minutes of POI go by
+    st.resume()
+    assert st.end_epoch == 1_000_400 + 500                              # 500 s were left when it was resumed
+    assert field(tc.render(st), "Ends") == "<t:1000900:T> · <t:1000900:R>"
+
+
+def test_finished_timer_has_no_countdown_field():
+    st, _ = fake_state(60)
+    st.phase = "ended"
+    e = tc.render(st)
+    assert e.description == "✅ **Time's up**" and field(e, "Ends") is None and field(e, "Time left") is None
+
+
+async def test_the_countdown_costs_no_more_edits_than_before():
+    ch, task = start(0.5)                                                 # five "minutes"
+    await ready(ch)
+    await asyncio.wait_for(task, 5)
+    await asyncio.sleep(0.3)
+    assert len(ch.msgs[0].embeds) <= 7                                    # ~ one per minute + end; never one per second
+
+
+async def test_live_buttons_use_fixed_ids_so_they_survive_a_restart():
+    st, _ = fake_state(60)
+    view = tc.TimerView(st)
+    assert sorted(b.custom_id for b in view.children) == sorted([tc.PAUSE_ID, tc.SKIP_ID])
+
+
+@pytest.mark.parametrize("button", ["pause_btn", "skip_btn"])
+async def test_buttons_of_a_timer_lost_in_a_restart_explain_themselves(button):
+    view = tc.OrphanTimerView()
+    i = mock.MagicMock()
+    i.response.edit_message = mock.AsyncMock()
+    await getattr(view, button).callback(i)
+    kwargs = i.response.edit_message.await_args.kwargs
+    assert "restarted" in kwargs["content"] and kwargs["view"] is None
+    assert {b.custom_id for b in view.children} == {tc.PAUSE_ID, tc.SKIP_ID}
+    assert view.is_persistent()
+
+
+async def test_setup_registers_the_fallback_view():
+    bot = mock.MagicMock()
+    bot.add_cog = mock.AsyncMock()
+    await tc.setup(bot)
+    assert isinstance(bot.add_view.call_args.args[0], tc.OrphanTimerView)
+
+
+async def test_a_finished_timers_view_is_released():
+    ch, task = start(0.05)
+    await ready(ch)
+    await asyncio.wait_for(task, 5)
+    assert ch.msgs[0].view.is_finished()
