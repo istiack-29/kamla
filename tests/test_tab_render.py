@@ -140,3 +140,26 @@ def test_wrap_respects_width_and_ellipsises():
 def test_fonts_status_reports_raqm():
     info = tr.check_fonts()
     assert set(info) == {"E.ttf", "B.ttf", "raqm", "emoji"} and info["raqm"] is True and info["emoji"] is True
+
+
+def test_speaker_break_renders_with_emoji_bengali_and_any_number_of_metric_columns():
+    from tabbycat_client import SpeakerRow
+    rows = [SpeakerRow(1, "সুমি আক্তার", "🦊 Dhaka Debaters", [("Average", "83.5"), ("Total", "417.5"), ("Speeches", "5")]),
+            SpeakerRow(2, "Ann " + "Longname " * 12, "🇧🇩 Team", [("Average", "82"), ("Total", "410"), ("Speeches", "5")])]
+    pages = tr.render_speaker_break("Open", "Break  ·  Top 10 Speakers", "Overall  ·  2 speakers",
+                                    ["Average", "Total", "Speeches"], rows)
+    assert len(pages) == 1 and size_of(pages[0])[0] == tr.WIDTH * tr.SCALE
+    none = tr.render_speaker_break("Open", "Break", "x", [], [SpeakerRow(1, "A", "T", [])])           # no metric columns at all
+    assert len(none) == 1
+
+
+def test_speaker_break_of_100_rows_is_one_image():
+    from tabbycat_client import SpeakerRow
+    rows = [SpeakerRow(i, f"Speaker {i}", f"Team {i}", [("Total", str(400 - i))]) for i in range(1, 101)]
+    pages = tr.render_speaker_break("Open", "Break  ·  Top 100", "Overall", ["Total"], rows)
+    assert len(pages) == 1 and len(pages[0]) <= tr.MAX_BYTES
+
+
+def test_adjudicator_break_renders():
+    pages = tr.render_adjudicator_break("Open", ["Dr Chair", "পানেল ওয়ান", "🧑‍⚖️ Judge J"])
+    assert len(pages) == 1 and size_of(pages[0])[1] > 300

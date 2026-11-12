@@ -236,6 +236,66 @@ class BreakTeam:
     remark: str = ""
 
 
+@dataclass
+class SpeakerCategoryInfo:
+    name: str
+    slug: str
+
+
+@dataclass
+class SpeakerRow:
+    rank: int
+    name: str
+    team: str
+    metrics: list[tuple[str, str]]          # (label, formatted value), e.g. ("Total", "412.5")
+
+
+METRIC_LABELS = {"total": "Total", "average": "Average", "avg": "Average", "trimmed_mean": "Trimmed mean",
+                 "stdev": "Std dev", "count": "Speeches", "replies_avg": "Reply avg", "replies_stdev": "Reply std dev",
+                 "replies_count": "Replies"}
+MAX_METRIC_COLUMNS = 3
+MAX_TOP_SPEAKERS = 100
+
+
+def metric_label(slug: Any) -> str:
+    slug = str(slug or "").strip()
+    return METRIC_LABELS.get(slug.lower()) or slug.replace("_", " ").capitalize() or "Score"
+
+
+def format_metric(value: Any) -> str:
+    if value is None or value == "":
+        return "–"
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return clean_text(value) or "–"
+    return f"{num:.2f}".rstrip("0").rstrip(".")
+
+
+def _metrics_of(row: dict) -> list[tuple[str, Any]]:
+    """Standings metrics as [(slug, value)], whether Tabbycat sent a list of {metric, value} or a mapping."""
+    raw = row.get("metrics")
+    out: list[tuple[str, Any]] = []
+    if isinstance(raw, dict):
+        out = [(str(k), v) for k, v in raw.items()]
+    elif isinstance(raw, list):
+        for m in raw:
+            if isinstance(m, dict):
+                out.append((str(m.get("metric") or m.get("slug") or m.get("name") or ""), m.get("value")))
+    return out
+
+
+def _rank_of(value: Any) -> Optional[int]:
+    if isinstance(value, dict):
+        value = value.get("rank", value.get("value"))
+    if isinstance(value, (list, tuple)) and value:
+        value = value[0]
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 REMARKS = {"C": "capped", "I": "ineligible", "D": "different break", "d": "disqualified", "t": "lost coin toss", "w": "withdrawn"}
 
 
@@ -280,6 +340,8 @@ class TabbycatClient:
         self._session: Optional[aiohttp.ClientSession] = None
         self._sem = asyncio.Semaphore(4)
         self._names: Optional[dict[str, dict[str, str]]] = None
+        self._adj_breaking: list[str] = []
+        self._speakers: Optional[dict[str, tuple[str, str]]] = None
         self._host = urlparse(self.base).netloc
 
     # -- plumbing --------------------------------------------------------------
@@ -396,8 +458,13 @@ class TabbycatClient:
             if emoji and not EMOJI_RE.search(name):               # Tabbycat keeps the team emoji in its own field
                 name = f"{emoji} {name}"
             out["teams"][self._key(t.get("url"))] = name
+        breaking: list[str] = []
         for a in adjs if isinstance(adjs, list) else []:
-            out["adjs"][self._key(a.get("url"))] = clean_text(a.get("name") or "")
+            adj_name = clean_text(a.get("name") or "")
+            out["adjs"][self._key(a.get("url"))] = adj_name
+            if a.get("breaking") is True and adj_name:              # marked "breaking" on Tabbycat's Feedback page
+                breaking.append(adj_name)
+        self._adj_breaking = breaking
         for v in venues if isinstance(venues, list) else []:
             out["venues"][self._key(v.get("url"))] = clean_text(v.get("display_name") or v.get("name") or "")
         self._names = out
@@ -405,6 +472,7 @@ class TabbycatClient:
 
     def forget_names(self) -> None:
         self._names = None
+        self._speakers = None
 
     # -- rounds / motions ------------------------------------------------------
 
@@ -519,6 +587,67 @@ class TabbycatClient:
             teams.append(BreakTeam(rank=int(rank), name=names["teams"].get(self._key(b.get("team")), "TBA"),
                                    remark=REMARKS.get(remark, remark)))
         return sorted(teams, key=lambda t: t.rank)
+
+
+    @_safe_parse
+    async def breaking_adjudicators(self) -> list[str]:
+        """Adjudicators marked 'breaking' in Tabbycat, alphabetical. Costs no extra request: it comes from the
+        adjudicator list that names() already loads."""
+        await self.names()
+        return sorted(self._adj_breaking, key=natural_key)
+
+    @_safe_parse
+    async def speaker_categories(self) -> list[SpeakerCategoryInfo]:
+        data = await self._get(self.root + "/speaker-categories")
+        out = []
+        for c in data if isinstance(data, list) else []:
+            slug = str(c.get("slug") or "").strip()
+            if slug:
+                out.append(SpeakerCategoryInfo(name=clean_text(c.get("name") or slug), slug=slug))
+        return out
+
+    async def _speaker_names(self) -> dict[str, tuple[str, str]]:
+        """speaker hyperlink path -> (name, team hyperlink path); one request, kept until the next refresh."""
+        if self._speakers is None:
+            data = await self._get(self.root + "/speakers")
+            self._speakers = {self._key(sp.get("url")): (clean_text(sp.get("name") or ""), self._key(sp.get("team")))
+                              for sp in (data if isinstance(data, list) else []) if isinstance(sp, dict)}
+        return self._speakers
+
+    @_safe_parse
+    async def speaker_standings(self, category_slug: Optional[str] = None,
+                                top: int = 10) -> tuple[list[str], list[SpeakerRow]]:
+        """The top speakers (ties at the last place included), overall or for one speaker category.
+        Returns (metric column labels, rows)."""
+        from urllib.parse import quote
+        top = max(1, min(int(top), MAX_TOP_SPEAKERS))
+        path = self.root + "/speakers/standings"
+        if category_slug:
+            path += "?category=" + quote(category_slug, safe="")
+        data = await self._get(path)
+        if not isinstance(data, list):
+            raise TabbycatError("badresponse", "Unexpected speaker standings data from Tabbycat.")
+        speakers, names = await asyncio.gather(self._speaker_names(), self.names())
+        rows: list[tuple[int, int, dict]] = []
+        for idx, row in enumerate(r for r in data if isinstance(r, dict)):
+            rank = _rank_of(row.get("rank"))
+            rows.append((rank if rank is not None else idx + 1, idx, row))
+        rows.sort(key=lambda t: (t[0], t[1]))
+        out: list[SpeakerRow] = []
+        labels: list[str] = []
+        for rank, _, row in rows:
+            if rank > top or len(out) >= MAX_TOP_SPEAKERS:
+                break
+            name, team_key = speakers.get(self._key(row.get("speaker")), ("", ""))
+            name = name or clean_text(row.get("speaker_name") or row.get("name") or "") or "TBA"
+            team = names["teams"].get(team_key) or names["teams"].get(self._key(row.get("team")), "")
+            metrics = _metrics_of(row)[:MAX_METRIC_COLUMNS]
+            if not labels:
+                labels = [metric_label(slug) for slug, _ in metrics]
+            values = [format_metric(v) for _, v in metrics]
+            values += ["–"] * (len(labels) - len(values))
+            out.append(SpeakerRow(rank=rank, name=name, team=team, metrics=list(zip(labels, values[:len(labels)]))))
+        return labels, out
 
 
 # ── pure helpers (unit-tested) ────────────────────────────────────────────────

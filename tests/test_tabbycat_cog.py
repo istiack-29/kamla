@@ -150,6 +150,99 @@ async def test_each_kind_goes_only_to_its_own_channel(env):
         assert i.channel.sent == []
 
 
+# ── /break: team / speaker / adjudicator ─────────────────────────────────────
+
+async def break_names(env, guild, type_):
+    return [(c.name, c.value) for c in await choices(env, cog_mod.TabbycatCog._break_ac, guild, type=type_)]
+
+
+async def test_break_category_options_follow_the_chosen_type(env):
+    guild = FakeGuild()
+    await connect(env, guild)
+    assert await break_names(env, guild, "team") == [("Open", "Open")]
+    assert await break_names(env, guild, "speaker") == [("Overall (all speakers)", "all"), ("Novice", "novice"), ("ESL", "esl")]
+    assert await break_names(env, guild, "adjudicator") == [("Breaking adjudicators (2)", "all")]
+    hint = await break_names(env, guild, None)                                       # type not chosen yet
+    assert len(hint) == 1 and "type first" in hint[0][0] and hint[0][1] == "-"
+    filtered = await choices(env, cog_mod.TabbycatCog._break_ac, guild, "nov", type="speaker")
+    assert [c.value for c in filtered] == ["novice"]
+
+
+async def test_break_type_choices_are_the_three_kinds():
+    assert [(c.name, c.value) for c in cog_mod.BREAK_TYPES] == [
+        ("Team break", "team"), ("Speaker break (top speakers)", "speaker"), ("Adjudicator break", "adjudicator")]
+
+
+async def test_nothing_marked_breaking_shows_a_refresh_warning(env):
+    guild = FakeGuild()
+    await connect(env, guild)
+    env.cog._cache[guild.id].adj_breaking = 0
+    out = await break_names(env, guild, "adjudicator")
+    assert len(out) == 1 and "/refresh" in out[0][0] and out[0][1] == "-"
+
+
+async def test_speaker_break_posts_top_speakers_in_the_break_channel(env):
+    guild = FakeGuild()
+    await connect(env, guild)
+    i = interaction(member("CAP"), guild)
+    await env.cog.break_.callback(env.cog, i, "speaker", "all", 3)
+    chan = guild.channels_by["break"]
+    assert len(chan.sent) == 1 and chan.sent[0]["files"][0].filename == "break-speaker-overall-1.png"
+    for kind in ("draw", "motion", "result"):
+        assert guild.channels_by[kind].sent == []
+
+
+async def test_speaker_break_of_a_category_and_default_top(env):
+    guild = FakeGuild()
+    await connect(env, guild)
+    i = interaction(member("CAP"), guild)
+    await env.cog.break_.callback(env.cog, i, "speaker", "novice")
+    assert guild.channels_by["break"].sent[0]["files"][0].filename == "break-speaker-novice-1.png"
+    i = interaction(member("CAP"), guild)
+    await env.cog.break_.callback(env.cog, i, "speaker", "no-such-category", 5)       # unknown category → nothing posted
+    assert guild.channels_by["break"].sent == [] and "No break" in last_text(i)
+
+
+async def test_adjudicator_break_posts_the_breaking_adjudicators(env):
+    guild = FakeGuild()
+    await connect(env, guild)
+    i = interaction(member("ORG"), guild)
+    await env.cog.break_.callback(env.cog, i, "adjudicator", "all")
+    assert guild.channels_by["break"].sent[0]["files"][0].filename == "break-adjudicator-all-1.png"
+
+
+async def test_team_break_still_works_and_is_named_by_type(env):
+    guild = FakeGuild()
+    await connect(env, guild)
+    i = interaction(member("ORG"), guild)
+    await env.cog.break_.callback(env.cog, i, "team", "Open")
+    assert guild.channels_by["break"].sent[0]["files"][0].filename == "break-team-open-1.png"
+    i = interaction(member("ORG"), guild)
+    await env.cog.break_.callback(env.cog, i, "team", "Nope")
+    assert "No break" in last_text(i)
+
+
+async def test_break_for_everyone_else_is_refused(env):
+    guild = FakeGuild()
+    await connect(env, guild)
+    i = interaction(member("DEBATER"), guild)
+    await env.cog.break_.callback(env.cog, i, "speaker", "all", 10)
+    assert "Only CAP, ORG and TABBY" in last_text(i)
+    assert guild.channels_by["break"].sent == []
+
+
+async def test_a_tabbycat_error_while_reading_standings_is_reported(env, monkeypatch):
+    guild = FakeGuild()
+    await connect(env, guild)
+
+    async def boom(self, slug=None, top=10):
+        raise cog_mod.TabbycatError("auth", "Tabbycat refused the saved token.")
+    monkeypatch.setattr(cog_mod.TabbycatClient, "speaker_standings", boom)
+    i = interaction(member("CAP"), guild)
+    await env.cog.break_.callback(env.cog, i, "speaker", "all", 10)
+    assert "refused" in last_text(i) and guild.channels_by["break"].sent == []
+
+
 # ── permissions ───────────────────────────────────────────────────────────────
 
 def test_role_rules():
@@ -173,7 +266,7 @@ async def test_tab_command_is_for_tabby_only(env):
 
 async def test_other_commands_refuse_non_operators(env):
     cog = env.cog
-    for name, args in (("draw", (1,)), ("motion", (1,)), ("result", (1,)), ("break_", ("Open",)), ("refresh", ())):
+    for name, args in (("draw", (1,)), ("motion", (1,)), ("result", (1,)), ("break_", ("team", "Open")), ("refresh", ())):
         i = interaction(member("DEBATER"))
         await getattr(cog, name).callback(cog, i, *args)
         assert "CAP, ORG and TABBY" in last_text(i)
@@ -231,8 +324,9 @@ async def test_status_never_shows_the_token(env):
 
 # ── options (autocomplete) ────────────────────────────────────────────────────
 
-async def choices(env, fn, guild, current=""):
+async def choices(env, fn, guild, current="", **namespace):
     i = interaction(member("CAP"), guild)
+    i.namespace = types.SimpleNamespace(**namespace)             # the options already filled in, e.g. type="speaker"
     return await fn(env.cog, i, current)
 
 
@@ -252,7 +346,7 @@ async def test_autocomplete_states(env):
     assert [c.name for c in motion[:-1]] == ["Round 1"] and "/refresh" in motion[-1].name
     result = await choices(env, cog_mod.TabbycatCog._result_ac, guild)
     assert [c.name for c in result[:-1]] == ["Round 1"]
-    assert [c.name for c in await choices(env, cog_mod.TabbycatCog._break_ac, guild)] == ["Open"]
+    assert [c.name for c in await choices(env, cog_mod.TabbycatCog._break_ac, guild, type="team")] == ["Open"]
     assert [c.name for c in (await choices(env, cog_mod.TabbycatCog._draw_ac, guild, "3"))[:-1]] == ["Round 3"]
 
 
@@ -283,7 +377,7 @@ async def test_dropdown_reloads_stale_data_but_not_fresh_data(env, monkeypatch):
     assert len(calls) == 1 and out[0].name == "Round 1"                # stale → re-read, the released round shows up
     for fn in (cog_mod.TabbycatCog._draw_ac, cog_mod.TabbycatCog._result_ac, cog_mod.TabbycatCog._break_ac):
         env.cog._cache[guild.id].fetched -= cog_mod.AUTO_TTL + 1       # every dropdown refreshes, not only /motion and /draw
-        await choices(env, fn, guild)
+        await choices(env, fn, guild, type="team")
     assert len(calls) == 4
 
 
@@ -359,7 +453,7 @@ async def test_each_command_goes_to_its_own_channel(env):
     guild = FakeGuild()
     await connect(env, guild)
     cog = env.cog
-    plan = [("result", "result", (1,)), ("break_", "break", ("Open",))]
+    plan = [("result", "result", (1,)), ("break_", "break", ("team", "Open"))]
     for method, kind, args in plan:
         i = interaction(member("ORG"), guild)
         await getattr(cog, method).callback(cog, i, *args)

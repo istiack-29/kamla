@@ -54,7 +54,7 @@ def build_app(token="secret-token", host_override=None):
     @routes.get(root + "/adjudicators")
     async def adjs(request):
         await guard(request)
-        return web.json_response([{"url": u(request, f"/adjudicators/{i}"), "name": n}
+        return web.json_response([{"url": u(request, f"/adjudicators/{i}"), "name": n, "breaking": n != "Trainee T"}
                                   for i, n in enumerate(["Dr Chair", "Panel One", "Trainee T"], 1)])
 
     @routes.get(root + "/venues")
@@ -108,6 +108,31 @@ def build_app(token="secret-token", host_override=None):
             {"team": u(request, "/teams/1"), "rank": 1, "break_rank": 1, "remark": ""},
             {"team": u(request, "/teams/3"), "rank": 3, "break_rank": None, "remark": ""},
             {"team": u(request, "/teams/4"), "rank": 4, "break_rank": 3, "remark": "C"}])
+
+    @routes.get(root + "/speaker-categories")
+    async def speaker_cats(request):
+        await guard(request)
+        return web.json_response([{"url": u(request, "/speaker-categories/1"), "name": "Novice", "slug": "novice"},
+                                  {"url": u(request, "/speaker-categories/2"), "name": "ESL", "slug": "esl"}])
+
+    @routes.get(root + "/speakers")
+    async def speakers(request):
+        await guard(request)
+        people = [("Ann", 1), ("Bo", 2), ("সুমি", 3), ("Dee", 4), ("Eli", 1)]
+        return web.json_response([{"url": u(request, f"/speakers/{i}"), "name": n, "team": u(request, f"/teams/{t}")}
+                                  for i, (n, t) in enumerate(people, 1)])
+
+    @routes.get(root + "/speakers/standings")
+    async def speaker_standings(request):
+        await guard(request)
+        state["standings_queries"] = state.get("standings_queries", []) + [dict(request.query)]
+        rows = [(1, 3, 83.5, 417.5), (2, 1, 82.0, 410.0), (3, 2, 80.25, 401.25), (3, 5, 80.25, 401.25), (5, 4, 79.0, 395.0)]
+        if request.query.get("category") == "novice":
+            rows = [r for r in rows if r[1] in (4, 5)]
+        return web.json_response([
+            {"speaker": u(request, f"/speakers/{sp}"), "rank": rank,
+             "metrics": [{"metric": "average", "value": avg}, {"metric": "total", "value": tot}, {"metric": "count", "value": 5}]}
+            for rank, sp, avg, tot in rows])
 
     @routes.get("/redirect/api/v1/tournaments/" + SLUG)
     async def redir(request):
@@ -229,6 +254,65 @@ async def test_break(server):
     teams = await c.breaking_teams(cats[0])
     assert [(t.rank, t.name) for t in teams] == [(1, "Alpha"), (2, "Beta")]   # capped / not-breaking excluded
     await c.close()
+
+
+async def test_breaking_adjudicators_come_from_the_adjudicator_list_without_an_extra_request(server):
+    srv, state = server
+    c = client_for(srv)
+    assert await c.breaking_adjudicators() == ["Dr Chair", "Panel One"]          # "Trainee T" is not marked breaking
+    hits = state["hits"].count("/api/v1/tournaments/kijani/adjudicators")
+    await c.breaking_adjudicators()
+    assert state["hits"].count("/api/v1/tournaments/kijani/adjudicators") == hits == 1
+    await c.close()
+
+
+async def test_speaker_categories(server):
+    srv, _ = server
+    c = client_for(srv)
+    cats = await c.speaker_categories()
+    assert [(x.name, x.slug) for x in cats] == [("Novice", "novice"), ("ESL", "esl")]
+    await c.close()
+
+
+async def test_top_speakers_overall_include_ties_and_show_the_standings_metrics(server):
+    srv, state = server
+    c = client_for(srv)
+    labels, rows = await c.speaker_standings(None, 3)
+    assert labels == ["Average", "Total", "Speeches"]
+    assert [(r.rank, r.name) for r in rows] == [(1, "সুমি"), (2, "Ann"), (3, "Bo"), (3, "Eli")]   # both rank-3 speakers
+    assert rows[0].team == "বাংলা দল" and rows[1].team == "Alpha"
+    assert rows[0].metrics == [("Average", "83.5"), ("Total", "417.5"), ("Speeches", "5")]
+    assert rows[2].metrics[0] == ("Average", "80.25")
+    assert state["standings_queries"][-1] == {}                                  # no category filter for "overall"
+    await c.close()
+
+
+async def test_top_n_is_respected_and_capped(server):
+    srv, _ = server
+    c = client_for(srv)
+    assert len((await c.speaker_standings(None, 1))[1]) == 1
+    assert len((await c.speaker_standings(None, 1000))[1]) == 5                   # only 5 exist; the cap is 100
+    await c.close()
+
+
+async def test_top_speakers_of_one_category_sends_the_category(server):
+    srv, state = server
+    c = client_for(srv)
+    _, rows = await c.speaker_standings("novice", 10)
+    assert state["standings_queries"][-1] == {"category": "novice"}
+    assert [(r.rank, r.name) for r in rows] == [(3, "Eli"), (5, "Dee")]
+    await c.close()
+
+
+def test_standings_shapes_are_read_tolerantly():
+    assert tc._metrics_of({"metrics": [{"metric": "total", "value": 1}, {"metric": "average", "value": 2}]}) == [("total", 1), ("average", 2)]
+    assert tc._metrics_of({"metrics": {"total": 5}}) == [("total", 5)]
+    assert tc._metrics_of({}) == [] and tc._metrics_of({"metrics": "junk"}) == []
+    assert tc._rank_of(4) == 4 and tc._rank_of({"rank": 7}) == 7 and tc._rank_of([2, True]) == 2
+    assert tc._rank_of(None) is None and tc._rank_of("x") is None
+    assert tc.format_metric(83.5) == "83.5" and tc.format_metric(80.0) == "80" and tc.format_metric(79.126) == "79.13"
+    assert tc.format_metric(None) == "–" and tc.format_metric("n/a") == "n/a"
+    assert tc.metric_label("trimmed_mean") == "Trimmed mean" and tc.metric_label("odd_metric") == "Odd metric"
 
 
 # ── failure modes ─────────────────────────────────────────────────────────────

@@ -23,6 +23,7 @@ administrators), never in logs and never shown back. Old copies of the config ar
 import asyncio
 import io
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -34,7 +35,7 @@ from discord.ext import commands
 import tab_render
 from config import config_manager
 from ratelimit import describe, notify
-from tabbycat_client import (BreakCategoryInfo, RoundInfo, TabbycatClient, TabbycatError, validate_base_url,
+from tabbycat_client import (BreakCategoryInfo, RoundInfo, SpeakerCategoryInfo, TabbycatClient, TabbycatError, validate_base_url,
                              validate_slug)
 
 log = logging.getLogger("kamla.tabbycat")
@@ -58,6 +59,12 @@ CHANNELS = {
     "break": "🎓︱break",
 }
 NONE_VALUE = -1
+BREAK_TYPES = [app_commands.Choice(name="Team break", value="team"),
+               app_commands.Choice(name="Speaker break (top speakers)", value="speaker"),
+               app_commands.Choice(name="Adjudicator break", value="adjudicator")]
+SPEAKER_ALL = "all"         # category value: overall speaker standings
+ADJ_ALL = "all"
+
 
 
 @dataclass
@@ -65,6 +72,8 @@ class Cache:
     tournament: str
     rounds: list[RoundInfo]
     breaks: list[tuple[BreakCategoryInfo, int]] = field(default_factory=list)   # (category, breaking teams)
+    speaker_cats: list[SpeakerCategoryInfo] = field(default_factory=list)
+    adj_breaking: int = 0                                                       # adjudicators marked "breaking"
     fetched: float = field(default_factory=time.monotonic)
 
     def stale(self) -> bool:
@@ -81,8 +90,9 @@ class Cache:
             rs = self.available_rounds(kind)
             return ", ".join(r.name for r in rs) if rs else "none yet"
         brk = ", ".join(c.name for c, n in self.breaks if n) or "none yet"
+        extra = f"\n**Adjudicators breaking:** {self.adj_breaking}" if self.adj_breaking else ""
         return (f"**Draw:** {seqs('draw')}\n**Motions:** {seqs('motion')}\n"
-                f"**Results:** {seqs('result')}\n**Break:** {brk}")
+                f"**Results:** {seqs('result')}\n**Break:** {brk}{extra}")
 
 
 def _member_roles(member) -> set[str]:
@@ -348,8 +358,16 @@ class TabbycatCog(commands.Cog):
                     log.info("Break data not accessible in guild %s (%s).", guild.id, exc.kind)
                 else:
                     raise
+            speaker_cats, adj_breaking = [], 0
+            try:
+                speaker_cats = await client.speaker_categories()
+                adj_breaking = len(await client.breaking_adjudicators())
+            except TabbycatError as exc:
+                if exc.kind not in ("auth", "notfound"):
+                    raise
+                log.info("Speaker/adjudicator break data not accessible in guild %s (%s).", guild.id, exc.kind)
             cache = Cache(tournament=tournament.get("short_name") or tournament.get("name") or "Tournament",
-                          rounds=rounds, breaks=breaks)
+                          rounds=rounds, breaks=breaks, speaker_cats=speaker_cats, adj_breaking=adj_breaking)
             self._cache[guild.id] = cache
             return cache
 
@@ -542,17 +560,30 @@ class TabbycatCog(commands.Cog):
         return await self._round_choices(i, current, "result")
 
     async def _break_ac(self, interaction: discord.Interaction, current: str):
+        """Options for category:, depending on the type: that was chosen first."""
         if not await self._tab_config(interaction.guild):
             return [app_commands.Choice(name="Not connected — a TABBY must run /tab", value="-")]
         cache = await self._autocomplete_cache(interaction.guild)
         if cache is None:
             return [app_commands.Choice(name="⚠️ Could not load from Tabbycat — please /refresh to get latest update!",
                                         value="-")]
-        cats = [c for c, n in cache.breaks if n and current.lower() in c.name.lower()]
-        if not cats:
-            return [] if any(n for _, n in cache.breaks) else [
-                app_commands.Choice(name="⚠️ No break released yet — please /refresh to get latest update!", value="-")]
-        return [app_commands.Choice(name=c.name[:100], value=c.name[:100]) for c in cats[:25]]
+        kind = getattr(interaction.namespace, "type", None)
+        needle = (current or "").lower()
+        refresh = "please /refresh to get latest update!"
+        if kind == "speaker":
+            options = [("Overall (all speakers)", SPEAKER_ALL)] + [(c.name, c.slug) for c in cache.speaker_cats]
+            return [app_commands.Choice(name=n[:100], value=v[:100]) for n, v in options if needle in n.lower()][:25]
+        if kind == "adjudicator":
+            if cache.adj_breaking:
+                return [app_commands.Choice(name=f"Breaking adjudicators ({cache.adj_breaking})", value=ADJ_ALL)]
+            return [app_commands.Choice(name=f"⚠️ No adjudicators marked as breaking yet — {refresh}", value="-")]
+        if kind == "team":
+            cats = [c for c, n in cache.breaks if n and needle in c.name.lower()]
+            if not cats:
+                return [] if any(n for _, n in cache.breaks) else [
+                    app_commands.Choice(name=f"⚠️ No team break released yet — {refresh}", value="-")]
+            return [app_commands.Choice(name=c.name[:100], value=c.name[:100]) for c in cats[:25]]
+        return [app_commands.Choice(name="⬆️ Choose the type first (team / speaker / adjudicator)", value="-")]
 
     # ── shared command plumbing ───────────────────────────────────────────────
 
@@ -718,25 +749,27 @@ class TabbycatCog(commands.Cog):
             return await asyncio.to_thread(tab_render.render_results, cache.tournament, rnd, results)
         await self._run(interaction, "result", round_, build)
 
-    @app_commands.command(name="break", description="Post a break as an image.")
-    @app_commands.describe(category="Break category (only categories with a break are listed)")
+    @app_commands.command(name="break", description="Post a break (teams, top speakers or adjudicators) as an image.")
+    @app_commands.describe(type_="What to post: team break, speaker break (top speakers) or adjudicator break",
+                           category="Depends on the type (the list only shows what is available)",
+                           top="Speaker break only: how many top speakers (default 10)")
+    @app_commands.rename(type_="type")
+    @app_commands.choices(type_=BREAK_TYPES)
     @app_commands.autocomplete(category=_break_ac)
     @app_commands.guild_only()
-    async def break_(self, interaction: discord.Interaction, category: str):
+    async def break_(self, interaction: discord.Interaction, type_: str, category: str,
+                     top: app_commands.Range[int, 1, 100] = 10):
         prepared = await self._prepare(interaction)
         if prepared is None:
             return
         client, cache = prepared
-        entry = next(((c, n) for c, n in cache.breaks if n and c.name == category), None)
-        if entry is None:
-            await self._none_available(interaction, "break")
-            return
         try:
-            teams = await client.breaking_teams(entry[0])
-            if not teams:
-                await self._none_available(interaction, "break")
-                return
-            pages = await asyncio.to_thread(tab_render.render_break, cache.tournament, entry[0], teams)
+            if type_ == "speaker":
+                pages, slug = await self._speaker_break_pages(client, cache, category, top)
+            elif type_ == "adjudicator":
+                pages, slug = await self._adjudicator_break_pages(client, cache, category)
+            else:
+                pages, slug = await self._team_break_pages(client, cache, category)
         except TabbycatError as exc:
             await interaction.followup.send(f"❌ {exc.message}", ephemeral=True)
             return
@@ -744,8 +777,46 @@ class TabbycatCog(commands.Cog):
             log.exception("Rendering /break failed")
             await interaction.followup.send("❌ Could not build the image. Please try again.", ephemeral=True)
             return
+        if not pages:
+            await self._none_available(interaction, "break")
+            return
         await self._post(interaction, "break",
-                         [(f"break-{category.lower().replace(' ', '-')}-{i}.png", png) for i, png in enumerate(pages, 1)])
+                         [(f"break-{type_}-{slug}-{i}.png", png) for i, png in enumerate(pages, 1)])
+
+    @staticmethod
+    def _slug(text: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-") or "all"
+
+    async def _team_break_pages(self, client, cache: Cache, category: str):
+        entry = next(((c, n) for c, n in cache.breaks if n and c.name == category), None)
+        if entry is None:
+            return [], ""
+        teams = await client.breaking_teams(entry[0])
+        if not teams:
+            return [], ""
+        return await asyncio.to_thread(tab_render.render_break, cache.tournament, entry[0], teams), self._slug(category)
+
+    async def _speaker_break_pages(self, client, cache: Cache, category: str, top: int):
+        if category == SPEAKER_ALL:
+            slug, label = None, "Overall"
+        else:
+            cat = next((c for c in cache.speaker_cats if c.slug == category), None)
+            if cat is None:
+                return [], ""
+            slug, label = cat.slug, cat.name
+        labels, rows = await client.speaker_standings(slug, top)
+        if not rows:
+            return [], ""
+        title = f"Break  ·  Top {top} Speakers" if slug is None else f"Break  ·  Top {top} Speakers  ·  {label}"
+        pages = await asyncio.to_thread(tab_render.render_speaker_break, cache.tournament, title,
+                                        f"{label}  ·  {len(rows)} speakers", labels, rows)
+        return pages, self._slug(label)
+
+    async def _adjudicator_break_pages(self, client, cache: Cache, category: str):
+        names = await client.breaking_adjudicators()
+        if not names or category != ADJ_ALL:
+            return [], ""
+        return await asyncio.to_thread(tab_render.render_adjudicator_break, cache.tournament, names), "all"
 
 
 async def setup(bot: commands.Bot):

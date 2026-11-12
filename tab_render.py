@@ -32,7 +32,7 @@ from typing import Callable, Optional
 from PIL import Image, ImageDraw, ImageFont, features
 
 from tabbycat_client import (EMOJI_RE, BreakCategoryInfo, BreakTeam, DebateInfo, MotionInfo, ResultInfo, RoundInfo,
-                             strip_emoji)
+                             SpeakerRow, strip_emoji)
 
 log = logging.getLogger("kamla.render")
 
@@ -441,7 +441,10 @@ def render_table(kicker: str, title: str, subtitle: str, columns: list[Column], 
             x = 0
             for col, w in zip(columns, widths):                       # column headings
                 card.rect([x, 0, x + w, COLHEAD_H], fill=col.color)
-                card.text((x + PAD_X, (COLHEAD_H - 34) // 2 - 2), col.header, 30, "#FFFFFF", bold=True)
+                size = 30
+                while size > 18 and text_width(col.header, size) > w - 2 * PAD_X:      # a heading must never be cut off
+                    size -= 1
+                card.text((x + PAD_X, (COLHEAD_H - size - 4) // 2 - 2), col.header, size, "#FFFFFF", bold=True)
                 x += w
 
             y = COLHEAD_H
@@ -554,6 +557,26 @@ def render_break(tournament: str, category: BreakCategoryInfo, teams: list[Break
             for t in teams]
     size = f"top {category.break_size}  ·  " if category.break_size else ""
     return render_table(tournament or "Tournament", f"Break  ·  {category.name}", f"{size}{len(teams)} teams", columns, rows)
+
+
+def render_speaker_break(tournament: str, title: str, subtitle: str, labels: list[str],
+                         rows: list[SpeakerRow]) -> list[bytes]:
+    """Top speakers: Rank, Speaker, Team and the standings' own metric columns (Total, Average ...)."""
+    columns = [Column("Rank", 1.0, GOLD), Column("Speaker", 3.8), Column("Team", 3.0)]
+    columns += [Column(label, 1.7) for label in labels]
+    body = []
+    for r in rows:
+        line = [cell(str(r.rank), 30, GOLD, bold=True), cell(r.name, 30, TEXT, bold=r.rank <= 3),
+                cell(r.team or "", 26, MUTED)]
+        line += [cell(value, 28, TEXT) for _, value in r.metrics]
+        body.append(line)
+    return render_table(tournament or "Tournament", title, subtitle, columns, body)
+
+
+def render_adjudicator_break(tournament: str, names: list[str]) -> list[bytes]:
+    columns = [Column("#", 0.8, GOLD), Column("Adjudicator", 6.0)]
+    rows = [[cell(str(i), 30, GOLD, bold=True), cell(n, 30, TEXT)] for i, n in enumerate(names, 1)]
+    return render_table(tournament or "Tournament", "Break  ·  Adjudicators", f"{len(names)} adjudicators", columns, rows)
 
 
 # ── motions & info slides ─────────────────────────────────────────────────────
