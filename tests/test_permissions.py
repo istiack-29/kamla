@@ -152,3 +152,51 @@ async def test_slash_commands_are_not_hidden_behind_the_administrator_gate(tmp_p
             assert bot.tree.get_command(name).default_permissions is None, name
     finally:
         await bot.close()
+
+
+# ── /st and /rebuild: the owner is never refused, and a bot that is not a real member says so ──
+
+def _interaction(*, perms=None, owner_id=None, roles=(), user_id=1, in_guild=True):
+    guild = types.SimpleNamespace(id=7, owner_id=owner_id)
+    user = types.SimpleNamespace(id=user_id, roles=[types.SimpleNamespace(name=r) for r in roles],
+                                 guild_permissions=discord.Permissions.none())      # what a half-cached guild gives
+    i = mock.MagicMock(guild=guild, user=user, guild_id=7, application_id=4242)
+    i.permissions = perms if perms is not None else discord.Permissions.none()
+    i.client.get_guild.return_value = object() if in_guild else None
+    i.response.send_message = mock.AsyncMock()
+    return i
+
+
+def test_the_server_owner_and_administrators_are_organisers_even_when_the_guild_is_half_cached():
+    assert setup_cog.is_organiser(_interaction(perms=discord.Permissions.all()))               # Discord says: all permissions
+    assert setup_cog.is_organiser(_interaction(perms=discord.Permissions(administrator=True)))
+    assert setup_cog.is_organiser(_interaction(owner_id=1))                                    # owner id known
+    assert setup_cog.is_organiser(_interaction(roles=["TABBY"]))
+    assert setup_cog.is_organiser(_interaction(roles=["CAP"]))
+
+
+def test_strangers_are_not_organisers():
+    assert not setup_cog.is_organiser(_interaction(roles=["DEBATER"]))
+    assert not setup_cog.is_organiser(_interaction(perms=discord.Permissions(manage_messages=True), owner_id=99))
+    assert not setup_cog.is_organiser(_interaction(roles=[], owner_id=None))
+
+
+async def test_st_and_rebuild_explain_a_missing_bot_membership_with_a_working_invite_link():
+    cog = setup_cog.SetupCog(bot=None)
+    for call in ("st", "rebuild"):
+        i = _interaction(perms=discord.Permissions.all(), in_guild=False)
+        if call == "st":
+            await cog.st.callback(cog, i, types.SimpleNamespace(value="ap"), 5, "T", types.SimpleNamespace(value="ORG"))
+        else:
+            await cog.rebuild.callback(cog, i)
+        text = i.response.send_message.await_args.args[0]
+        assert "not a real member" in text and "slash commands only" in text
+        assert "client_id=4242" in text and "scope=bot" in text and "guild_id=7" in text
+        assert i.response.send_message.await_args.kwargs["ephemeral"] is True
+
+
+async def test_rebuild_still_refuses_strangers_when_the_bot_is_a_member():
+    cog = setup_cog.SetupCog(bot=None)
+    i = _interaction(roles=["DEBATER"])
+    await cog.rebuild.callback(cog, i)
+    assert "need an admin role" in i.response.send_message.await_args.args[0]

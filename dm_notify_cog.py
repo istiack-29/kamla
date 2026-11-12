@@ -112,6 +112,10 @@ class DMNotifyCog(commands.Cog):
                     break
         except discord.Forbidden:
             pass
+        except discord.NotFound:
+            return          # 404 Unknown Guild: KAMLA is no longer in that server (removed / server deleted) — nothing to do
+        except discord.HTTPException:
+            pass            # any other Discord hiccup: fall back to the plain "left" message
 
         if action == "kicked":
             embed = discord.Embed(
