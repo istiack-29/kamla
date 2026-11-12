@@ -139,6 +139,20 @@ class KamlaBot(commands.Bot):
         self._ready_logged = True
         keep_alive_mod.set_status("connected")
         log.info("Ready — logged in as %s (ID: %s) in %d guild(s).", self.user, self.user.id, len(self.guilds))
+        asyncio.create_task(self._protect_tab_channels_everywhere())
+
+    async def _protect_tab_channels_everywhere(self) -> None:
+        """Startup sweep: matchup/motion/ballot/break deleted while KAMLA was offline come back, and older
+        servers get the delete/rename protection. One guild at a time, errors never stop the sweep."""
+        from server_builder import protect_tab_channels
+        for guild in list(self.guilds):
+            try:
+                restored = await protect_tab_channels(guild)
+                if restored:
+                    log.info("Restored %d missing tournament channel(s) in guild %s.", restored, guild.id)
+            except Exception as e:  # noqa: BLE001
+                log.warning("Tournament-channel check failed in guild %s: %s", guild.id, describe(e))
+            await asyncio.sleep(1)
 
     async def on_resumed(self) -> None:
         log.info("Gateway session resumed.")
@@ -323,6 +337,17 @@ class KamlaBot(commands.Bot):
                 guild, channel.name, is_category, parent_category_name=parent
             )
         )
+
+    async def on_guild_channel_update(self, before: discord.abc.GuildChannel, after: discord.abc.GuildChannel) -> None:
+        """matchup / motion / ballot / break must keep their names (KAMLA posts by name): rename them back."""
+        from server_builder import TAB_CHANNELS, _building_guilds
+        if (before.name in TAB_CHANNELS and after.name != before.name and not isinstance(after, (discord.VoiceChannel, discord.CategoryChannel))
+                and after.guild.id not in _building_guilds):
+            try:
+                await after.edit(name=before.name, reason="KAMLA — protected channel, name restored")
+                log.info("Renamed #%s back to #%s in guild %s.", after.name, before.name, after.guild.id)
+            except Exception as e:  # noqa: BLE001
+                log.warning("Could not rename #%s back in guild %s: %s", after.name, after.guild.id, describe(e))
 
     async def on_member_remove(self, member: discord.Member) -> None:
         # Live member count in the webhook embed (debounced).

@@ -582,16 +582,37 @@ class TabbycatCog(commands.Cog):
             return None
         return client, cache
 
-    async def _post(self, interaction: discord.Interaction, kind: str, files: list[tuple[str, bytes]]) -> None:
+    async def _tab_channel(self, guild: discord.Guild, kind: str) -> Optional[discord.TextChannel]:
+        """The channel for this kind of output. If it is missing KAMLA recreates it first; it is never swapped
+        for some other channel."""
+        name = CHANNELS[kind]
+        channel = discord.utils.get(guild.text_channels, name=name)
+        if channel is None:
+            try:
+                from server_builder import protect_tab_channels
+                await protect_tab_channels(guild)
+            except Exception as e:  # noqa: BLE001
+                log.warning("Could not restore #%s in guild %s: %s", name, guild.id, describe(e))
+            channel = discord.utils.get(guild.text_channels, name=name)
+        return channel
+
+    async def _post(self, interaction: discord.Interaction, kind: str, files: list[tuple[str, bytes]]) -> bool:
+        """Post the images in THEIR channel (matchup / motion / ballot / break). Returns True when posted."""
         guild = interaction.guild
-        channel = discord.utils.get(guild.text_channels, name=CHANNELS[kind]) or interaction.channel
+        channel = await self._tab_channel(guild, kind)
+        if channel is None:
+            await interaction.followup.send(
+                f"❌ The channel **#{CHANNELS[kind]}** is missing and KAMLA could not recreate it, so nothing was "
+                "posted. Check that KAMLA has the *Manage Channels* permission, then try again.", ephemeral=True)
+            return False
         for start in range(0, len(files), MAX_FILES_PER_MESSAGE):
             chunk = files[start:start + MAX_FILES_PER_MESSAGE]
             await notify.run(
                 lambda c=chunk: channel.send(files=[discord.File(io.BytesIO(data), filename=name) for name, data in c]),
                 label=f"tab-{kind}")
-        where = channel.mention if hasattr(channel, "mention") else "this channel"
+        where = channel.mention if hasattr(channel, "mention") else f"#{CHANNELS[kind]}"
         await interaction.followup.send(f"✅ Posted in {where}.", ephemeral=True)
+        return True
 
     @staticmethod
     def _pick_round(cache: Cache, kind: str, seq: int) -> Optional[RoundInfo]:
@@ -681,8 +702,7 @@ class TabbycatCog(commands.Cog):
             await self._none_available(interaction, "motion", rnd)
             return False
         slug = rnd.name.lower().replace(" ", "-")
-        await self._post(interaction, "motion", [(f"{prefix}-{slug}-{n}.png", png) for n, png in zip(numbers, pages)])
-        return True
+        return await self._post(interaction, "motion", [(f"{prefix}-{slug}-{n}.png", png) for n, png in zip(numbers, pages)])
 
     @app_commands.command(name="result", description="Post a round's results as an image.")
     @app_commands.describe(round_="Round (only rounds with results are listed)")

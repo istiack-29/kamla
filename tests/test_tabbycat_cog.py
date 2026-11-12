@@ -109,6 +109,47 @@ async def test_connect_has_no_warning_when_saved(env):
     assert "not be saved" not in i.followup.send.await_args.kwargs["embed"].description
 
 
+# ── output always lands in ITS channel, never somewhere else ─────────────────
+
+async def test_missing_channel_is_restored_before_posting(env, monkeypatch):
+    guild = FakeGuild()
+    i = interaction(member("CAP"), guild)
+    guild.text_channels = [c for c in guild.text_channels if c.name != "🎓︱motion"]       # someone deleted it
+    revived = Chan("🎓︱motion")
+
+    async def fake_protect(g):
+        g.text_channels.append(revived)
+        return 1
+    import server_builder
+    monkeypatch.setattr(server_builder, "protect_tab_channels", fake_protect)
+    assert await env.cog._post(i, "motion", [("a.png", b"x")]) is True
+    assert len(revived.sent) == 1 and i.channel.sent == []              # in the motion channel, not where the command ran
+
+
+async def test_if_the_channel_cannot_be_restored_nothing_is_posted_elsewhere(env, monkeypatch):
+    guild = FakeGuild()
+    i = interaction(member("CAP"), guild)
+    guild.text_channels = [c for c in guild.text_channels if c.name != "🎓︱matchup"]
+
+    async def fail(g):
+        raise RuntimeError("no permission")
+    import server_builder
+    monkeypatch.setattr(server_builder, "protect_tab_channels", fail)
+    assert await env.cog._post(i, "draw", [("a.png", b"x")]) is False
+    assert i.channel.sent == [] and all(c.sent == [] for c in guild.text_channels)
+    assert "missing" in last_text(i) and "Manage Channels" in last_text(i)
+
+
+async def test_each_kind_goes_only_to_its_own_channel(env):
+    guild = FakeGuild()
+    for kind in ("draw", "motion", "result", "break"):
+        i = interaction(member("CAP"), guild)
+        assert await env.cog._post(i, kind, [("a.png", b"x")]) is True
+        for k, chan in guild.channels_by.items():
+            assert len(chan.sent) == (1 if k == kind else 0), (kind, k)
+        assert i.channel.sent == []
+
+
 # ── permissions ───────────────────────────────────────────────────────────────
 
 def test_role_rules():

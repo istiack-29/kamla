@@ -59,7 +59,17 @@ class FakeChannel:
         for m in list(reversed(self.messages))[:limit]:
             yield m
 
+    def overwrites_for(self, target):
+        got = self.overwrites.get(target)
+        return discord.PermissionOverwrite.from_pair(*got.pair()) if got is not None else discord.PermissionOverwrite()
+
+    async def set_permissions(self, target, overwrite=None, reason=None, **kw):
+        self.overwrites[target] = overwrite
+        self.guild.edits += 1
+
     async def edit(self, **kw):
+        if "name" in kw:
+            self.name = kw["name"]
         if "overwrites" in kw:
             self.overwrites = dict(kw["overwrites"])
         if "user_limit" in kw:

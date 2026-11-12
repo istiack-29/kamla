@@ -485,9 +485,11 @@ async def _forbid_member_invites(guild: discord.Guild, report: BuildReport) -> N
 def _bot_ow(guild):
     # create_instant_invite: members cannot invite (see _forbid_member_invites), but KAMLA
     # itself must still be able to create the role-granting invite links.
+    # manage_channels: KAMLA itself must be able to edit its own channels (slowmode, rename-back) even though
+    # the announcement channels deny it to @everyone (see _build_announce_overwrites).
     return _allow("view_channel", "send_messages", "read_message_history",
                   "manage_messages", "embed_links", "attach_files",
-                  "connect", "speak", "move_members", "create_instant_invite")
+                  "connect", "speak", "move_members", "create_instant_invite", "manage_channels")
 
 
 def _build_orgcom_overwrites(guild, roles):
@@ -523,7 +525,9 @@ def _build_all_role_overwrites(guild, roles, send=True):
 
 def _build_announce_overwrites(guild, roles):
     ow = {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        # manage_channels=False: even if a role is later given Manage Channels, nobody but a server administrator
+        # can delete or rename these channels (an administrator is handled by the restore / rename-back guards).
+        guild.default_role: discord.PermissionOverwrite(view_channel=False, manage_channels=False),
         guild.me: _bot_ow(guild),
     }
     for rn in KAMLA_ROLE_NAMES:
@@ -1407,6 +1411,39 @@ def _category_overwrites(guild: discord.Guild, roles: dict, cat_name: str) -> di
     elif cat_name == "ℹ️︱INFORMATION":
         return _build_all_role_overwrites(guild, roles, send=False)
     return {}
+
+
+GRAND_AUDITORIUM = "🏟️︱GRAND AUDITORIUM"
+# The channels KAMLA's Tabbycat commands post into. Nobody may delete or rename them.
+TAB_CHANNELS = ("🎓︱matchup", "🎓︱motion", "🎓︱ballot", "🎓︱break")
+
+
+async def protect_tab_channels(guild: discord.Guild) -> int:
+    """Make sure matchup / motion / ballot / break exist in GRAND AUDITORIUM and cannot be deleted or renamed
+    by normal roles. Missing ones are recreated (e.g. deleted while KAMLA was offline); existing ones get the
+    manage_channels deny for @everyone and an allow for KAMLA if they predate that rule. Idempotent and cheap:
+    no request is made for a channel that is already right. Returns how many channels were restored."""
+    cat = discord.utils.get(guild.categories, name=GRAND_AUDITORIUM)
+    if cat is None or guild.id in _building_guilds:
+        return 0
+    restored = 0
+    for name in TAB_CHANNELS:
+        ch = discord.utils.get(cat.text_channels, name=name)
+        if ch is None:
+            if await restore_if_protected(guild, name, False, parent_category_name=GRAND_AUDITORIUM):
+                restored += 1
+            continue
+        try:
+            for target, want, attr in ((guild.default_role, False, "manage_channels"), (guild.me, True, "manage_channels")):
+                current = ch.overwrites_for(target)
+                if getattr(current, attr) is want:
+                    continue
+                setattr(current, attr, want)
+                await bulk.best_effort(lambda t=target, c=current: ch.set_permissions(t, overwrite=c, reason="KAMLA — protected channel"),
+                                       label=f"protect {name}")
+        except Exception as e:  # noqa: BLE001
+            log.warning("Could not harden #%s in guild %s: %s", name, guild.id, describe(e))
+    return restored
 
 
 def _channel_overwrites(guild: discord.Guild, roles: dict, cat_name: str, ch_name: str) -> dict:
