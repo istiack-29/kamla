@@ -9,7 +9,6 @@ toss_cog.py — Coin toss feature for KAMLA.
 No database is used; results are ephemeral and not stored anywhere.
 """
 
-import asyncio
 import random
 from datetime import datetime, timezone
 

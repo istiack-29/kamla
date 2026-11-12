@@ -90,6 +90,25 @@ async def connect(env, guild):
     return i
 
 
+async def test_connect_warns_when_the_config_could_not_be_saved(env, monkeypatch):
+    guild = FakeGuild()
+    real = env.cfg.set_config
+
+    async def failing(g, d):
+        await real(g, d)
+        return False
+    monkeypatch.setattr(env.cfg, "set_config", failing)
+    i = await connect(env, guild)
+    text = i.followup.send.await_args.kwargs["embed"].description
+    assert "could **not be saved**" in text and "restarts" in text
+
+
+async def test_connect_has_no_warning_when_saved(env):
+    guild = FakeGuild()
+    i = await connect(env, guild)
+    assert "not be saved" not in i.followup.send.await_args.kwargs["embed"].description
+
+
 # ── permissions ───────────────────────────────────────────────────────────────
 
 def test_role_rules():

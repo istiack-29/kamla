@@ -1,7 +1,7 @@
 import discord
 from discord.ext import commands
 import asyncio
-from config import ADMIN_ROLE_NAMES
+
 ALLOWED_ROLES = {
     "ORG", "CAP", "TABBY",
     "INVITED ADJUDICATOR", "INDEPENDENT ADJUDICATOR",

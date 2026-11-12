@@ -263,7 +263,9 @@ class KamlaBot(commands.Bot):
         import lockdown
         if creator is not None and creator.id == self.user.id:
             # KAMLA created it (e.g. restoring a protected channel): allowed, but keep the lock's slowmode
-            await lockdown.apply_to_channel(channel, lockdown.SLOWMODE_SECONDS)
+            owned = await lockdown.load_owned(guild)
+            if await lockdown.apply_to_channel(channel, lockdown.SLOWMODE_SECONDS, owned):
+                await lockdown.save_owned(guild)
             return
 
         channel_name = channel.name

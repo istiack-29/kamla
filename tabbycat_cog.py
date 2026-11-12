@@ -470,7 +470,7 @@ class TabbycatCog(commands.Cog):
         cfg = await config_manager.get_config(guild)
         token_changed = token != current.get("token", "")
         cfg["tabbycat"] = {"url": base, "slug": slug, "token": token}
-        await config_manager.set_config(guild, cfg)
+        saved = await config_manager.set_config(guild, cfg)
         if token_changed:
             await config_manager.compact(guild)               # old config copies may hold the previous token
         await self._drop_client(guild.id)
@@ -482,6 +482,9 @@ class TabbycatCog(commands.Cog):
             msg = exc.message if isinstance(exc, TabbycatError) else "unexpected error"
             body = f"Saved, but the first data load failed: {msg}\nTry `/refresh` in a moment."
         name = tournament.get("name") or slug
+        if saved is False:                                    # (FakeConfig in tests returns None: only a real False counts)
+            body += ("\n\n⚠️ The connection works now, but it could **not be saved** in the config channel, so it will be "
+                     "lost when KAMLA restarts. Check that KAMLA can write in 🔒︱kamla-config, then run `/tab` again.")
         await interaction.followup.send(
             embed=discord.Embed(title=f"✅ Connected to {name}", description=body, color=discord.Color.green())
             .set_footer(text="CAP, ORG and TABBY can now use /draw, /motion, /result, /break and /refresh"),

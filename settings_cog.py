@@ -36,11 +36,6 @@ def _is_admin(interaction: discord.Interaction) -> bool:
 
 
 def build_settings_embed(cfg: dict) -> discord.Embed:
-    try:
-        dt = datetime.fromisoformat(cfg.get("created_at", "")).strftime("%d-%m-%Y %H:%M UTC")
-    except Exception:
-        dt = cfg.get("created_at", "N/A")
-
     locked = cfg.get("locked", False)
     lock_status = "🔒 LOCKED" if locked else "🔓 OPEN"
 

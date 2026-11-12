@@ -1,7 +1,7 @@
 import discord
 from discord.ext import commands
 from config import (
-    KAMLA_ROLE_NAMES, ADMIN_ROLE_NAMES,
+    ADMIN_ROLE_NAMES,
     get_member_kamla_role,
 )
 

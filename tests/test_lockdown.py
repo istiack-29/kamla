@@ -8,8 +8,23 @@ from ratelimit import RequestCoordinator
 from tests.fakes import FakeGuild
 
 
+class MemConfig:
+    """config_manager stand-in that remembers what the lock saved."""
+    def __init__(self):
+        self.data = {}
+
+    async def get_config(self, guild):
+        return dict(self.data.get(guild.id, {}))
+
+    async def set_config(self, guild, d):
+        self.data[guild.id] = dict(d)
+        return True
+
+
 @pytest.fixture(autouse=True)
 def fast(monkeypatch):
+    monkeypatch.setattr(lockdown, "config_manager", MemConfig())
+    lockdown._owned.clear()
     async def nosleep(_):
         return None
     c = RequestCoordinator("t", 2, 0, retry_kwargs={"sleep": nosleep})
@@ -20,7 +35,10 @@ def fast(monkeypatch):
 
 
 class Chan:
+    _next = iter(range(5000, 6000))
+
     def __init__(self, name, delay=0, voice=False):
+        self.id = next(Chan._next)
         self.name, self.slowmode_delay, self.voice = name, delay, voice
         self.edits = 0
 
@@ -134,10 +152,14 @@ async def _handler_setup(monkeypatch, creator_id, locked=True):
     import lockdown as ld
     monkeypatch.setattr(ld, "report_blocked_channel", lambda g, c, n: calls["report"].append((c.id if c else None, n)))
 
-    async def fake_apply(ch, s):
+    async def fake_apply(ch, s, owned=None):
         calls["slow"].append(s)
         return True
+
+    async def fake_save(guild):
+        calls.setdefault("saved", []).append(guild.id)
     monkeypatch.setattr(ld, "apply_to_channel", fake_apply)
+    monkeypatch.setattr(ld, "save_owned", fake_save)
     ch = NewChannel()
     ch.guild = G()
     return bot, ch, calls
@@ -154,6 +176,7 @@ async def test_locked_server_allows_kamla_but_applies_slowmode(monkeypatch):
     bot, ch, calls = await _handler_setup(monkeypatch, creator_id=555)
     await bot.on_guild_channel_create(ch)
     assert calls["delete"] == 0 and calls["report"] == [] and calls["slow"] == [5]
+    assert calls["saved"] == [42]                                       # the lock's channel list is saved too
     await bot.close()
 
 
@@ -162,3 +185,42 @@ async def test_unlocked_server_ignores_new_channels(monkeypatch):
     await bot.on_guild_channel_create(ch)
     assert calls["delete"] == 0 and calls["report"] == []
     await bot.close()
+
+
+# ── the lock only undoes slowmode it set itself ───────────────────────────────
+
+async def test_channel_that_already_had_5s_keeps_it_after_unlock():
+    mine, theirs = Chan("general"), Chan("announcements", delay=5)      # "theirs" had a 5 s slowmode before the lock
+    g = guild_with(mine, theirs)
+    await lockdown.start_slowmode(g, 5)
+    assert mine.slowmode_delay == 5 and theirs.slowmode_delay == 5 and theirs.edits == 0
+    await lockdown.start_slowmode(g, 0)
+    assert mine.slowmode_delay == 0
+    assert theirs.slowmode_delay == 5 and theirs.edits == 0             # not ours → left alone
+
+
+async def test_lock_remembers_its_channels_across_a_restart():
+    mine, theirs = Chan("general"), Chan("announcements", delay=5)
+    g = guild_with(mine, theirs)
+    await lockdown.start_slowmode(g, 5)
+    assert lockdown.config_manager.data[g.id]["lock_slowmode"] == [mine.id]
+    lockdown._owned.clear()                                             # KAMLA restarts: memory is gone, the config stays
+    await lockdown.start_slowmode(g, 0)
+    assert mine.slowmode_delay == 0 and theirs.slowmode_delay == 5
+    assert "lock_slowmode" not in lockdown.config_manager.data[g.id]    # nothing left to remember
+
+
+async def test_lock_made_by_an_older_kamla_still_unlocks():
+    a, b = Chan("a", delay=5), Chan("b", delay=5)                       # no saved list: fall back to "exactly 5 s was ours"
+    g = guild_with(a, b)
+    await lockdown.start_slowmode(g, 0)
+    assert (a.slowmode_delay, b.slowmode_delay) == (0, 0)
+
+
+async def test_channel_changed_by_a_human_during_the_lock_is_not_reset():
+    a = Chan("a")
+    g = guild_with(a)
+    await lockdown.start_slowmode(g, 5)
+    a.slowmode_delay = 30                                               # a moderator picked their own value
+    await lockdown.start_slowmode(g, 0)
+    assert a.slowmode_delay == 30

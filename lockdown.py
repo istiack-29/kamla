@@ -20,6 +20,7 @@ from typing import Optional
 
 import discord
 
+from config import config_manager
 from ratelimit import bulk, notify, describe
 
 log = logging.getLogger("kamla.lockdown")
@@ -29,6 +30,7 @@ NOTIFY_BATCH_SECONDS = 5.0
 CONFIG_MARKER = "kamla-config"
 
 _slowmode_tasks: dict[int, asyncio.Task] = {}
+_owned: dict[int, set[int]] = {}           # guild -> ids of the channels whose slowmode THIS lock set
 _pending: dict[int, list[tuple[str, str]]] = {}
 _flush_tasks: dict[int, asyncio.Task] = {}
 
@@ -40,27 +42,77 @@ def _chat_channels(guild: discord.Guild) -> list:
     return [c for c in chans if CONFIG_MARKER not in c.name and hasattr(c, "slowmode_delay")]
 
 
-async def apply_to_channel(channel, seconds: int) -> bool:
-    """Set slowmode on one channel if it needs changing. Returns True when an edit was made."""
+async def load_owned(guild: discord.Guild) -> set[int]:
+    """Channels whose slowmode the lock set (restored from the config after a restart). Unlocking only touches
+    these, so a channel that had its own 5-second slowmode before the lock keeps it."""
+    got = _owned.get(guild.id)
+    if got is None:
+        ids: list = []
+        try:
+            ids = (await config_manager.get_config(guild)).get("lock_slowmode") or []
+        except Exception as e:  # noqa: BLE001
+            log.warning("Could not read the lock's channel list for guild %s: %s", guild.id, describe(e))
+        got = _owned[guild.id] = {int(i) for i in ids if str(i).isdigit()}
+    return got
+
+
+async def save_owned(guild: discord.Guild) -> None:
+    owned = _owned.get(guild.id, set())
+    try:
+        cfg = await config_manager.get_config(guild)
+        if owned:
+            cfg["lock_slowmode"] = sorted(owned)
+        elif "lock_slowmode" in cfg:
+            cfg.pop("lock_slowmode")
+        else:
+            return
+        await config_manager.set_config(guild, cfg)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Could not save the lock's channel list for guild %s: %s", guild.id, describe(e))
+
+
+async def apply_to_channel(channel, seconds: int, owned: Optional[set[int]] = None,
+                           ours: Optional[set[int]] = None) -> bool:
+    """Set slowmode on one channel if it needs changing. Returns True when an edit was made.
+    `owned` = the channels the lock set (updated here). `ours` = a snapshot of it taken before a whole pass, used
+    to decide what is ours (so the decision doesn't change while the pass removes entries); defaults to `owned`.
+    Without any (or when it is empty, e.g. a lock made by an older KAMLA) unlocking falls back to
+    'a channel at exactly the lock's value was set by the lock'."""
+    if ours is None:
+        ours = owned
     current = getattr(channel, "slowmode_delay", None)
     if current is None:
         return False
+    cid = getattr(channel, "id", None)
     if seconds > 0 and current >= seconds:          # already as slow or slower: leave custom values alone
         return False
-    if seconds == 0 and current != SLOWMODE_SECONDS:   # only undo what the lock set
-        return False
+    if seconds == 0:
+        if ours:
+            if cid not in ours:
+                return False
+            if current != SLOWMODE_SECONDS:             # someone changed it since: not ours any more
+                owned.discard(cid)
+                return False
+        elif current != SLOWMODE_SECONDS:               # only undo what the lock set
+            return False
     ok = await bulk.best_effort(
         lambda: channel.edit(slowmode_delay=seconds, reason="KAMLA server lock" if seconds else "KAMLA server unlock"),
         label="slowmode")
+    if ok and owned is not None and cid is not None:
+        (owned.add if seconds else owned.discard)(cid)
     return ok
 
 
 async def _apply_all(guild: discord.Guild, seconds: int) -> None:
     changed = 0
     try:
+        owned = await load_owned(guild)
+        ours = set(owned)
         for channel in _chat_channels(guild):
-            if await apply_to_channel(channel, seconds):
+            if await apply_to_channel(channel, seconds, owned, ours):
                 changed += 1
+        if changed:
+            await save_owned(guild)
         log.info("Slowmode %ss applied in guild %s (%d channel(s) changed).", seconds, guild.id, changed)
     except asyncio.CancelledError:
         log.info("Slowmode change for guild %s was superseded by a newer lock/unlock.", guild.id)

@@ -13,7 +13,6 @@ no-database requirement.
 • /close [where]       — closes an active poll by exact topic, or shows a picker
 """
 
-import asyncio
 import re
 import uuid
 from datetime import datetime, timezone

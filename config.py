@@ -1,9 +1,10 @@
-import discord
+import io
 import json
-import asyncio
 import logging
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import timedelta
+
+import discord
 
 from ratelimit import notify, describe
 
@@ -19,6 +20,10 @@ WARNING_MSG = (
     "Deleting this channel will cause KAMLA to recreate it and restore the last known configuration."
 )
 
+CONFIG_FILE = "kamla-config.json"       # large configs (over one message) are stored as this attached file
+MAX_INLINE = 1990                        # Discord messages are limited to 2000 characters
+MAX_FILE_BYTES = 2_000_000
+
 KAMLA_ROLE_NAMES = [
     "ORG", "CAP", "TABBY", "EQUITY",
     "INVITED ADJUDICATOR", "INDEPENDENT ADJUDICATOR", "DEBATER", "VISITOR"
@@ -27,16 +32,58 @@ KAMLA_ROLE_NAMES = [
 ADMIN_ROLE_NAMES = ["ORG", "CAP", "TABBY", "EQUITY"]
 
 
+def is_own_config(msg, me_id: int) -> bool:
+    """A configuration copy written by KAMLA itself (inline JSON or the attached file). Messages from anyone
+    else — including other bots — are never trusted: the config can hold secrets and drives permissions."""
+    if getattr(msg.author, "id", None) != me_id:
+        return False
+    if (msg.content or "").lstrip().startswith("{"):
+        return True
+    return any(getattr(a, "filename", "") == CONFIG_FILE for a in getattr(msg, "attachments", None) or [])
+
+
+async def read_config_message(msg) -> dict | None:
+    text = msg.content or ""
+    if not text.lstrip().startswith("{"):
+        att = next((a for a in msg.attachments if getattr(a, "filename", "") == CONFIG_FILE), None)
+        if att is None:
+            return None
+        text = (await att.read()).decode("utf-8")
+    data = json.loads(text)
+    return data if isinstance(data, dict) else None
+
+
+def find_config_channel(guild: discord.Guild):
+    """The existing config channel: the exact name first, otherwise a channel with 'kamla-config' in its name —
+    but ONLY one that @everyone cannot see (a visible look-alike must never receive the saved token)."""
+    hidden = []
+    for ch in guild.text_channels:
+        if "kamla-config" not in ch.name:
+            continue
+        try:
+            visible = bool(ch.permissions_for(guild.default_role).view_channel)
+        except Exception:  # noqa: BLE001
+            visible = False
+        if visible:
+            log.warning("Ignoring channel %s in guild %s: it looks like the config channel but @everyone can see it.",
+                        ch.id, guild.id)
+            continue
+        if ch.name == CHANNEL_NAME:
+            return ch
+        hidden.append(ch)
+    return hidden[0] if hidden else None
+
+
 class ConfigManager:
     _cache: dict[int, dict] = {}
     _channel_ids: dict[int, int] = {}
     _miss_until: dict[int, float] = {}
 
     async def ensure_config_channel(self, guild: discord.Guild) -> discord.TextChannel:
-        for ch in guild.text_channels:
-            if "kamla-config" in ch.name:
-                self._channel_ids[guild.id] = ch.id
-                return ch
+        existing = find_config_channel(guild)
+        if existing is not None:
+            self._channel_ids[guild.id] = existing.id
+            return existing
 
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -57,7 +104,7 @@ class ConfigManager:
             )
             await channel.send(WARNING_MSG)
             if guild.id in self._cache and self._cache[guild.id]:
-                await channel.send(json.dumps(self._cache[guild.id], ensure_ascii=False))
+                await self._write(channel, json.dumps(self._cache[guild.id], ensure_ascii=False))
             self._channel_ids[guild.id] = channel.id
             return channel
         except discord.Forbidden:
@@ -72,33 +119,45 @@ class ConfigManager:
         try:
             channel = await self.ensure_config_channel(guild)
             async for message in channel.history(limit=100, oldest_first=False):
-                if message.author.bot and message.content.strip().startswith("{"):
+                if is_own_config(message, guild.me.id):
                     try:
-                        data = json.loads(message.content)
-                        if isinstance(data, dict):
-                            self._cache[guild.id] = data
-                            return dict(data)
-                    except (json.JSONDecodeError, ValueError):
+                        data = await read_config_message(message)
+                    except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
                         continue
+                    if data is not None:
+                        self._cache[guild.id] = data
+                        return dict(data)
         except Exception as e:
             log.warning("get_config error for guild %s: %s", guild.id, describe(e))
 
         self._miss_until[guild.id] = time.monotonic() + _MISS_TTL
         return {}
 
-    async def set_config(self, guild: discord.Guild, data: dict) -> None:
+    @staticmethod
+    async def _write(channel, payload: str) -> None:
+        """One message when it fits, otherwise the same JSON as an attached file (nothing is ever dropped)."""
+        if len(payload) <= MAX_INLINE:
+            await channel.send(payload)
+            return
+        data = payload.encode("utf-8")
+        if len(data) > MAX_FILE_BYTES:
+            raise ValueError(f"config is too large to store ({len(data)} bytes)")
+        await channel.send("📦 KAMLA configuration (stored as a file because it is large).",
+                           file=discord.File(io.BytesIO(data), filename=CONFIG_FILE))
+
+    async def set_config(self, guild: discord.Guild, data: dict) -> bool:
+        """Remember the config (cache) and save it in the config channel. Returns True when it was saved there;
+        False means it only lives in memory until the next restart."""
         self._cache[guild.id] = dict(data)
         self._miss_until.pop(guild.id, None)
         payload = json.dumps(data, ensure_ascii=False)
-        if len(payload) > 1990:
-            # Discord messages are limited to 2000 characters; a silent failure here would lose settings.
-            log.error("Config for guild %s is too large to store (%d chars).", guild.id, len(payload))
-            return
         try:
             channel = await self.ensure_config_channel(guild)
-            await channel.send(payload)
+            await self._write(channel, payload)
+            return True
         except Exception as e:
-            log.warning("set_config error for guild %s: %s", guild.id, describe(e))
+            log.error("Could not save the config of guild %s: %s", guild.id, describe(e))
+            return False
 
     async def update_config(self, guild: discord.Guild, **kwargs) -> dict:
         current = await self.get_config(guild)
@@ -116,7 +175,7 @@ class ConfigManager:
             channel = await self.ensure_config_channel(guild)
             newest_seen, stale = False, []
             async for msg in channel.history(limit=500):          # newest first
-                if msg.author.id == guild.me.id and msg.content.startswith("{"):
+                if is_own_config(msg, guild.me.id):
                     if newest_seen:
                         stale.append(msg)
                     newest_seen = True
