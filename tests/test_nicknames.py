@@ -15,6 +15,8 @@ def fast(monkeypatch):
         return None
     monkeypatch.setattr(nc, "bulk", RequestCoordinator("t", 2, 0, retry_kwargs={"sleep": nosleep}))
     monkeypatch.setattr(nc, "DEBOUNCE_SECONDS", 0.02)
+    monkeypatch.setattr(nc, "STARTUP_DELAY", 0)
+    monkeypatch.setattr(nc, "STARTUP_GAP", 0)
 
 
 def make_guild(owner_id=1000, bot_pos=50):
@@ -24,7 +26,7 @@ def make_guild(owner_id=1000, bot_pos=50):
 
 def make_member(guild, uid, roles=(), nick=None, name="alice", global_name=None, pos=1, bot=False):
     m = types.SimpleNamespace(
-        id=uid, guild=guild, bot=bot, nick=nick, name=name, global_name=global_name,
+        id=uid, guild=guild, bot=bot, nick=nick, name=name, global_name=global_name, display_name=name,
         roles=[types.SimpleNamespace(name=r) for r in roles],
         top_role=types.SimpleNamespace(position=pos),
     )
@@ -133,3 +135,67 @@ async def test_command_syncs_everyone_and_reports():
     inter2.response.send_message = mock.AsyncMock()
     await cog.nicknames.callback(cog, inter2)
     inter2.response.send_message.assert_awaited()
+
+
+# ── diagnostics: every "not changed" has a reason ────────────────────────────
+
+def test_skip_reasons():
+    g = make_guild(owner_id=7, bot_pos=10)
+    assert nc.skip_reason(make_member(g, 1, ["DEBATER"])) is None
+    assert nc.skip_reason(make_member(g, 7, ["ORG"])) == nc.REASON_OWNER
+    assert nc.skip_reason(make_member(g, 2, ["ORG"], pos=99)) == nc.REASON_HIERARCHY
+    g.me.guild_permissions = types.SimpleNamespace(administrator=False, manage_nicknames=False)
+    assert nc.skip_reason(make_member(g, 3, ["DEBATER"])) == nc.REASON_PERMISSION          # no doomed requests at all
+    g.me.guild_permissions = types.SimpleNamespace(administrator=True, manage_nicknames=False)
+    assert nc.skip_reason(make_member(g, 4, ["DEBATER"])) is None
+
+
+async def test_unchanged_nicknames_are_logged_with_the_reason(caplog):
+    import logging
+    g = make_guild(owner_id=7)
+    owner = make_member(g, 7, ["ORG"], name="o")
+    with caplog.at_level(logging.INFO, logger="kamla.nick"):
+        assert await nc.sync_member(owner) == "skipped"
+    assert any("server owner" in r.message for r in caplog.records)
+
+
+async def test_command_explains_who_was_skipped_and_how_to_fix_it():
+    g = make_guild(owner_id=7, bot_pos=10)
+    make_member(g, 1, ["DEBATER"], name="rafi")
+    make_member(g, 7, ["ORG"], name="boss")
+    make_member(g, 8, ["CAP"], name="highrole", pos=99)
+    g.chunked = True
+    admin = types.SimpleNamespace(guild_permissions=types.SimpleNamespace(administrator=True), roles=[])
+    inter = mock.MagicMock(guild=g, user=admin)
+    inter.response.defer = mock.AsyncMock()
+    inter.edit_original_response = mock.AsyncMock()
+    cog = nc.NicknameCog(bot=None)
+    await cog.nicknames.callback(cog, inter)
+    msg = inter.edit_original_response.await_args.kwargs["content"]
+    assert "1** updated" in msg and "2** skipped" in msg
+    assert "boss" in msg and "highrole" in msg and "above all tournament roles" in msg
+
+
+# ── start-up reconcile ───────────────────────────────────────────────────────
+
+async def test_startup_reconcile_tags_members_whose_role_changed_while_offline():
+    g1, g2 = make_guild(owner_id=7), make_guild(owner_id=7)
+    late = make_member(g1, 1, ["DEBATER"], name="late")
+    fine = make_member(g1, 2, ["VISITOR"], nick="[V] fine", name="fine")
+    other = make_member(g2, 3, ["ORG"], name="other")
+    owner = make_member(g1, 7, ["ORG"], name="boss")
+    cog = nc.NicknameCog(bot=types.SimpleNamespace(guilds=[g1, g2]))
+    await cog.on_ready()
+    await cog.on_ready()                                 # reconnects must not start a second pass
+    await cog._startup_task
+    assert late.nick == "[D] late" and other.nick == "[O] other"
+    assert fine.edits == [] and owner.edits == []        # already correct / not allowed: no requests
+
+
+async def test_startup_reconcile_can_be_switched_off(monkeypatch):
+    monkeypatch.setenv("KAMLA_NICKNAME_STARTUP_SYNC", "0")
+    g = make_guild()
+    m = make_member(g, 1, ["DEBATER"], name="x")
+    cog = nc.NicknameCog(bot=types.SimpleNamespace(guilds=[g]))
+    await cog.on_ready()
+    assert cog._startup_task is None and m.edits == []

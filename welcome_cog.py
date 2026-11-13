@@ -67,6 +67,14 @@ class WelcomeCog(commands.Cog):
     async def on_member_join(self, member: discord.Member) -> None:
         """Send a beautiful welcome embed to the welcome channel."""
         guild = member.guild
+        # Nobody needs a welcome for the developer link: whoever joins through it (the developer) is not a
+        # participant. The invite tracker tells us which link was used (it answers within a couple of seconds).
+        try:
+            from invite_roles_cog import join_outcome, DEV_KEY
+            if await join_outcome(member) == DEV_KEY:
+                return
+        except Exception:  # noqa: BLE001 - never let this block a normal welcome
+            pass
         channel = discord.utils.get(guild.text_channels, name=WELCOME_CHANNEL_NAME)
         if channel is None:
             # Fall back to system channel if welcome channel doesn't exist

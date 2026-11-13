@@ -16,6 +16,7 @@ nickname_cog.py — keeps a role tag at the start of every member's nickname.
 
 import asyncio
 import logging
+import os
 import re
 import time
 
@@ -42,6 +43,8 @@ PRIORITY = [
 _PREFIX_RE = re.compile(r"^\s*\[(?:O|CA|T|E|J|D|V)\]\s*")
 MAX_NICK = 32
 DEBOUNCE_SECONDS = 2.0
+STARTUP_DELAY = 30.0          # let the bot settle before the start-up reconcile
+STARTUP_GAP = 2.0             # pause between servers
 
 
 def prefix_for(member) -> str | None:
@@ -76,30 +79,53 @@ def desired_nick(member) -> str | None:
     return member.nick                                       # nothing of ours to touch
 
 
+REASON_PERMISSION = "KAMLA lacks the Manage Nicknames permission"
+REASON_OWNER = "server owner (Discord never lets a bot change the owner's nickname)"
+REASON_HIERARCHY = "their top role is above KAMLA's role"
+
+
+def skip_reason(member) -> str | None:
+    """Why KAMLA cannot change this member's nickname, or None if it can. Pure/local (no API request).
+    Sending a request that is certain to fail would only count against Discord's invalid-request limit."""
+    guild = member.guild
+    perms = getattr(guild.me, "guild_permissions", None)
+    if perms is not None and not (perms.administrator or perms.manage_nicknames):
+        return REASON_PERMISSION
+    if member.id == guild.owner_id:
+        return REASON_OWNER
+    if member.top_role.position >= guild.me.top_role.position:
+        return REASON_HIERARCHY
+    return None
+
+
 def plan(member) -> tuple[str, str | None]:
     """('ok'|'skip'|'edit', nick). Pure/local: costs no API request."""
-    guild = member.guild
     if member.bot:
         return "skip", None
     desired = desired_nick(member)
     if desired == member.nick:
         return "ok", None
-    if member.id == guild.owner_id or member.top_role.position >= guild.me.top_role.position:
-        return "skip", None                                  # Discord forbids it; don't send a doomed request
+    if skip_reason(member):
+        return "skip", None
     return "edit", desired
 
 
 async def sync_member(member) -> str:
-    """Returns 'updated' | 'ok' | 'skipped' | 'failed'."""
+    """Returns 'updated' | 'ok' | 'skipped' | 'failed'. Every non-obvious outcome is logged with its reason,
+    so "the nickname did not change" can always be explained from the logs."""
     action, nick = plan(member)
     if action == "ok":
         return "ok"
     if action == "skip":
+        log.info("Nickname of %s left unchanged: %s.", member.id, skip_reason(member) or "bot account")
         return "skipped"
     try:
         await bulk.run(lambda: member.edit(nick=nick, reason="KAMLA role tag"), label="nickname")
+        log.info("Nickname of %s set to %r.", member.id, nick)
         return "updated"
     except discord.Forbidden:
+        log.warning("Discord refused the nickname change for %s (403). In Server Settings → Roles, move KAMLA's "
+                    "role above every tournament role and make sure it has Manage Nicknames.", member.id)
         return "skipped"
     except Exception as e:  # noqa: BLE001
         log.warning("Could not set nickname for %s: %s", member.id, describe(e))
@@ -112,11 +138,44 @@ class NicknameCog(commands.Cog):
         self._tasks: dict[tuple[int, int], asyncio.Task] = {}
         self._rerun: set[tuple[int, int]] = set()
         self._sweeping: set[int] = set()
+        self._startup_task: asyncio.Task | None = None
+        self._startup_done = False
 
     async def cog_unload(self) -> None:
-        for t in list(self._tasks.values()):
-            t.cancel()
+        for t in list(self._tasks.values()) + ([self._startup_task] if self._startup_task else []):
+            if t and not t.done():
+                t.cancel()
         self._tasks.clear()
+
+    # ── start-up reconcile ──────────────────────────────────────────────────
+    # Role changes that happened while KAMLA was offline (or before this feature existed) never produced an
+    # event, so those members would stay untagged until someone ran /nicknames. After every start KAMLA
+    # therefore makes one quiet, paced pass: only members who actually need a change cost a request.
+    # Disable with KAMLA_NICKNAME_STARTUP_SYNC=0.
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        if self._startup_done or os.getenv("KAMLA_NICKNAME_STARTUP_SYNC", "1").strip() == "0":
+            return
+        self._startup_done = True                    # on_ready repeats after reconnects; do this once
+        self._startup_task = asyncio.get_running_loop().create_task(self._startup_sweep())
+
+    async def _startup_sweep(self) -> None:
+        try:
+            await asyncio.sleep(STARTUP_DELAY)
+            for guild in list(self.bot.guilds):
+                todo = [m for m in guild.members if plan(m)[0] == "edit"]
+                changed = 0
+                for member in todo:
+                    if await sync_member(member) == "updated":
+                        changed += 1
+                if todo:
+                    log.info("Start-up nickname reconcile in guild %s: %d of %d needed update.", guild.id, changed, len(todo))
+                await asyncio.sleep(STARTUP_GAP)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.warning("Start-up nickname reconcile failed: %s", describe(e))
 
     # ── automatic: on role / nickname change ────────────────────────────────
 
@@ -170,6 +229,11 @@ class NicknameCog(commands.Cog):
         self._sweeping.add(guild.id)
         try:
             await interaction.response.defer(ephemeral=True, thinking=True)
+            if not getattr(guild, "chunked", True):
+                try:
+                    await guild.chunk()               # make sure every member is known, not just the cached ones
+                except Exception as e:  # noqa: BLE001
+                    log.warning("Could not load the full member list of guild %s: %s", guild.id, describe(e))
             members = [m for m in guild.members if not m.bot]
             plans = [(m, plan(m)[0]) for m in members]
             todo = [m for m, action in plans if action == "edit"]
@@ -193,12 +257,24 @@ class NicknameCog(commands.Cog):
                         pass
 
             note = ""
-            if counts["skipped"]:
-                note = ("\nSkipped members are the server owner or members whose top role is above KAMLA's "
-                        "role — Discord does not allow bots to change those nicknames.")
+            skipped = [(m, skip_reason(m)) for m, a in plans if a == "skip" and skip_reason(m)]
+            if skipped:
+                reasons: dict[str, list] = {}
+                for m, why in skipped:
+                    reasons.setdefault(why, []).append(m)
+                lines = []
+                for why, ms in reasons.items():
+                    who = ", ".join(getattr(m, "display_name", str(m.id)) for m in ms[:6]) + (" …" if len(ms) > 6 else "")
+                    lines.append(f"• **{len(ms)}** — {why}: {who}")
+                note = "\n\nNot changed:\n" + "\n".join(lines)
+                if REASON_HIERARCHY in reasons or REASON_PERMISSION in reasons:
+                    note += ("\n\n**Fix:** Server Settings → Roles → drag **KAMLA's role above all tournament roles** "
+                             "(and keep Manage Nicknames or Administrator on it).")
+            elif not members or not any(a == "edit" or a == "ok" for _, a in plans):
+                note = "\n\nNo members with a KAMLA role were found."
             await interaction.edit_original_response(content=(
                 f"✅ Nicknames synced: **{counts['updated']}** updated, **{counts['ok']}** already correct, "
-                f"**{counts['skipped']}** skipped, **{counts['failed']}** failed.{note}"))
+                f"**{counts['skipped']}** skipped, **{counts['failed']}** failed.{note}")[:1900])
         except Exception as e:  # noqa: BLE001
             log.exception("Nickname sync failed in guild %s", guild.id)
             try:

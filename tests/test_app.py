@@ -22,7 +22,7 @@ BASELINE = {
                    "kamla:s:add", "kamla:s:del", "kamla:s:fmt", "kamla:s:lock",
                    "kamla:timer:pause", "kamla:timer:skip"],
     "listeners": {"on_member_join": 3, "on_member_remove": 1, "on_member_update": 2, "on_message": 6,
-                  "on_ready": 2, "on_invite_create": 1, "on_invite_delete": 1},
+                  "on_ready": 3, "on_invite_create": 1, "on_invite_delete": 1},
     "views": ["AllInView", "OnJoinView", "OrphanTimerView", "RoleSelectView", "SettingsView"],
 }
 

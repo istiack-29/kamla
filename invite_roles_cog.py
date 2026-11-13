@@ -20,6 +20,7 @@ The invite-code -> roles mapping lives in the existing kamla-config channel.
 """
 
 import asyncio
+from typing import Optional
 import logging
 
 import discord
@@ -49,6 +50,41 @@ DEV_ROLE_NAME = "KAMLA"
 # guild_id -> {invite code: uses}. In memory only; rebuilt from Discord on startup.
 _uses: dict[int, dict[str, int]] = {}
 _tracked: set[int] = set()
+
+# (guild, member) -> which role-invite KEY ("visitor", ..., "dev") the member joined with, or None when
+# unknown. Other listeners (the welcome message) wait for it so they can treat developer joins differently.
+_outcomes: dict[tuple[int, int], "asyncio.Future"] = {}
+OUTCOME_TIMEOUT = 6.0
+
+
+def _outcome_future(guild_id: int, member_id: int) -> "asyncio.Future":
+    key = (guild_id, member_id)
+    fut = _outcomes.get(key)
+    if fut is None or fut.done() and fut.cancelled():
+        loop = asyncio.get_running_loop()
+        fut = _outcomes[key] = loop.create_future()
+        loop.call_later(120, lambda: _outcomes.pop(key, None))        # never leak entries nobody asked for
+    return fut
+
+
+def _set_outcome(guild_id: int, member_id: int, key: Optional[str]) -> None:
+    fut = _outcome_future(guild_id, member_id)
+    if not fut.done():
+        fut.set_result(key)
+
+
+async def join_outcome(member: discord.Member, timeout: Optional[float] = None) -> Optional[str]:
+    """The role-invite key a new member joined with ('dev' = the developer invite), or None if it is not a
+    role invite / could not be determined. Returns immediately for servers without role invites."""
+    if member.bot or member.guild.id not in _tracked:
+        return None
+    fut = _outcome_future(member.guild.id, member.id)
+    try:
+        return await asyncio.wait_for(asyncio.shield(fut), timeout if timeout is not None else OUTCOME_TIMEOUT)
+    except asyncio.TimeoutError:
+        return None
+    finally:
+        _outcomes.pop((member.guild.id, member.id), None)
 
 
 async def _snapshot(guild: discord.Guild) -> dict[str, int]:
@@ -229,6 +265,14 @@ class InviteRolesCog(commands.Cog):
             log.warning("Invite-role processing failed in guild %s: %s", guild.id, describe(e))
 
     async def _assign_batch(self, guild: discord.Guild, members: list[discord.Member]) -> None:
+        key: Optional[str] = None
+        try:
+            key = await self._assign_batch_inner(guild, members)
+        finally:
+            for m in members:                      # always release anyone waiting for the outcome
+                _set_outcome(guild.id, m.id, key)
+
+    async def _assign_batch_inner(self, guild: discord.Guild, members: list[discord.Member]) -> Optional[str]:
         before = dict(_uses.get(guild.id, {}))
         now = await _snapshot(guild)
         deltas = {c: n - before.get(c, 0) for c, n in now.items() if n > before.get(c, 0)}
@@ -237,7 +281,7 @@ class InviteRolesCog(commands.Cog):
 
         if not deltas:
             log.info("No tracked invite use detected for %d new member(s) in guild %s.", len(members), guild.id)
-            return
+            return None
         total = sum(deltas.values())
         # Strict rule: exactly ONE invite changed and its use count equals the joins we saw.
         # Anything else (several invites, joins we didn't witness, vanity URL joins mixed in) is
@@ -245,16 +289,16 @@ class InviteRolesCog(commands.Cog):
         if len(deltas) != 1 or total != len(members):
             log.warning("Ambiguous join in guild %s (%d member(s) seen, %d invite use(s) across %d invite(s)). "
                         "No invite roles were assigned.", guild.id, len(members), total, len(deltas))
-            return
+            return None
 
         code = next(iter(deltas))
         entry = mapping.get(code)
         if not entry:
-            return                                        # a normal, non-role invite
+            return None                                   # a normal, non-role invite
         role = next((r for r in guild.roles if r.name == entry["roles"][0] and not r.managed), None)
         if role is None:
             log.warning("Role %s for invite %s is missing in guild %s.", entry["roles"][0], code, guild.id)
-            return
+            return entry["key"]
         for member in members:
             only = entry.get("only_user")
             if only and member.id != only:
@@ -272,6 +316,7 @@ class InviteRolesCog(commands.Cog):
                 log.info("Assigned %s to a new member via the %s invite.", role.name, entry["key"])
             except Exception as e:  # noqa: BLE001
                 log.warning("Could not assign invite role: %s", describe(e))
+        return entry["key"]
 
 
 async def setup(bot: commands.Bot):

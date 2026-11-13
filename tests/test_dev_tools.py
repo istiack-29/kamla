@@ -304,3 +304,98 @@ async def test_owner_lookup_falls_back_to_the_application_owner(monkeypatch):
     team_bot = types.SimpleNamespace(application_info=mock.AsyncMock(
         return_value=types.SimpleNamespace(team=types.SimpleNamespace(owner_id=999), owner=None)))
     assert await devtools.get_owner_id(team_bot) == 999
+
+
+# ── developer-invite joins get no welcome message ────────────────────────────
+
+async def test_join_outcome_reports_which_invite_was_used():
+    g = DevGuild()
+    g.make_welcome()
+    url = await ir.ensure_dev_invite(g, OWNER)
+    links = await ir.create_role_invites(g)
+    code = url.rsplit("/", 1)[1]
+    cog = ir.InviteRolesCog(bot=None)
+
+    dev, visitor = person(OWNER, g), person(5, g)
+    g.live[code].uses += 1
+    await cog.on_member_join(dev)
+    assert await ir.join_outcome(dev) == "dev"
+    g.live[links[0]["code"]].uses += 1
+    await cog.on_member_join(visitor)
+    assert await ir.join_outcome(visitor) == "visitor"
+
+
+async def test_join_outcome_works_whichever_listener_runs_first():
+    g = DevGuild()
+    g.make_welcome()
+    url = await ir.ensure_dev_invite(g, OWNER)
+    cog = ir.InviteRolesCog(bot=None)
+    dev = person(OWNER, g)
+    g.live[url.rsplit("/", 1)[1]].uses += 1
+    waiter = asyncio.create_task(ir.join_outcome(dev))          # the welcome listener asks BEFORE the tracker runs
+    await asyncio.sleep(0.01)
+    await cog.on_member_join(dev)
+    assert await waiter == "dev"
+
+
+async def test_join_outcome_is_immediate_when_not_tracked_and_none_for_normal_invites():
+    g = DevGuild()
+    stranger = person(9, g)
+    assert await ir.join_outcome(stranger) is None              # no role invites in this server: no waiting
+    g.make_welcome()
+    await ir.create_role_invites(g)
+    g.live["plain"] = Inv("plain")
+    ir._uses[g.id]["plain"] = 0
+    cog = ir.InviteRolesCog(bot=None)
+    g.live["plain"].uses += 1
+    await cog.on_member_join(stranger)
+    assert await ir.join_outcome(stranger) is None
+
+
+async def test_ambiguous_join_never_counts_as_developer():
+    g = DevGuild()
+    g.make_welcome()
+    url = await ir.ensure_dev_invite(g, OWNER)
+    links = await ir.create_role_invites(g)
+    cog = ir.InviteRolesCog(bot=None)
+    a, b = person(OWNER, g), person(8, g)
+    g.live[url.rsplit("/", 1)[1]].uses += 1
+    g.live[links[0]["code"]].uses += 1
+    await cog.on_member_join(a)
+    await cog.on_member_join(b)
+    assert await ir.join_outcome(a) is None and await ir.join_outcome(b) is None
+
+
+async def test_welcome_message_is_skipped_for_the_developer_link_only(monkeypatch):
+    import welcome_cog
+    sent = []
+
+    class Chan:
+        name = welcome_cog.WELCOME_CHANNEL_NAME
+
+        async def send(self, **kw):
+            sent.append(kw)
+
+    class G:
+        id = 77
+        system_channel = None
+        text_channels = [Chan()]
+        member_count = 3
+        name = "G"
+        banner = icon = None
+        me = types.SimpleNamespace(display_avatar=types.SimpleNamespace(url="https://x/m.png"))
+
+    member = types.SimpleNamespace(id=1, guild=G(), mention="<@1>", bot=False,
+                                   display_avatar=types.SimpleNamespace(url="https://x/a.png"))
+    cog = welcome_cog.WelcomeCog(bot=None)
+    import importlib
+    mod = importlib.import_module("invite_roles_cog")
+    monkeypatch.setattr(mod, "join_outcome", mock.AsyncMock(return_value="dev"))
+    await cog.on_member_join(member)
+    assert sent == []                                            # developer link: no welcome
+    monkeypatch.setattr(mod, "join_outcome", mock.AsyncMock(return_value="visitor"))
+    await cog.on_member_join(member)
+    assert len(sent) == 1                                        # any other link: normal welcome
+    monkeypatch.setattr(mod, "join_outcome", mock.AsyncMock(side_effect=RuntimeError("boom")))
+    await cog.on_member_join(member)
+    assert len(sent) == 2                                        # a failure here never swallows a welcome
