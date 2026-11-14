@@ -2,21 +2,15 @@ import discord
 from discord.ext import commands
 from config import (
     ADMIN_ROLE_NAMES,
+    assign_kamla_role,
     get_member_kamla_role,
 )
 
-PUBLIC_ROLE_CHANNEL_MAP = {
-    "INVITED ADJUDICATOR":    "invited-adjudicator",
-    "INDEPENDENT ADJUDICATOR": "independent-adjudicator",
-    "DEBATER":                "debater",
-    "VISITOR":                "visitor",
-}
+async def _assign_role(interaction: discord.Interaction, role_name: str) -> None:
+    """Give the clicking member `role_name` (replacing any other tournament role they hold).
 
-
-async def _route_via_assign_channel(
-    interaction: discord.Interaction, role_name: str
-) -> None:
-    """Mention user in the assign channel so AssignCog processes the role."""
+    This used to post a mention in a per-role channel of the 🛅︱ASSIGN category and let another listener
+    assign the role. That category no longer exists, so the role is assigned right here."""
     guild = interaction.guild
     member = interaction.user
 
@@ -30,49 +24,25 @@ async def _route_via_assign_channel(
         )
         return
 
-    # Find assign category
-    assign_cat = discord.utils.get(guild.categories, name="🛅︱ASSIGN")
-    if assign_cat is None:
+    role = next((r for r in guild.roles if r.name == role_name and not r.managed), None)
+    if role is None:
         await interaction.response.send_message(
-            "❌ The ASSIGN category does not exist. Ask an admin to run `/st` first.",
-            ephemeral=True,
-        )
+            f"❌ The **{role_name}** role does not exist. Ask an admin to run `/st` first.", ephemeral=True)
+        return
+    if existing and existing.id == role.id:
+        await interaction.response.send_message(f"You already have the **{role_name}** role.", ephemeral=True)
         return
 
-    # Find the specific assign channel for this role
-    ch_name = PUBLIC_ROLE_CHANNEL_MAP.get(role_name)
-    if ch_name is None:
-        await interaction.response.send_message(
-            f"❌ No assign channel mapping for **{role_name}**.", ephemeral=True
-        )
+    await interaction.response.defer(ephemeral=True)
+    if not await assign_kamla_role(member, role):
+        await interaction.followup.send(
+            "❌ KAMLA could not give you that role. An admin must move **KAMLA's role above the tournament roles** "
+            "(Server Settings → Roles).", ephemeral=True)
         return
-
-    assign_ch = discord.utils.get(assign_cat.text_channels, name=ch_name)
-    if assign_ch is None:
-        await interaction.response.send_message(
-            f"❌ Channel **#{ch_name}** not found in the ASSIGN category.", ephemeral=True
-        )
-        return
-
-    # Bot mentions user in assign channel → AssignCog's on_message handles assignment
-    try:
-        await assign_ch.send(member.mention)
-    except discord.Forbidden:
-        await interaction.response.send_message(
-            "❌ KAMLA cannot send messages in the assign channel. Check permissions.",
-            ephemeral=True,
-        )
-        return
-
     if existing:
-        desc = (
-            f"🔄 Switching your role from **{existing.name}** to **{role_name}**…\n"
-            "Your role will update in a moment."
-        )
+        await interaction.followup.send(f"🔄 Switched your role from **{existing.name}** to **{role_name}**.", ephemeral=True)
     else:
-        desc = f"🔄 Assigning you the **{role_name}** role… it will appear shortly."
-
-    await interaction.response.send_message(desc, ephemeral=True)
+        await interaction.followup.send(f"✅ You are now **{role_name}**.", ephemeral=True)
 
 
 class RoleSelectView(discord.ui.View):
@@ -87,7 +57,7 @@ class RoleSelectView(discord.ui.View):
         row=0,
     )
     async def invited_adj(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await _route_via_assign_channel(interaction, "INVITED ADJUDICATOR")
+        await _assign_role(interaction, "INVITED ADJUDICATOR")
 
     @discord.ui.button(
         label="Independent Adjudicator",
@@ -97,7 +67,7 @@ class RoleSelectView(discord.ui.View):
         row=0,
     )
     async def independent_adj(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await _route_via_assign_channel(interaction, "INDEPENDENT ADJUDICATOR")
+        await _assign_role(interaction, "INDEPENDENT ADJUDICATOR")
 
     @discord.ui.button(
         label="Debater",
@@ -107,7 +77,7 @@ class RoleSelectView(discord.ui.View):
         row=1,
     )
     async def debater(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await _route_via_assign_channel(interaction, "DEBATER")
+        await _assign_role(interaction, "DEBATER")
 
     @discord.ui.button(
         label="Visitor",
@@ -117,7 +87,7 @@ class RoleSelectView(discord.ui.View):
         row=1,
     )
     async def visitor(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await _route_via_assign_channel(interaction, "VISITOR")
+        await _assign_role(interaction, "VISITOR")
 
 
 class RolesCog(commands.Cog):

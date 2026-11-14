@@ -348,8 +348,6 @@ class KamlaBot(commands.Bot):
 
     async def on_member_remove(self, member: discord.Member) -> None:
         # Live member count in the webhook embed (debounced).
-        # NOTE: the ASSIGN-channel mention cleanup lives in AssignCog.on_member_remove;
-        # it used to be duplicated here, doubling the history scans per departure.
         from webhook import schedule_join_log_edit
         schedule_join_log_edit(member.guild, config_manager.get_cached(member.guild.id) or {})
 

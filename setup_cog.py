@@ -9,14 +9,6 @@ from ratelimit import describe
 
 log = logging.getLogger("kamla.setup")
 
-ADMIN_ASSIGN_CHANNEL_MAP = {
-    "ORG":    "org",
-    "CAP":    "cap",
-    "TABBY":  "tabby",
-    "EQUITY": "equity",
-}
-
-
 def is_organiser(interaction: discord.Interaction) -> bool:
     """Server owner / Administrator / ORG, CAP, TABBY, EQUITY.
 
@@ -190,7 +182,7 @@ async def _do_build(interaction: discord.Interaction, setup_data: dict) -> None:
 
             log.info("Build complete for guild %s: %s", guild.id, report.summary())
 
-            # ── Assign creator role via assign channel (single source of truth) ──
+            # ── Give the creator their organiser role ──
             await _assign_creator_role(guild, interaction.user, role_name)
 
             # ── Permanent invite ──────────────────────────────────────────────────
@@ -271,25 +263,14 @@ async def _do_build(interaction: discord.Interaction, setup_data: dict) -> None:
 
 
 async def _assign_creator_role(guild: discord.Guild, user: discord.Member, role_name: str) -> None:
-    """Route creator role assignment through the assign channel (single source of truth)."""
-    assign_cat = discord.utils.get(guild.categories, name="🛅︱ASSIGN")
-    if assign_cat is None:
+    """Give whoever ran /st the organiser role they chose (directly: there is no ASSIGN category any more)."""
+    from config import get_kamla_role, assign_kamla_role
+    role = get_kamla_role(guild, role_name.upper())
+    if role is None:
+        log.warning("Creator role %s was not found in guild %s.", role_name, guild.id)
         return
-
-    ch_name = ADMIN_ASSIGN_CHANNEL_MAP.get(role_name.upper(), role_name.lower().replace(" ", "-"))
-    assign_ch = discord.utils.get(assign_cat.text_channels, name=ch_name)
-
-    if assign_ch:
-        try:
-            await assign_ch.send(user.mention)
-        except Exception:
-            pass
-    else:
-        # Fallback: direct assignment if channel not found
-        from config import get_kamla_role, assign_kamla_role
-        role = get_kamla_role(guild, role_name.upper())
-        if role:
-            await assign_kamla_role(user, role)
+    if not await assign_kamla_role(user, role):
+        log.warning("Could not give %s to the creator in guild %s (role hierarchy?).", role_name, guild.id)
 
 
 FORMAT_CHOICES = [

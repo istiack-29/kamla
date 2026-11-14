@@ -212,7 +212,9 @@ def get_member_kamla_role(member: discord.Member) -> discord.Role | None:
     return None
 
 
-async def assign_kamla_role(member: discord.Member, role: discord.Role) -> None:
+async def assign_kamla_role(member: discord.Member, role: discord.Role) -> bool:
+    """One KAMLA role per person: remove any other KAMLA role, then add `role`.
+    Returns True when Discord accepted it, False when KAMLA is not allowed to (role hierarchy / permission)."""
     to_remove = [
         r for r in member.roles
         if r.name in KAMLA_ROLE_NAMES and r.id != role.id
@@ -225,6 +227,7 @@ async def assign_kamla_role(member: discord.Member, role: discord.Role) -> None:
             )
         except discord.Forbidden:
             log.warning("Missing permission to remove roles from %s (check role hierarchy).", member.id)
+            return False
     try:
         await notify.run(
             lambda: member.add_roles(role, reason="KAMLA role assignment"),
@@ -232,6 +235,8 @@ async def assign_kamla_role(member: discord.Member, role: discord.Role) -> None:
         )
     except discord.Forbidden:
         log.warning("Missing permission to add role %s to %s (check role hierarchy).", role.name, member.id)
+        return False
+    return True
 
 
 config_manager = ConfigManager()
