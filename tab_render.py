@@ -482,26 +482,51 @@ def _side_columns(debates: list[DebateInfo]) -> list[str]:
     return [f"Team {i + 1}" for i in range(n)]
 
 
+def _team_cells(d: DebateInfo, sides: list[str]) -> list[Cell]:
+    by_side = {t.side: t.name for t in d.teams}
+    out = []
+    for i, s in enumerate(sides):
+        name = by_side.get(s) or (d.teams[i].name if len(d.teams) == len(sides) and i < len(d.teams) and s.startswith("Team") else "—")
+        out.append(cell(name or "—", 28))
+    return out
+
+
 def render_draw(tournament: str, rnd: RoundInfo, debates: list[DebateInfo]) -> list[bytes]:
+    """Team matchup only — never adjudicators, whatever /draw is used for: this is the /draw command's image."""
     sides = _side_columns(debates)
-    show_adjs = rnd.adjudicators_released and any(d.chair or d.panel for d in debates)
     columns = [Column("Venue", 1.1)] + [Column(s, 2.0, SIDE_COLORS.get(s, NAVY_2)) for s in sides]
-    if show_adjs:
-        columns += [Column("Chair", 1.5), Column("Panel", 2.0)]
     rows = []
     for d in debates:
-        by_side = {t.side: t.name for t in d.teams}
         row = [cell(d.venue or "—", 28, NAVY, bold=True)]
-        for i, s in enumerate(sides):
-            name = by_side.get(s) or (d.teams[i].name if len(d.teams) == len(sides) and i < len(d.teams) and s.startswith("Team") else "—")
-            row.append(cell(name or "—", 28))
-        if show_adjs:
-            row.append(cell(d.chair or "—", 28))
-            panel = list(d.panel) + [f"{t} (T)" for t in d.trainees]
-            row.append(cell(", ".join(p for p in panel if p) or "—", 26, MUTED))
+        row += _team_cells(d, sides)
         rows.append(row)
-    subtitle = f"{len(debates)} debates" + ("" if show_adjs else "  ·  adjudicators not released yet")
-    return render_table(tournament or "Tournament", f"{rnd.name}  ·  Draw", subtitle, columns, rows)
+    return render_table(tournament or "Tournament", f"{rnd.name}  ·  Draw", f"{len(debates)} debates", columns, rows)
+
+
+def render_draw_adjudicators(tournament: str, rnd: RoundInfo, debates: list[DebateInfo]) -> list[bytes]:
+    """Team matchup PLUS the adjudicator allocation — Chair / Panellist / Trainee are three independent
+    columns, each shown only if at least one debate in this round actually has someone in it. (Only call this
+    for a round whose adjudicators are released — the /drawadj command enforces that.)"""
+    sides = _side_columns(debates)
+    show_panel = any(d.panel for d in debates)
+    show_trainee = any(d.trainees for d in debates)
+    columns = [Column("Venue", 1.0)] + [Column(s, 1.7, SIDE_COLORS.get(s, NAVY_2)) for s in sides] + [Column("Chair", 1.3)]
+    if show_panel:
+        columns.append(Column("Panellist", 1.6))
+    if show_trainee:
+        columns.append(Column("Trainee", 1.6))
+    rows = []
+    for d in debates:
+        row = [cell(d.venue or "—", 28, NAVY, bold=True)]
+        row += _team_cells(d, sides)
+        row.append(cell(d.chair or "—", 28))
+        if show_panel:
+            row.append(cell(", ".join(p for p in d.panel if p) or "—", 26, MUTED))
+        if show_trainee:
+            row.append(cell(", ".join(t for t in d.trainees if t) or "—", 26, MUTED))
+        rows.append(row)
+    return render_table(tournament or "Tournament", f"{rnd.name}  ·  Adjudicator Draw", f"{len(debates)} debates",
+                        columns, rows)
 
 
 # ── results ───────────────────────────────────────────────────────────────────

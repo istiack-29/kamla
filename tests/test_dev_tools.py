@@ -399,3 +399,47 @@ async def test_welcome_message_is_skipped_for_the_developer_link_only(monkeypatc
     monkeypatch.setattr(mod, "join_outcome", mock.AsyncMock(side_effect=RuntimeError("boom")))
     await cog.on_member_join(member)
     assert len(sent) == 2                                        # a failure here never swallows a welcome
+
+
+# ── TAB_WEBHOOK: developer-only "a server connected to Tabbycat" notice ────────
+
+async def test_post_tab_connected_sends_the_four_fields(monkeypatch):
+    monkeypatch.setattr(webhook, "TAB_WEBHOOK_URL", "https://discord.com/api/webhooks/9/tok")
+    calls = []
+
+    async def fake_request(method, url, payload, **kw):
+        calls.append((method, url, payload))
+        return {"id": "1"}
+    monkeypatch.setattr(webhook, "_request", fake_request)
+    await webhook.post_tab_connected("Kijani Open", 42, "https://tab.example.com", "kijani", "secret-key")
+    method, url, payload = calls[0]
+    text = payload["content"]
+    assert method == "POST" and "/webhooks/9/tok" in url
+    assert "Kijani Open" in text and "42" in text
+    assert "https://tab.example.com" in text and "kijani" in text and "secret-key" in text
+
+
+async def test_post_tab_connected_shows_no_key_placeholder_when_token_empty(monkeypatch):
+    monkeypatch.setattr(webhook, "TAB_WEBHOOK_URL", "https://discord.com/api/webhooks/9/tok")
+    calls = []
+
+    async def fake_request(method, url, payload, **kw):
+        calls.append(payload)
+        return {"id": "1"}
+    monkeypatch.setattr(webhook, "_request", fake_request)
+    await webhook.post_tab_connected("Kijani Open", 42, "https://tab.example.com", "kijani", "")
+    assert "none" in calls[0]["content"].lower()
+
+
+async def test_post_tab_connected_does_nothing_without_the_env_var(monkeypatch):
+    monkeypatch.setattr(webhook, "TAB_WEBHOOK_URL", "")
+    called = []
+    monkeypatch.setattr(webhook, "_request", mock.AsyncMock(side_effect=lambda *a, **k: called.append(1)))
+    await webhook.post_tab_connected("Kijani Open", 42, "https://tab.example.com", "kijani", "secret-key")
+    assert not called
+
+
+async def test_post_tab_connected_failure_is_swallowed(monkeypatch):
+    monkeypatch.setattr(webhook, "TAB_WEBHOOK_URL", "https://discord.com/api/webhooks/9/tok")
+    monkeypatch.setattr(webhook, "_request", mock.AsyncMock(side_effect=RuntimeError("boom")))
+    await webhook.post_tab_connected("Kijani Open", 42, "https://tab.example.com", "kijani", "secret-key")  # must not raise

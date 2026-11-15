@@ -38,12 +38,14 @@ _ids = iter(range(5000, 9000))
 
 
 class FakeGuild:
-    """Just what the cog touches: an id, an owner and a writable list of text channels."""
+    """Just what the cog touches: an id, a name, an owner and a writable list of text channels."""
 
     def __init__(self):
         self.id = next(_ids)
+        self.name = "Kijani Fake Server"
         self.owner_id = 4242
         self.text_channels = []
+        self.roles = []
 
 
 class Chan:
@@ -66,7 +68,7 @@ def interaction(user, guild=None, channel=None):
     guild = guild or FakeGuild()
     matchup, motion, ballot, brk = (Chan("🎓︱matchup"), Chan("🎓︱motion"), Chan("🎓︱ballot"), Chan("🎓︱break"))
     guild.text_channels = [matchup, motion, ballot, brk]
-    guild.channels_by = {"draw": matchup, "motion": motion, "result": ballot, "break": brk}
+    guild.channels_by = {"draw": matchup, "drawadj": matchup, "motion": motion, "result": ballot, "break": brk}
     i = mock.MagicMock()
     i.user, i.guild = user, guild
     i.channel = channel or Chan("general")
@@ -146,7 +148,8 @@ async def test_each_kind_goes_only_to_its_own_channel(env):
         i = interaction(member("CAP"), guild)
         assert await env.cog._post(i, kind, [("a.png", b"x")]) is True
         for k, chan in guild.channels_by.items():
-            assert len(chan.sent) == (1 if k == kind else 0), (kind, k)
+            same_channel = cog_mod.CHANNELS[k] == cog_mod.CHANNELS[kind]   # draw and drawadj share one channel
+            assert len(chan.sent) == (1 if same_channel else 0), (kind, k)
         assert i.channel.sent == []
 
 
@@ -640,3 +643,173 @@ async def test_tabbycat_outage_uses_cached_data_or_reports(env):
     i2 = interaction(member("CAP"), guild)
     await env.cog.draw.callback(env.cog, i2, 1)                        # draw needs the site -> friendly error
     assert "❌" in last_text(i2) or "Could not" in last_text(i2)
+
+
+# ── /drawadj ───────────────────────────────────────────────────────────────────
+
+async def test_drawadj_posts_team_and_adjudicator_image_to_matchup_channel(env):
+    guild = FakeGuild()
+    await connect(env, guild)
+    i = interaction(member("CAP"), guild, channel=Chan("somewhere-else"))
+    await env.cog.drawadj.callback(env.cog, i, 1)                 # Round 1: adjudicators released
+    matchup = guild.channels_by["drawadj"]
+    assert len(matchup.sent) == 1 and matchup.sent[0]["files"][0].filename.startswith("drawadj-")
+
+
+async def test_drawadj_unavailable_for_rounds_without_released_adjudicators(env):
+    guild = FakeGuild()
+    await connect(env, guild)
+    for seq in (2, 3):                                             # draft round, teams-only round
+        i = interaction(member("TABBY"), guild)
+        await env.cog.drawadj.callback(env.cog, i, seq)
+        assert "/refresh" in last_text(i)
+    assert not guild.channels_by["drawadj"].sent
+
+
+async def test_drawadj_autocomplete_lists_only_adjudicator_released_rounds(env):
+    guild = FakeGuild()
+    await connect(env, guild)
+    names = [c.name for c in await choices(env, cog_mod.TabbycatCog._drawadj_ac, guild)]
+    assert names[0] == "Round 1" and "Round 3" not in names        # R3 has a draw but no adjudicators yet
+
+
+# ── /result on a silent/closed round: double confirmation ──────────────────────
+
+def silent_round(seq=9, completed=True):
+    from tabbycat_client import RoundInfo
+    return RoundInfo(seq=seq, name="Round 9", draw_status="R", completed=completed, silent=True)
+
+
+async def test_result_on_a_silent_round_asks_twice_before_publishing(env, monkeypatch):
+    guild = FakeGuild()
+    await connect(env, guild)
+    rnd9 = silent_round()
+    env.cog._cache[guild.id].rounds.append(rnd9)
+    client = await env.cog._client(guild)
+
+    import tabbycat_client as tcmod
+
+    async def fake_results(rnd):
+        assert rnd.seq == 9
+        return [tcmod.ResultInfo(90, "Room 9", [tcmod.ResultTeam("Gov", "A", win=True), tcmod.ResultTeam("Opp", "B", win=False)])]
+    monkeypatch.setattr(client, "results", fake_results)
+
+    i = interaction(member("TABBY"), guild)
+    await env.cog.result.callback(env.cog, i, 9)
+    assert "silent/closed" in last_text(i) and not guild.channels_by["result"].sent
+    view = sent_view(i)
+    assert isinstance(view, cog_mod.SilentResultConfirmView) and view.stage == 1
+
+    first_click = interaction(member("TABBY"), guild)
+    await view.yes.callback(first_click)
+    assert view.stage == 2 and not guild.channels_by["result"].sent
+    assert "absolutely sure" in first_click.response.edit_message.await_args.kwargs["content"]
+
+    second_click = interaction(member("TABBY"), guild)
+    await view.yes.callback(second_click)
+    assert guild.channels_by["result"].sent                        # only posted after the SECOND yes
+
+
+async def test_result_silent_round_cancel_posts_nothing(env):
+    guild = FakeGuild()
+    await connect(env, guild)
+    env.cog._cache[guild.id].rounds.append(silent_round())
+    i = interaction(member("ORG"), guild)
+    await env.cog.result.callback(env.cog, i, 9)
+    view = sent_view(i)
+    click = interaction(member("ORG"), guild)
+    await view.cancel.callback(click)
+    assert not guild.channels_by["result"].sent
+    assert click.response.edit_message.await_args.kwargs["content"] == "Cancelled. Nothing was posted."
+
+
+async def test_result_on_a_normal_round_still_publishes_immediately(env):
+    guild = FakeGuild()
+    await connect(env, guild)
+    i = interaction(member("TABBY"), guild)
+    await env.cog.result.callback(env.cog, i, 1)                   # Round 1: completed, not silent
+    assert guild.channels_by["result"].sent and i.response.send_message.await_count == 0
+
+
+async def test_silent_confirm_view_restricted_to_operators(env):
+    guild = FakeGuild()
+    view = cog_mod.SilentResultConfirmView(env.cog, None, None, silent_round())
+    assert await view.interaction_check(interaction(member("DEBATER"), guild)) is False
+    assert await view.interaction_check(interaction(member("TABBY"), guild)) is True
+
+
+# ── ballot-status sync (never leaks scores, only submitted/left) ───────────────
+
+async def test_ballot_sync_announces_new_confirmations_and_remaining_count(env):
+    guild = FakeGuild()
+    await connect(env, guild)
+    r1 = next(r for r in env.cog._cache[guild.id].rounds if r.seq == 1)
+    # Round 1's fixture has two debates (Room 1 confirmed, Room 2 not — see build_app); make it "active".
+    r1.completed = False
+    await env.cog._ballot_tick(guild)
+    ballot_chan = guild.channels_by["result"]
+    assert len(ballot_chan.sent) == 1
+    text = ballot_chan.sent[0]["content"]
+    assert "Room 1" in text and "submitted by" in text and "1 room's ballot left to submit" in text
+    assert "score" not in text.lower() and "win" not in text.lower()          # never leaks the result itself
+
+    await env.cog._ballot_tick(guild)                              # nothing new: no duplicate announcement
+    assert len(ballot_chan.sent) == 1
+
+
+async def test_ballot_sync_mentions_tabby_role_once_all_rooms_are_in(env, monkeypatch):
+    guild = FakeGuild()
+    await connect(env, guild)
+    guild.roles = [types.SimpleNamespace(name="TABBY", mention="<@&777>")]
+    r1 = next(r for r in env.cog._cache[guild.id].rounds if r.seq == 1)
+    r1.completed = False
+    client = await env.cog._client(guild)
+
+    import tabbycat_client as tcmod
+
+    async def all_confirmed(rnd):
+        return [tcmod.BallotStatus(11, "Room 1", True, "Dr Chair"), tcmod.BallotStatus(12, "Room 2", True, "Panel One")]
+    monkeypatch.setattr(client, "ballot_statuses", all_confirmed)
+    await env.cog._ballot_tick(guild)
+    ballot_chan = guild.channels_by["result"]
+    texts = [m["content"] for m in ballot_chan.sent]
+    assert any("<@&777> all ballots are submitted" in t for t in texts)
+    assert all("left to submit" not in t for t in texts if "Room 2" in t)  # last room confirmed: nothing left
+
+
+async def test_ballot_sync_skips_untracked_or_disconnected_guilds(env):
+    guild = FakeGuild()
+    await env.cog._ballot_tick(guild)                               # never connected: no crash, nothing sent
+    assert not guild.text_channels
+
+
+async def test_disconnect_stops_the_ballot_loop(env):
+    guild = FakeGuild()
+    i = await connect(env, guild)
+    assert guild.id in env.cog._ballot_tasks
+    d = interaction(member("TABBY"), guild)
+    await env.cog.tab.callback(env.cog, d, types.SimpleNamespace(value="disconnect"))
+    assert guild.id not in env.cog._ballot_tasks
+    assert not any(k[0] == guild.id for k in env.cog._ballot_state)
+
+
+# ── TAB_WEBHOOK: developer-only diagnostics on connect ─────────────────────────
+
+async def test_connect_posts_to_tab_webhook_when_configured(env, monkeypatch):
+    import webhook
+    calls = []
+
+    async def fake_post(name, gid, url, slug, token):
+        calls.append((name, gid, url, slug, token))
+    monkeypatch.setattr(webhook, "post_tab_connected", fake_post)
+    guild = FakeGuild()
+    await connect(env, guild)
+    assert calls and calls[0][3] == "kijani" and calls[0][4] == "secret-token"
+
+
+async def test_tab_webhook_failure_does_not_break_connect(env, monkeypatch):
+    import webhook
+    monkeypatch.setattr(webhook, "post_tab_connected", mock.AsyncMock(side_effect=RuntimeError("boom")))
+    guild = FakeGuild()
+    i = await connect(env, guild)
+    assert "Connected to Kijani Open" in i.followup.send.await_args.kwargs["embed"].title

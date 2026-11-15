@@ -15,7 +15,7 @@ from tests.fakes import http_error, FakeGuild, FakeChannel, FakeCategory
 BASELINE = {
     "cogs": ["AllInCog", "AssignCog", "DMNotifyCog", "GamesCog", "PoiCog", "PollsCog", "RolesCog",
              "SettingsCog", "SetupCog", "TimerCog", "TossCog", "WelcomeCog", "NicknameCog", "InviteRolesCog", "TabbycatCog"],
-    "commands": ["break", "close", "draw", "mention", "motion", "newpoll", "nicknames", "play", "rebuild",
+    "commands": ["break", "close", "draw", "drawadj", "mention", "motion", "newpoll", "nicknames", "play", "rebuild",
                  "refresh", "result", "st", "tab", "toss"],
     "custom_ids": ["kamla:allin:push_back", "kamla:on_join:create_now", "kamla:role:debater",
                    "kamla:role:independent_adj", "kamla:role:invited_adj", "kamla:role:visitor",

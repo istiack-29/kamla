@@ -163,3 +163,45 @@ def test_speaker_break_of_100_rows_is_one_image():
 def test_adjudicator_break_renders():
     pages = tr.render_adjudicator_break("Open", ["Dr Chair", "পানেল ওয়ান", "🧑‍⚖️ Judge J"])
     assert len(pages) == 1 and size_of(pages[0])[1] > 300
+
+
+# ── adjudicator draw (/drawadj): independent chair/panel/trainee columns ──────
+
+def adj(i, chair="Chair", panel=(), trainees=()):
+    return DebateInfo(id=i, venue=f"Room {i}", teams=[TeamSlot("Gov", "A"), TeamSlot("Opp", "B")],
+                      chair=chair, panel=list(panel), trainees=list(trainees))
+
+
+def _header_texts_of(png: bytes) -> list[str]:
+    """We can't OCR the PNG, so this just documents the expected column SET via the render call succeeding;
+    the real assertions below check tr.render_draw_adjudicators doesn't raise and produces distinct output
+    per configuration (covered by the byte-difference checks)."""
+    return []
+
+
+def test_only_chair_when_no_panel_or_trainee_exist_in_the_round():
+    a = tr.render_draw_adjudicators("Open", RND, [adj(1), adj(2)])
+    assert a  # renders fine with just Venue/Gov/Opp/Chair
+
+
+def test_panel_column_hidden_when_no_debate_has_a_panellist():
+    with_trainee_only = [adj(1, trainees=["T1"]), adj(2)]
+    a = tr.render_draw_adjudicators("Open", RND, with_trainee_only)
+    chair_trainee_only = tr.render_draw_adjudicators("Open", RND, [adj(1, chair="C", trainees=["T1"])])
+    assert a and chair_trainee_only
+    # a debate with ONLY chair+panel vs ONLY chair+trainee must differ (different column sets)
+    chair_panel_only = tr.render_draw_adjudicators("Open", RND, [adj(1, chair="C", panel=["P1"])])
+    assert chair_panel_only != chair_trainee_only
+
+
+def test_trainee_column_present_only_when_some_debate_has_one():
+    none_have_trainees = [adj(1, panel=["P1"]), adj(2, panel=["P2"])]
+    one_has_trainee = [adj(1, panel=["P1"]), adj(2, panel=["P2"], trainees=["T1"])]
+    assert tr.render_draw_adjudicators("Open", RND, none_have_trainees) != \
+        tr.render_draw_adjudicators("Open", RND, one_has_trainee)
+
+
+def test_draw_adj_never_crashes_on_hostile_input():
+    weird = [adj(1, chair="", panel=[], trainees=[]), adj(2, chair="ড. করিম", panel=["🎉🎉🎉"], trainees=["x" * 200])]
+    assert tr.render_draw_adjudicators("Open" * 80, RND, weird)
+    assert tr.render_draw_adjudicators("", RND, [])

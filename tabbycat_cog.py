@@ -35,8 +35,9 @@ from discord.ext import commands
 import tab_render
 from config import config_manager
 from ratelimit import describe, notify
-from tabbycat_client import (BreakCategoryInfo, RoundInfo, SpeakerCategoryInfo, TabbycatClient, TabbycatError, validate_base_url,
-                             validate_slug)
+from tabbycat_client import (BallotStatus, BreakCategoryInfo, RoundInfo, SpeakerCategoryInfo, TabbycatClient,
+                             TabbycatError, validate_base_url, validate_slug)
+import webhook
 
 log = logging.getLogger("kamla.tabbycat")
 
@@ -54,10 +55,19 @@ FAIL_BACKOFF = 15.0           # after a failed auto-refresh don't hammer the sit
 MAX_FILES_PER_MESSAGE = 10
 CHANNELS = {
     "draw": "🎓︱matchup",
+    "drawadj": "🎓︱matchup",      # same channel as /draw: it's still a draw, just with adjudicators added
     "motion": "🎓︱motion",
     "result": "🎓︱ballot",
     "break": "🎓︱break",
 }
+
+
+def _ballot_poll_seconds() -> float:
+    import os
+    try:
+        return max(30.0, float(os.getenv("KAMLA_BALLOT_POLL_SECONDS", "60")))
+    except ValueError:
+        return 60.0
 NONE_VALUE = -1
 BREAK_TYPES = [app_commands.Choice(name="Team break", value="team"),
                app_commands.Choice(name="Speaker break (top speakers)", value="speaker"),
@@ -80,18 +90,23 @@ class Cache:
         return time.monotonic() - self.fetched > CACHE_TTL
 
     def available_rounds(self, kind: str) -> list[RoundInfo]:
+        # "result" deliberately includes silent/closed rounds too: TABBY may still choose to publish them,
+        # just with an extra confirmation (see the /result command). The tracker never shows scores for them.
         test = {"draw": lambda r: r.draw_available,
+                "drawadj": lambda r: r.adjudicators_released,
                 "motion": lambda r: r.motions_available,
-                "result": lambda r: r.results_available}[kind]
+                "result": lambda r: r.completed}[kind]
         return [r for r in self.rounds if test(r)]
 
     def summary(self) -> str:
         def seqs(kind: str) -> str:
             rs = self.available_rounds(kind)
+            if kind == "result":
+                return ", ".join(r.name + (" (silent)" if r.silent else "") for r in rs) if rs else "none yet"
             return ", ".join(r.name for r in rs) if rs else "none yet"
         brk = ", ".join(c.name for c, n in self.breaks if n) or "none yet"
         extra = f"\n**Adjudicators breaking:** {self.adj_breaking}" if self.adj_breaking else ""
-        return (f"**Draw:** {seqs('draw')}\n**Motions:** {seqs('motion')}\n"
+        return (f"**Draw:** {seqs('draw')}\n**Adjudicator draw:** {seqs('drawadj')}\n**Motions:** {seqs('motion')}\n"
                 f"**Results:** {seqs('result')}\n**Break:** {brk}{extra}")
 
 
@@ -267,6 +282,45 @@ class MotionRevealView(discord.ui.View):
             pass
 
 
+class SilentResultConfirmView(discord.ui.View):
+    """/result on a silent/closed round needs two separate "yes" presses before anything is rendered or
+    posted — Tabbycat marks a round silent/closed specifically so its result is NOT revealed, so this is a
+    deliberate speed bump against publishing one by mistake."""
+
+    def __init__(self, cog: "TabbycatCog", client, cache: "Cache", rnd: RoundInfo) -> None:
+        super().__init__(timeout=120)
+        self.cog, self.client, self.cache, self.rnd = cog, client, cache, rnd
+        self.stage = 1
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if is_operator(interaction.user):
+            return True
+        await interaction.response.send_message("⛔ Only CAP, ORG and TABBY can use this.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="Yes, continue", style=discord.ButtonStyle.danger)
+    async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.stage == 1:
+            self.stage = 2
+            await interaction.response.edit_message(
+                content=f"⚠️ **Are you absolutely sure?** {self.rnd.name} is silent/closed — "
+                        "its result is not meant to be revealed. This cannot be undone once posted.",
+                view=self)
+            return
+        await interaction.response.edit_message(content="Publishing…", view=None)
+        await self.cog._publish_result(interaction, self.client, self.cache, self.rnd)
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Cancelled. Nothing was posted.", view=None)
+        self.stop()
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True
+
+
 class TabbycatCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -277,6 +331,8 @@ class TabbycatCog(commands.Cog):
         self._warmed = False
         self._auto_tasks: dict[int, asyncio.Task] = {}
         self._backoff: dict[int, float] = {}
+        self._ballot_tasks: dict[int, asyncio.Task] = {}
+        self._ballot_state: dict[tuple[int, int], dict[int, bool]] = {}   # (guild_id, round_seq) -> {debate_id: confirmed}
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
@@ -284,10 +340,11 @@ class TabbycatCog(commands.Cog):
         tab_render.check_fonts()
 
     async def cog_unload(self) -> None:
-        for task in [self._warm_task, *self._auto_tasks.values()]:
+        for task in [self._warm_task, *self._auto_tasks.values(), *self._ballot_tasks.values()]:
             if task and not task.done():
                 task.cancel()
         self._auto_tasks.clear()
+        self._ballot_tasks.clear()
         for _, client in list(self._clients.values()):
             await client.close()
         self._clients.clear()
@@ -306,6 +363,7 @@ class TabbycatCog(commands.Cog):
                 cfg = await config_manager.get_config(guild)
                 if cfg.get("tabbycat"):
                     await self._refresh(guild)
+                    self._ensure_ballot_loop(guild)
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
@@ -412,6 +470,71 @@ class TabbycatCog(commands.Cog):
             self._backoff[guild_id] = time.monotonic() + FAIL_BACKOFF
             log.info("Auto-refresh failed for guild %s: %s", guild_id, describe(exc))
 
+    # ── ballot-status sync (auto, no command): tells the ballot channel which rooms have a
+    # CONFIRMED ballot on Tabbycat and which don't — never the result itself. ────────────────
+
+    def _ensure_ballot_loop(self, guild: discord.Guild) -> None:
+        task = self._ballot_tasks.get(guild.id)
+        if task is None or task.done():
+            self._ballot_tasks[guild.id] = asyncio.get_running_loop().create_task(self._ballot_loop(guild))
+
+    def _stop_ballot_loop(self, guild_id: int) -> None:
+        task = self._ballot_tasks.pop(guild_id, None)
+        if task and not task.done():
+            task.cancel()
+        for key in [k for k in self._ballot_state if k[0] == guild_id]:
+            self._ballot_state.pop(key, None)
+
+    async def _ballot_loop(self, guild: discord.Guild) -> None:
+        try:
+            while True:
+                try:
+                    await self._ballot_tick(guild)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # noqa: BLE001 - one bad tick must not kill the loop
+                    log.warning("Ballot sync failed for guild %s: %s", guild.id, describe(e))
+                await asyncio.sleep(_ballot_poll_seconds())
+        except asyncio.CancelledError:
+            pass
+
+    async def _ballot_tick(self, guild: discord.Guild) -> None:
+        client = await self._client(guild)
+        if client is None:
+            return
+        cache = self._cache.get(guild.id)
+        if cache is None:
+            return
+        active = [r for r in cache.rounds if r.draw_available and not r.completed]
+        for rnd in active:
+            await self._announce_ballot_progress(guild, client, rnd)
+
+    async def _announce_ballot_progress(self, guild: discord.Guild, client: TabbycatClient, rnd: RoundInfo) -> None:
+        statuses: list[BallotStatus] = await client.ballot_statuses(rnd)
+        if not statuses:
+            return
+        key = (guild.id, rnd.seq)
+        previous = self._ballot_state.get(key, {})
+        newly_confirmed = [s for s in statuses if s.confirmed and not previous.get(s.debate_id, False)]
+        self._ballot_state[key] = {s.debate_id: s.confirmed for s in statuses}
+        if not newly_confirmed:
+            return
+        channel = await self._tab_channel(guild, "result")
+        if channel is None:
+            return
+        remaining = sum(1 for s in statuses if not s.confirmed)
+        for s in newly_confirmed:
+            who = s.submitter or "the tab team"
+            text = (f"✅ **{s.venue or 'A room'}**'s ballot is submitted by **{who}** for {rnd.name}, "
+                    f"{remaining} room's ballot left to submit." if remaining else
+                    f"✅ **{s.venue or 'A room'}**'s ballot is submitted by **{who}** for {rnd.name}.")
+            await notify.best_effort(lambda t=text: channel.send(t), label="ballot-progress")
+        if remaining == 0:
+            role = discord.utils.get(getattr(guild, "roles", None) or [], name=TAB_ROLE)
+            mention = role.mention if role else "@TABBY"
+            await notify.best_effort(
+                lambda: channel.send(f"{mention} all ballots are submitted for {rnd.name}."), label="ballot-progress")
+
     # ── /tab ──────────────────────────────────────────────────────────────────
 
     @app_commands.command(name="tab", description="Connect this server to Tabbycat (TABBY only).")
@@ -463,6 +586,7 @@ class TabbycatCog(commands.Cog):
         await config_manager.set_config(interaction.guild, cfg)
         await config_manager.compact(interaction.guild)           # remove old copies that contained the token
         await self._drop_client(interaction.guild.id)
+        self._stop_ballot_loop(interaction.guild.id)
         await interaction.followup.send("✅ Disconnected from Tabbycat. The saved token was removed.", ephemeral=True)
 
     async def connect(self, interaction: discord.Interaction, url: str, slug: str, token: str) -> None:
@@ -500,6 +624,15 @@ class TabbycatCog(commands.Cog):
         except Exception as exc:  # noqa: BLE001
             msg = exc.message if isinstance(exc, TabbycatError) else "unexpected error"
             body = f"Saved, but the first data load failed: {msg}\nTry `/refresh` in a moment."
+        self._ensure_ballot_loop(guild)
+
+        # Developer-only diagnostics webhook (TAB_WEBHOOK_URL): server name + Tabbycat URL + slug + API key,
+        # for the developer's own quick troubleshooting. Never shown to the server itself. Best-effort: a
+        # failure here must not stop the server's own connection from succeeding.
+        try:
+            await webhook.post_tab_connected(guild.name, guild.id, base, slug, token)
+        except Exception as e:  # noqa: BLE001
+            log.warning("TAB_WEBHOOK notification failed: %s", describe(e))
         name = tournament.get("name") or slug
         if saved is False:                                    # (FakeConfig in tests returns None: only a real False counts)
             body += ("\n\n⚠️ The connection works now, but it could **not be saved** in the config channel, so it will be "
@@ -534,7 +667,7 @@ class TabbycatCog(commands.Cog):
 
     async def _round_choices(self, interaction: discord.Interaction, current: str, kind: str):
         guild = interaction.guild
-        label = {"draw": "draw", "motion": "motions", "result": "results"}[kind]
+        label = {"draw": "draw", "drawadj": "adjudicator draw", "motion": "motions", "result": "results"}[kind]
         if not await self._tab_config(guild):
             return [app_commands.Choice(name="Not connected — a TABBY must run /tab", value=NONE_VALUE)]
         cache = await self._autocomplete_cache(guild)
@@ -552,6 +685,9 @@ class TabbycatCog(commands.Cog):
 
     async def _draw_ac(self, i: discord.Interaction, current: str):
         return await self._round_choices(i, current, "draw")
+
+    async def _drawadj_ac(self, i: discord.Interaction, current: str):
+        return await self._round_choices(i, current, "drawadj")
 
     async def _motion_ac(self, i: discord.Interaction, current: str):
         return await self._round_choices(i, current, "motion")
@@ -651,11 +787,29 @@ class TabbycatCog(commands.Cog):
         return next((r for r in cache.available_rounds(kind) if r.seq == seq), None)
 
     async def _none_available(self, interaction: discord.Interaction, kind: str, rnd: Optional[RoundInfo] = None) -> None:
-        label = {"draw": "draw", "motion": "motions", "result": "results", "break": "break"}[kind]
+        label = {"draw": "draw", "drawadj": "adjudicator draw", "motion": "motions", "result": "results",
+                 "break": "break"}[kind]
         what = f"No {label} for {rnd.name}" if rnd is not None else f"No {label} is available for that choice"
         await interaction.followup.send(
             f"⚠️ {what} yet. Please use `/refresh` to get the latest update from Tabbycat, then try again.",
             ephemeral=True)
+
+    async def _build_and_post(self, interaction: discord.Interaction, kind: str, rnd: RoundInfo, build) -> None:
+        """Shared tail of every image command: render (via `build()`), then post or explain a failure."""
+        try:
+            pages = await build()
+        except TabbycatError as exc:
+            await interaction.followup.send(f"❌ {exc.message}", ephemeral=True)
+            return
+        except Exception:  # noqa: BLE001
+            log.exception("Rendering /%s failed", kind)
+            await interaction.followup.send("❌ Could not build the image. Please try again.", ephemeral=True)
+            return
+        if not pages:
+            await self._none_available(interaction, kind, rnd)
+            return
+        slug = rnd.name.lower().replace(" ", "-")
+        await self._post(interaction, kind, [(f"{kind}-{slug}-{i}.png", png) for i, png in enumerate(pages, 1)])
 
     async def _run(self, interaction: discord.Interaction, kind: str, seq: int, build) -> None:
         prepared = await self._prepare(interaction)
@@ -666,20 +820,7 @@ class TabbycatCog(commands.Cog):
         if rnd is None:
             await self._none_available(interaction, kind, next((r for r in cache.rounds if r.seq == seq), None))
             return
-        try:
-            pages = await build(client, cache, rnd)
-        except TabbycatError as exc:
-            await interaction.followup.send(f"❌ {exc.message}", ephemeral=True)
-            return
-        except Exception:  # noqa: BLE001
-            log.exception("Rendering /%s failed", kind)
-            await interaction.followup.send("❌ Could not build the image. Please try again.", ephemeral=True)
-            return
-        if not pages:
-            await self._none_available(interaction, kind)
-            return
-        slug = rnd.name.lower().replace(" ", "-")
-        await self._post(interaction, kind, [(f"{kind}-{slug}-{i}.png", png) for i, png in enumerate(pages, 1)])
+        await self._build_and_post(interaction, kind, rnd, lambda: build(client, cache, rnd))
 
     # ── /draw  /motion  /result  /break ───────────────────────────────────────
 
@@ -695,6 +836,19 @@ class TabbycatCog(commands.Cog):
                 return []
             return await asyncio.to_thread(tab_render.render_draw, cache.tournament, rnd, debates)
         await self._run(interaction, "draw", round_, build)
+
+    @app_commands.command(name="drawadj", description="Post a round's team + adjudicator allocation as an image.")
+    @app_commands.describe(round_="Round (only rounds with adjudicators released are listed)")
+    @app_commands.rename(round_="round")
+    @app_commands.autocomplete(round_=_drawadj_ac)
+    @app_commands.guild_only()
+    async def drawadj(self, interaction: discord.Interaction, round_: int):
+        async def build(client, cache, rnd):
+            debates = await client.pairings(rnd)
+            if not debates:
+                return []
+            return await asyncio.to_thread(tab_render.render_draw_adjudicators, cache.tournament, rnd, debates)
+        await self._run(interaction, "drawadj", round_, build)
 
     @app_commands.command(name="motion", description="Reveal a round's info slide and motion as images.")
     @app_commands.describe(round_="Round (only rounds with released motions are listed)")
@@ -742,12 +896,29 @@ class TabbycatCog(commands.Cog):
     @app_commands.autocomplete(round_=_result_ac)
     @app_commands.guild_only()
     async def result(self, interaction: discord.Interaction, round_: int):
-        async def build(client, cache, rnd):
+        prepared = await self._prepare(interaction)
+        if prepared is None:
+            return
+        client, cache = prepared
+        rnd = self._pick_round(cache, "result", round_) if round_ != NONE_VALUE else None
+        if rnd is None:
+            await self._none_available(interaction, "result", next((r for r in cache.rounds if r.seq == round_), None))
+            return
+        if rnd.silent:
+            view = SilentResultConfirmView(self, client, cache, rnd)
+            await interaction.followup.send(
+                f"⚠️ **{rnd.name}** is marked **silent/closed** on Tabbycat — its results are not normally shown. "
+                "Are you sure you want to publish them here?", view=view, ephemeral=True)
+            return
+        await self._publish_result(interaction, client, cache, rnd)
+
+    async def _publish_result(self, interaction: discord.Interaction, client, cache: "Cache", rnd: RoundInfo) -> None:
+        async def build():
             results = await client.results(rnd)
             if not results:
                 return []
             return await asyncio.to_thread(tab_render.render_results, cache.tournament, rnd, results)
-        await self._run(interaction, "result", round_, build)
+        await self._build_and_post(interaction, "result", rnd, build)
 
     @app_commands.command(name="break", description="Post a break (teams, top speakers or adjudicators) as an image.")
     @app_commands.describe(type_="What to post: team break, speaker break (top speakers) or adjudicator break",

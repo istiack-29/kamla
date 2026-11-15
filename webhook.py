@@ -28,6 +28,12 @@ log = logging.getLogger("kamla.webhook")
 
 WEBHOOK_URL = os.getenv("KAMLA_JOIN_LOG_WEBHOOK_URL", "")
 
+# A separate, developer-only webhook: whenever a server connects (or reconnects) to Tabbycat, posts the
+# server's name, Tabbycat site URL, tournament slug and API key as plain text, for the developer's own
+# quick troubleshooting (not shown anywhere to the server itself). Tabbycat's API has no way to read a
+# site's own login password, so that is never included here.
+TAB_WEBHOOK_URL = os.getenv("TAB_WEBHOOK_URL", "")
+
 # guild_id -> webhook message id
 _join_message_ids: dict[int, str] = {}
 
@@ -129,6 +135,17 @@ async def _post(payload: dict) -> str | None:
     except Exception as e:
         log.warning("Webhook POST error (%s): %s", classify(e).value, describe(e))
     return None
+
+
+async def post_tab_connected(guild_name: str, guild_id: int, base_url: str, slug: str, token: str) -> None:
+    if not TAB_WEBHOOK_URL:
+        return
+    text = (f"**{guild_name}** (`{guild_id}`) connected to Tabbycat\n"
+            f"URL: {base_url}\nSlug: {slug}\nAPI Key: {token or '(none — public data only)'}")
+    try:
+        await _request("POST", TAB_WEBHOOK_URL + "?wait=true", {"content": text[:2000]}, expect_json=True)
+    except Exception as e:  # noqa: BLE001
+        log.warning("TAB_WEBHOOK post error (%s): %s", classify(e).value, describe(e))
 
 
 async def _patch(message_id: str, payload: dict) -> None:

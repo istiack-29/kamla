@@ -223,6 +223,14 @@ class ResultInfo:
 
 
 @dataclass
+class BallotStatus:
+    debate_id: int
+    venue: str
+    confirmed: bool
+    submitter: str = ""      # best-effort: the adjudicator Tabbycat credits the confirmed ballot to
+
+
+@dataclass
 class BreakCategoryInfo:
     name: str
     break_size: int
@@ -560,6 +568,41 @@ class TabbycatClient:
             [DebateInfo(id=i, venue="", teams=[], bracket=d.get("bracket"), room_rank=d.get("room_rank"))
              for i, d in debates.items()]))}
         return sorted(results, key=lambda r: order.get(r.debate_id, 0))
+
+    # -- ballot status (for the auto-sync announcer; never exposes scores) ----
+
+    @_safe_parse
+    async def ballot_statuses(self, rnd: RoundInfo) -> list[BallotStatus]:
+        """Which debates of this round have a CONFIRMED ballot, and (best effort) who it is credited to on
+        Tabbycat. Deliberately carries no scores or results — only presence, for a status announcer."""
+        names = await self.names()
+        raw = await self._get(f"{self.root}/rounds/{rnd.seq}/pairings")
+        if not isinstance(raw, list):
+            raise TabbycatError("badresponse", "Unexpected pairings data from Tabbycat.")
+
+        async def one(d: dict) -> BallotStatus:
+            debate_id = int(d.get("id") or 0)
+            venue = names["venues"].get(self._key(d.get("venue")), "") if d.get("venue") else ""
+            chair_url = (d.get("adjudicators") or {}).get("chair")
+            chair_name = names["adjs"].get(self._key(chair_url), "") if chair_url else ""
+            try:
+                ballots = await self._get(f"{self.root}/rounds/{rnd.seq}/pairings/{debate_id}/ballots")
+            except TabbycatError as exc:
+                if exc.kind in ("notfound", "auth"):
+                    ballots = []
+                else:
+                    raise
+            ballot = pick_confirmed_ballot(ballots)
+            if ballot is None:
+                return BallotStatus(debate_id, venue, False, "")
+            # participant_submitter is the adjudicator Tabbycat says submitted it (private-URL self-entry).
+            # When ballots are entered by tab staff through Tabbycat's own admin panel, this is null, so we
+            # fall back to the room's chair as the most reasonable attribution.
+            submitter = names["adjs"].get(self._key(ballot.get("participant_submitter")), "") if ballot.get("participant_submitter") else ""
+            return BallotStatus(debate_id, venue, True, submitter or chair_name)
+
+        out = await asyncio.gather(*(one(d) for d in raw))
+        return sorted(out, key=lambda s: natural_key(s.venue))
 
     # -- break -----------------------------------------------------------------
 

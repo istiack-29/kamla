@@ -92,7 +92,8 @@ def build_app(token="secret-token", host_override=None):
         return web.json_response([
             {"version": 1, "confirmed": False, "discarded": True, "result": {"sheets": [{"teams": [
                 {"side": "aff", "team": u(request, "/teams/1"), "win": False, "score": 1}]}]}},
-            {"version": 2, "confirmed": True, "discarded": False, "result": {"sheets": [sheet]}}])
+            {"version": 2, "confirmed": True, "discarded": False, "result": {"sheets": [sheet]},
+             "participant_submitter": u(request, "/adjudicators/2")}])
 
     @routes.get(root + "/break-categories")
     async def cats(request):
@@ -418,5 +419,60 @@ async def test_malformed_data_becomes_a_friendly_error():
     with pytest.raises(TabbycatError) as e:
         await c.rounds()
     assert e.value.kind == "badresponse"
+    await c.close()
+    await srv.close()
+
+
+# ── ballot status (sync announcer) ────────────────────────────────────────────
+
+async def test_ballot_statuses_reports_confirmed_and_pending(server):
+    srv, _ = server
+    c = client_for(srv)
+    r1 = (await c.rounds())[0]
+    statuses = await c.ballot_statuses(r1)
+    by_venue = {s.venue: s for s in statuses}
+    assert by_venue["Room 1"].confirmed and by_venue["Room 1"].submitter == "Panel One"   # participant_submitter wins
+    assert not by_venue["Room 2"].confirmed and by_venue["Room 2"].submitter == ""
+    await c.close()
+
+
+async def test_ballot_statuses_falls_back_to_chair_when_no_participant_submitter():
+    from aiohttp import web as w
+    app = w.Application()
+    root = "/api/v1/tournaments/kijani"
+
+    async def rounds(request):
+        return w.json_response([{"seq": 1, "name": "Round 1", "draw_status": "R", "motions_released": False,
+                                 "completed": False, "silent": False, "motions": []}])
+
+    async def pairings(request):
+        return w.json_response([{"id": 1, "venue": f"http://{request.host}{root}/venues/1",
+                                 "adjudicators": {"chair": f"http://{request.host}{root}/adjudicators/9"}}])
+
+    async def ballots(request):
+        return w.json_response([{"version": 1, "confirmed": True, "discarded": False, "result": {"sheets": []}}])
+
+    async def teams(request):
+        return w.json_response([])
+
+    async def adjs(request):
+        return w.json_response([{"url": f"http://{request.host}{root}/adjudicators/9", "name": "Chair Name"}])
+
+    async def venues(request):
+        return w.json_response([{"url": f"http://{request.host}{root}/venues/1", "name": "Room 1"}])
+
+    app.router.add_get(root, lambda r: w.json_response({"name": "K"}))
+    app.router.add_get(root + "/rounds", rounds)
+    app.router.add_get(root + "/rounds/1/pairings", pairings)
+    app.router.add_get(root + "/rounds/1/pairings/1/ballots", ballots)
+    app.router.add_get(root + "/teams", teams)
+    app.router.add_get(root + "/adjudicators", adjs)
+    app.router.add_get(root + "/venues", venues)
+    srv = TestServer(app)
+    await srv.start_server()
+    c = client_for(srv, token="")
+    r1 = (await c.rounds())[0]
+    statuses = await c.ballot_statuses(r1)
+    assert statuses == [tc.BallotStatus(1, "Room 1", True, "Chair Name")]
     await c.close()
     await srv.close()
