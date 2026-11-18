@@ -2,7 +2,7 @@ import logging
 import discord
 from discord.ext import commands
 from datetime import datetime, timezone
-from config import config_manager, ADMIN_ROLE_NAMES
+from config import config_manager, is_organiser
 from webhook import schedule_join_log_edit
 from ratelimit import describe
 
@@ -27,12 +27,6 @@ async def _structure_job(interaction: discord.Interaction, work):
         log.exception("Settings action failed in guild %s", interaction.guild.id)
         await interaction.followup.send(f"❌ Something went wrong: {describe(e)}", ephemeral=True)
     return None
-
-
-def _is_admin(interaction: discord.Interaction) -> bool:
-    if interaction.user.guild_permissions.administrator:
-        return True
-    return any(r.name in ADMIN_ROLE_NAMES for r in interaction.user.roles)
 
 
 def build_settings_embed(cfg: dict) -> discord.Embed:
@@ -74,7 +68,7 @@ class SettingsView(discord.ui.View):
         super().__init__(timeout=None)
 
     async def _guard(self, interaction: discord.Interaction) -> bool:
-        if not _is_admin(interaction):
+        if not is_organiser(interaction):
             await interaction.response.send_message(
                 "⛔ Only **ORG / CAP / TABBY / EQUITY** may use the settings panel.",
                 ephemeral=True,

@@ -12,7 +12,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from config import ADMIN_ROLE_NAMES
+from config import is_organiser
 
 log = logging.getLogger("kamla.assign")
 
@@ -23,18 +23,20 @@ class AssignCog(commands.Cog):
 
     @app_commands.command(name="mention", description="Mention a user in a channel.")
     @app_commands.describe(user="User to mention", channel="Channel to mention them in")
+    @app_commands.guild_only()
     async def mention(
         self,
         interaction: discord.Interaction,
         user: discord.Member,
         channel: discord.TextChannel,
     ):
+        if interaction.guild is None:
+            await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+            return
         # Organisers do not hold the Administrator permission, so Discord's own "administrators
         # only" gate would hide this command from them. The same audience (owner / admins /
         # ORG, CAP, TABBY, EQUITY) is enforced here instead.
-        actor = interaction.user
-        if not (actor.guild_permissions.administrator
-                or any(r.name in ADMIN_ROLE_NAMES for r in actor.roles)):
+        if not is_organiser(interaction):
             await interaction.response.send_message("⛔ Only ORG / CAP / TABBY / EQUITY can use this.", ephemeral=True)
             return
         try:

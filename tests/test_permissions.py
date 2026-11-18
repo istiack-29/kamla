@@ -200,3 +200,65 @@ async def test_rebuild_still_refuses_strangers_when_the_bot_is_a_member():
     i = _interaction(roles=["DEBATER"])
     await cog.rebuild.callback(cog, i)
     assert "need an admin role" in i.response.send_message.await_args.args[0]
+
+
+# ── Regression: the SAME owner-recognition fix must hold everywhere "is this an organiser?"
+# is checked, not just in /st and /rebuild. These three call sites used to each re-derive their own,
+# weaker version of the check (no owner_id fallback, no interaction.permissions fallback), so the
+# server owner could be wrongly refused in exactly the scenario above (a half-cached guild). They now
+# all delegate to config.is_organiser. ──────────────────────────────────────────────────────────────
+
+async def test_settings_panel_guard_recognises_the_owner_even_when_half_cached():
+    import settings_cog
+    view = settings_cog.SettingsView()
+    owner_interaction = _interaction(owner_id=1)                 # owner, no admin role, no cached admin bit
+    assert await view._guard(owner_interaction) is True
+    owner_interaction.response.send_message.assert_not_awaited()
+
+    stranger_interaction = _interaction(roles=["DEBATER"])
+    assert await view._guard(stranger_interaction) is False
+    stranger_interaction.response.send_message.assert_awaited_once()
+
+
+async def test_mention_recognises_the_owner_even_when_half_cached():
+    import assign_cog
+    cog = assign_cog.AssignCog(bot=None)
+    i = _interaction(owner_id=1)
+    i.response.send_message = mock.AsyncMock()
+    channel = mock.AsyncMock()
+    channel.mention = "#general"
+    target = types.SimpleNamespace(mention="@user")
+    await cog.mention.callback(cog, i, target, channel)
+    channel.send.assert_awaited_once_with("@user")               # proceeded instead of being refused
+
+    i2 = _interaction(roles=["DEBATER"])
+    i2.response.send_message = mock.AsyncMock()
+    channel2 = mock.AsyncMock()
+    await cog.mention.callback(cog, i2, target, channel2)
+    channel2.send.assert_not_awaited()
+    assert "Only ORG" in i2.response.send_message.await_args.args[0]
+
+
+async def test_mention_outside_a_guild_is_refused_cleanly_instead_of_crashing():
+    import assign_cog
+    cog = assign_cog.AssignCog(bot=None)
+    i = mock.MagicMock(guild=None)
+    i.response.send_message = mock.AsyncMock()
+    await cog.mention.callback(cog, i, types.SimpleNamespace(mention="@user"), mock.AsyncMock())
+    assert "must be used in a server" in i.response.send_message.await_args.args[0]
+
+
+async def test_nicknames_recognises_the_owner_even_when_half_cached(monkeypatch):
+    import nickname_cog
+    cog = nickname_cog.NicknameCog(bot=None)
+    i = _interaction(owner_id=1)
+    i.guild = types.SimpleNamespace(id=7, owner_id=1, members=[], chunked=True)
+    i.response.defer = mock.AsyncMock()
+    i.edit_original_response = mock.AsyncMock()
+    await cog.nicknames.callback(cog, i)
+    i.response.send_message.assert_not_called()                  # not refused: it proceeded to the sync itself
+    i.edit_original_response.assert_awaited()
+
+    i2 = _interaction(roles=["DEBATER"])
+    await cog.nicknames.callback(cog, i2)
+    assert "Only admins" in i2.response.send_message.await_args.args[0]

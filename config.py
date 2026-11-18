@@ -32,6 +32,52 @@ KAMLA_ROLE_NAMES = [
 ADMIN_ROLE_NAMES = ["ORG", "CAP", "TABBY", "EQUITY"]
 
 
+def is_organiser(interaction: discord.Interaction) -> bool:
+    """Server owner / Administrator / ORG, CAP, TABBY, EQUITY.
+
+    This is the ONE place that answers "is this user an organiser?" — every command or button with that
+    requirement should call this rather than re-deriving its own check, because the naive version (just
+    `member.guild_permissions.administrator`) has a known failure mode: whenever the guild is not fully
+    cached, that cached permission snapshot can be wrong and tell the server's own owner they have no
+    permission. Discord's own answer for THIS interaction (`interaction.permissions`, computed fresh by
+    Discord and delivered with every interaction) is checked first to avoid exactly that, before falling
+    back to owner_id, then to the cached permissions, then to role name."""
+    user = interaction.user
+    if getattr(interaction.permissions, "administrator", False) is True:
+        return True
+    guild = interaction.guild
+    if guild is not None and getattr(guild, "owner_id", None) == getattr(user, "id", None):
+        return True
+    perms = getattr(user, "guild_permissions", None)
+    if perms is not None and getattr(perms, "administrator", False) is True:
+        return True
+    return any(getattr(r, "name", None) in ADMIN_ROLE_NAMES for r in getattr(user, "roles", []))
+
+
+def bot_is_in_guild(interaction: discord.Interaction) -> bool:
+    """False when KAMLA only has the slash commands in this server (installed without the 'bot' scope): Discord
+    then delivers /commands, but KAMLA cannot see members/roles or create anything."""
+    try:
+        return interaction.client.get_guild(interaction.guild_id) is not None
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def not_a_member_message(interaction: discord.Interaction) -> str:
+    url = discord.utils.oauth_url(
+        interaction.application_id or interaction.client.user.id,
+        permissions=discord.Permissions(administrator=True),
+        scopes=("bot", "applications.commands"),
+        guild=discord.Object(id=interaction.guild_id),
+        disable_guild_select=True,
+    )
+    return ("⛔ KAMLA was added to this server with the *slash commands only* option, so it is not a real member "
+            "here: it cannot see your roles or build channels.\n"
+            f"Please add it again with the **Bot** option (the server owner must do this): {url}\n"
+            "(If you add KAMLA from the App Directory, its Default Install Settings in the Developer Portal must "
+            "include the `bot` scope.)")
+
+
 def is_own_config(msg, me_id: int) -> bool:
     """A configuration copy written by KAMLA itself (inline JSON or the attached file). Messages from anyone
     else — including other bots — are never trusted: the config can hold secrets and drives permissions."""

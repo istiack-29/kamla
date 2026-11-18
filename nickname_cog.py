@@ -24,7 +24,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from config import ADMIN_ROLE_NAMES
+from config import is_organiser
 from ratelimit import bulk, describe
 
 log = logging.getLogger("kamla.nick")
@@ -218,8 +218,7 @@ class NicknameCog(commands.Cog):
     @app_commands.command(name="nicknames", description="Set the [O]/[CA]/[T]/[E]/[J]/[D]/[V] role tag in everyone's nickname")
     @app_commands.guild_only()
     async def nicknames(self, interaction: discord.Interaction):
-        user = interaction.user
-        if not (user.guild_permissions.administrator or any(r.name in ADMIN_ROLE_NAMES for r in user.roles)):
+        if not is_organiser(interaction):
             await interaction.response.send_message("⛔ Only admins can use this command.", ephemeral=True)
             return
         guild = interaction.guild

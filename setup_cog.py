@@ -4,51 +4,14 @@ import time
 import discord
 from discord import app_commands
 from discord.ext import commands
-from config import config_manager, ADMIN_ROLE_NAMES
+from config import config_manager, is_organiser, bot_is_in_guild, not_a_member_message
 from ratelimit import describe
 
 log = logging.getLogger("kamla.setup")
 
-def is_organiser(interaction: discord.Interaction) -> bool:
-    """Server owner / Administrator / ORG, CAP, TABBY, EQUITY.
-
-    Discord's own answer (interaction.permissions: it is computed by Discord, owner => everything) comes first.
-    The old check used only discord.py's cached guild_permissions, which is wrong whenever the guild is not fully
-    cached: the server's own owner was then told he has no permission."""
-    user = interaction.user
-    if getattr(interaction.permissions, "administrator", False) is True:
-        return True
-    guild = interaction.guild
-    if guild is not None and getattr(guild, "owner_id", None) == getattr(user, "id", None):
-        return True
-    perms = getattr(user, "guild_permissions", None)
-    if perms is not None and getattr(perms, "administrator", False) is True:
-        return True
-    return any(getattr(r, "name", None) in ADMIN_ROLE_NAMES for r in getattr(user, "roles", []))
-
-
-def bot_is_in_guild(interaction: discord.Interaction) -> bool:
-    """False when KAMLA only has the slash commands in this server (installed without the 'bot' scope): Discord
-    then delivers /commands, but KAMLA cannot see members/roles or create anything."""
-    try:
-        return interaction.client.get_guild(interaction.guild_id) is not None
-    except Exception:  # noqa: BLE001
-        return True
-
-
-def not_a_member_message(interaction: discord.Interaction) -> str:
-    url = discord.utils.oauth_url(
-        interaction.application_id or interaction.client.user.id,
-        permissions=discord.Permissions(administrator=True),
-        scopes=("bot", "applications.commands"),
-        guild=discord.Object(id=interaction.guild_id),
-        disable_guild_select=True,
-    )
-    return ("⛔ KAMLA was added to this server with the *slash commands only* option, so it is not a real member "
-            "here: it cannot see your roles or build channels.\n"
-            f"Please add it again with the **Bot** option (the server owner must do this): {url}\n"
-            "(If you add KAMLA from the App Directory, its Default Install Settings in the Developer Portal must "
-            "include the `bot` scope.)")
+# is_organiser / bot_is_in_guild / not_a_member_message now live in config.py (the one shared place every
+# cog should get its "is this user an organiser?" answer from) and are re-exported here so existing
+# `setup_cog.is_organiser(...)` references keep working.
 
 
 class OnJoinView(discord.ui.View):

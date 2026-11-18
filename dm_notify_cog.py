@@ -8,6 +8,8 @@ Sends a DM to the user when:
   • They leave the server
 """
 
+import asyncio
+
 import discord
 from discord.ext import commands
 from config import KAMLA_ROLE_NAMES
@@ -19,6 +21,33 @@ async def _dm(user: discord.User | discord.Member, embed: discord.Embed) -> None
     await notify.best_effort(lambda: user.send(embed=embed), label="dm")
 
 
+async def _find_removal_action(guild: discord.Guild, member_id: int, *, sleep=asyncio.sleep) -> str:
+    """'kicked' / 'banned' / 'left' / '__gone__' (KAMLA is no longer in the guild at all).
+
+    The audit log can lag the actual kick/ban by a moment — the exact situation already handled
+    elsewhere in this codebase for channel-creation detection — so this retries briefly instead of
+    reporting "left" to someone who was actually removed. It also keeps scanning past an unrelated
+    entry that happens to target the same member (a role edit, a timeout, ...) instead of stopping on
+    the first match regardless of its action type."""
+    for attempt in range(3):
+        try:
+            async for entry in guild.audit_logs(limit=10):
+                if entry.target and entry.target.id == member_id:
+                    if entry.action == discord.AuditLogAction.kick:
+                        return "kicked"
+                    if entry.action == discord.AuditLogAction.ban:
+                        return "banned"
+        except discord.Forbidden:
+            return "left"            # no permission to read the audit log: never guess further
+        except discord.NotFound:
+            return "__gone__"        # KAMLA is no longer in this server at all
+        except discord.HTTPException:
+            pass                     # transient Discord hiccup: just retry
+        if attempt < 2:
+            await sleep(0.7)
+    return "left"
+
+
 class DMNotifyCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -27,6 +56,14 @@ class DMNotifyCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member) -> None:
+        # Nobody needs a "Welcome!" DM for the developer link: whoever joins through it (the developer) is
+        # not a participant. Mirrors the same skip in welcome_cog.py's channel embed.
+        try:
+            from invite_roles_cog import join_outcome, DEV_KEY
+            if await join_outcome(member) == DEV_KEY:
+                return
+        except Exception:  # noqa: BLE001 - never let this block a normal welcome DM
+            pass
         embed = discord.Embed(
             title="👋 Welcome!",
             description=(
@@ -99,23 +136,9 @@ class DMNotifyCog(commands.Cog):
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member) -> None:
         guild = member.guild
-
-        # Check audit log to distinguish kick / ban from voluntary leave
-        action = "left"
-        try:
-            async for entry in guild.audit_logs(limit=5):
-                if entry.target and entry.target.id == member.id:
-                    if entry.action == discord.AuditLogAction.kick:
-                        action = "kicked"
-                    elif entry.action == discord.AuditLogAction.ban:
-                        action = "banned"
-                    break
-        except discord.Forbidden:
-            pass
-        except discord.NotFound:
-            return          # 404 Unknown Guild: KAMLA is no longer in that server (removed / server deleted) — nothing to do
-        except discord.HTTPException:
-            pass            # any other Discord hiccup: fall back to the plain "left" message
+        action = await _find_removal_action(guild, member.id)
+        if action == "__gone__":
+            return          # 404 Unknown Guild: KAMLA is no longer in that server — nothing to do
 
         if action == "kicked":
             embed = discord.Embed(
