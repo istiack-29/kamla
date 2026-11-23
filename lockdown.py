@@ -144,6 +144,8 @@ def report_blocked_channel(guild: discord.Guild, creator: Optional[discord.abc.U
 
 
 def _recipients(guild: discord.Guild) -> list:
+    # guild.members may be partial in large servers (not chunked). Sending to the cached subset is
+    # better than waiting for a full member load on every notification.
     orgs = [m for m in guild.members if not m.bot and any(r.name == "ORG" for r in m.roles)]
     if orgs:
         return orgs

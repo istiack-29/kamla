@@ -30,7 +30,7 @@ def fast(monkeypatch):
     c = RequestCoordinator("t", 2, 0, retry_kwargs={"sleep": nosleep})
     monkeypatch.setattr(lockdown, "bulk", c)
     monkeypatch.setattr(lockdown, "notify", c)
-    monkeypatch.setattr(lockdown, "NOTIFY_BATCH_SECONDS", 0.05)
+    monkeypatch.setattr(lockdown, "NOTIFY_BATCH_SECONDS", 0.02)
     lockdown._pending.clear()
 
 
@@ -66,6 +66,43 @@ async def test_lock_sets_5s_everywhere_and_unlock_removes_only_what_it_set():
     assert custom.slowmode_delay == 30                                        # not ours to reset
 
 
+async def test_rapid_toggles_never_run_two_passes_concurrently(monkeypatch):
+    """Regression: start_slowmode used to cancel the old task and start the new one without waiting for the
+    cancellation to land, so a channel.edit() already in flight from the OLD pass could still be running
+    while the NEW pass started its own edit on the very same channel. Tracked here by recording the exact
+    order of start/settle events for each pass's edit, rather than a concurrency counter (too timing-fragile
+    to tell "ran concurrently" from "was never properly cleaned up" apart on its own)."""
+    a = Chan("a")
+    g = guild_with(a)
+    async def nosleep(_):
+        return None
+    monkeypatch.setattr(lockdown, "bulk", RequestCoordinator("t", 1, 0, retry_kwargs={"sleep": nosleep}))
+    events = []
+
+    async def slow_edit(self, slowmode_delay=None, reason=None):
+        events.append(("start", slowmode_delay))
+        try:
+            await asyncio.sleep(0.03)      # long enough to still be "in flight" when the next toggle fires
+        except asyncio.CancelledError:
+            events.append(("cancelled", slowmode_delay))
+            raise
+        self.slowmode_delay = slowmode_delay
+        events.append(("finish", slowmode_delay))
+    monkeypatch.setattr(Chan, "edit", slow_edit)
+
+    t1 = lockdown.start_slowmode(g, 5)
+    await asyncio.sleep(0.01)              # let t1's edit actually start before t2 is issued
+    t2 = lockdown.start_slowmode(g, 5)     # same target: the cancelled first attempt never actually set it,
+    await asyncio.gather(t1, t2, return_exceptions=True)   # so the second pass must still try the edit itself
+
+    assert events[0] == ("start", 5)
+    starts = [i for i, e in enumerate(events) if e == ("start", 5)]
+    assert len(starts) == 2, events                         # both passes actually attempted the edit
+    # the first pass's attempt must fully settle (cancelled or finished) before the second one's even starts
+    assert events[starts[0] + 1][0] in ("cancelled", "finish")
+    assert events[starts[0] + 1] != events[starts[1]]       # i.e. settle happens strictly before the 2nd start
+
+
 async def test_second_lock_is_a_noop_and_quick_toggle_supersedes():
     a = Chan("a")
     g = guild_with(a)
@@ -94,7 +131,7 @@ async def test_blocked_channels_notify_every_org_member_once_per_burst():
     creator = types.SimpleNamespace(mention="<@7>", name="eve")
     for name in ("spam-1", "spam-2", "spam-3"):
         lockdown.report_blocked_channel(g, creator, name)
-    await asyncio.sleep(0.3)
+    await asyncio.sleep(0.07)
     assert len(o1.dms) == 1 and len(o2.dms) == 1 and not deb.dms            # one DM each, debaters not told
     text = o1.dms[0].description
     assert "<@7>" in text and all(f"#spam-{i}" in text for i in (1, 2, 3))
@@ -104,7 +141,7 @@ async def test_unknown_creator_and_owner_fallback():
     owner = Org(99, roles=("DEBATER",))
     g = guild_with(members=[owner])                                           # no ORG members at all
     lockdown.report_blocked_channel(g, None, "x")
-    await asyncio.sleep(0.2)
+    await asyncio.sleep(0.07)
     assert len(owner.dms) == 1 and "audit log was unavailable" in owner.dms[0].description
 
 
@@ -115,7 +152,7 @@ async def test_closed_dms_do_not_crash():
             raise http_error(403)
     g = guild_with(members=[Closed(1)])
     lockdown.report_blocked_channel(g, None, "x")
-    await asyncio.sleep(0.2)                                                  # must simply not raise
+    await asyncio.sleep(0.07)                                                # must simply not raise
 
 
 # ── integration with main.on_guild_channel_create ─────────────────────────────

@@ -117,8 +117,8 @@ class TimerCog(commands.Cog):
         # Always delete the user's message
         try:
             await message.delete()
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001 - message delete is best-effort
+            log.debug("Could not delete timer message: %s", describe(e))
 
         # Empty / no time-like content at all → generic help
         if not content or not _HAS_TIMEY.search(content):

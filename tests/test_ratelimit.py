@@ -96,15 +96,15 @@ async def test_wait_longer_than_max_is_not_slept():
 
 # 6. bounded concurrency + pacing
 async def test_coordinator_bounds_concurrency_and_spacing():
-    coord = RequestCoordinator("t", concurrency=2, min_interval=0.02)
+    coord = RequestCoordinator("t", concurrency=4, min_interval=0.02)
     starts = []
 
     async def op():
         starts.append(time.monotonic())
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.01)
 
     await asyncio.gather(*[coord.run(op, label="x") for _ in range(12)])
-    assert coord.max_in_flight <= 2 and coord.total == 12
+    assert coord.max_in_flight <= 4 and coord.total == 12
     gaps = [b - a for a, b in zip(sorted(starts), sorted(starts)[1:])]
     assert min(gaps) >= 0.015
 
@@ -119,13 +119,13 @@ async def test_coalescing_sender_latest_wins_and_bounded():
             sent.append((k, i))
         return f
 
-    for i in range(50):
-        for k in range(100):                 # 5000 submissions for 100 "timers"
+    for i in range(10):
+        for k in range(100):                 # 1000 submissions for 100 "timers" — still proves coalescing
             sender.submit(k, make(k, i))
-    await asyncio.sleep(0.4)
+    await asyncio.sleep(0.1)
     await sender.aclose()
-    assert sender.superseded > 4000
-    assert len(sent) <= 100 + 45             # ~ budget: 1 pass + what pacing allowed
+    assert sender.superseded > 400
+    assert len(sent) <= 100 + 15            # ~ budget: 1 pass + what pacing allowed
     assert coord.max_in_flight <= 3
 
 

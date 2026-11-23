@@ -10,6 +10,9 @@ Sends a DM to the user when:
 
 import asyncio
 
+# injectable for tests
+_remove_sleep = asyncio.sleep
+
 import discord
 from discord.ext import commands
 from config import KAMLA_ROLE_NAMES
@@ -136,7 +139,7 @@ class DMNotifyCog(commands.Cog):
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member) -> None:
         guild = member.guild
-        action = await _find_removal_action(guild, member.id)
+        action = await _find_removal_action(guild, member.id, sleep=_remove_sleep)
         if action == "__gone__":
             return          # 404 Unknown Guild: KAMLA is no longer in that server — nothing to do
 

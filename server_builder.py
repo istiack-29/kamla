@@ -1048,7 +1048,8 @@ async def _saved_config(guild: discord.Guild) -> dict:
         return cfg
     try:
         return await asyncio.wait_for(config_manager.get_config(guild), timeout=3.0)
-    except Exception:
+    except Exception as e:  # noqa: BLE001 - treat a timeout/error as unconfigured
+        log.warning("Could not load config for channel guard: %s", describe(e))
         return {}
 
 
@@ -1481,5 +1482,5 @@ async def _repost_channel_content(
                     history = [m async for m in settings_ch.history(limit=1)]
                     if not history:
                         await _post_settings_panel(settings_ch, cfg)
-                except Exception:
-                    pass
+                except Exception as e:  # noqa: BLE001 - settings panel is cosmetic
+                    log.debug("Could not post settings panel after restore: %s", describe(e))

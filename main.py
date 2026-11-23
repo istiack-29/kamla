@@ -116,8 +116,8 @@ class KamlaBot(commands.Bot):
                 if state_file.read_text().strip() == fingerprint:
                     log.info("Slash commands unchanged since last sync; skipping tree.sync().")
                     return
-            except OSError:
-                pass
+            except OSError as e:
+                log.debug("Sync-hash read failed (non-fatal): %s", e)
         try:
             synced = await self.tree.sync()
             log.info("Synced %d slash command(s).", len(synced))
@@ -299,8 +299,8 @@ class KamlaBot(commands.Bot):
                     "because the server is locked.",
                     delete_after=30,
                 )
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001 - settings panel is cosmetic
+            log.debug("Could not post settings panel after lock event: %s", describe(e))
 
     async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel) -> None:
         guild = channel.guild

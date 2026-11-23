@@ -57,8 +57,8 @@ async def _refresh_panel(interaction: discord.Interaction, cfg: dict, note: str 
     else:
         try:
             await interaction.message.edit(embed=embed, view=SettingsView())
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001 - settings embed is cosmetic
+            log.debug("Could not refresh settings embed: %s", describe(e))
         if note:
             await interaction.followup.send(note, ephemeral=True)
 

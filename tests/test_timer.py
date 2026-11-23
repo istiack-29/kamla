@@ -66,7 +66,7 @@ def start(total, ch=None, cmd=None):
 async def test_announcements_in_order_and_exact_wording():
     ch, task = start(0.5)                                  # a "5 minute" timer
     await asyncio.wait_for(task, 5)
-    await asyncio.sleep(0.4)                               # let the pens-drop task fire
+    await asyncio.sleep(0.12)                             # let the pens-drop task fire
     assert ch.sent == [
         "1 Mins Done, 4 mins left @Cmd",
         "4 mins done, 1 mins left @Cmd",
@@ -80,7 +80,7 @@ async def test_status_embed_has_no_clock_and_counts_minutes():
     await ready(ch)
     assert "0 min running" in ch.msgs[0].first_embed.description
     await asyncio.wait_for(task, 5)
-    await asyncio.sleep(0.3)
+    await asyncio.sleep(0.15)
     texts = [e.description for e in ch.msgs[0].embeds]
     assert any("1 min running" in t for t in texts)
     assert texts[-1] == "✅ **Time's up**"
@@ -92,12 +92,12 @@ async def test_status_embed_has_no_clock_and_counts_minutes():
 async def test_short_timers_do_not_spam():
     ch, task = start(0.08)                                 # <= 1 minute: only Times up
     await asyncio.wait_for(task, 5)
-    await asyncio.sleep(0.2)
+    await asyncio.sleep(0.12)
     assert ch.sent == ["Times up @Cmd", "Adjudicators Pens Drop @Cmd"]
     ch2, task2 = start(0.2)                                # exactly 2 minutes: one combined message
     ch2.id = 6
     await asyncio.wait_for(task2, 5)
-    await asyncio.sleep(0.2)
+    await asyncio.sleep(0.12)
     assert ch2.sent[0] == "1 Mins Done, 1 mins left @Cmd" and len(ch2.sent) == 3
 
 
@@ -114,13 +114,13 @@ async def test_pause_stops_the_clock_and_resume_continues():
     ran = view.state.running()                             # clock value frozen at pause time
     assert view.state.paused and view.pause_btn.label == "Resume"
     assert "Paused" in inter.response.edit_message.await_args.kwargs["embed"].description
-    await asyncio.sleep(0.4)                               # way past the original end
+    await asyncio.sleep(0.28)                             # past the unpaused end (timer had ~0.25 s left)
     assert not task.done() and "Times up @Cmd" not in ch.sent
     await view.pause_btn.callback(inter)
     assert not view.state.paused
     await asyncio.wait_for(task, 5)
     assert view.state.running() == pytest.approx(0.3, abs=0.02)
-    assert asyncio.get_event_loop().time() - t0 >= 0.4 + (0.3 - ran) - 0.03   # paused time did not count
+    assert asyncio.get_event_loop().time() - t0 >= 0.28 + (0.3 - ran) - 0.03  # paused time did not count
     assert "Times up @Cmd" in ch.sent
 
 
@@ -133,7 +133,7 @@ async def test_skip_ends_immediately_without_times_up_or_pens_drop():
     inter.response.edit_message = mock.AsyncMock()
     await view.skip_btn.callback(inter)
     await asyncio.wait_for(task, 5)
-    await asyncio.sleep(0.3)
+    await asyncio.sleep(0.15)
     assert ch.sent == ["⏭ Timer skipped by Cmd @Cmd"]
     assert all(c.disabled for c in view.children)
 
@@ -282,7 +282,7 @@ async def test_the_countdown_costs_no_more_edits_than_before():
     ch, task = start(0.5)                                                 # five "minutes"
     await ready(ch)
     await asyncio.wait_for(task, 5)
-    await asyncio.sleep(0.3)
+    await asyncio.sleep(0.15)
     assert len(ch.msgs[0].embeds) <= 7                                    # ~ one per minute + end; never one per second
 
 

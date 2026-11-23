@@ -1,9 +1,12 @@
+
 import discord
 from discord.ext import commands
-import asyncio
+
+from config import ADMIN_ROLE_NAMES
+from ratelimit import notify
 
 ALLOWED_ROLES = {
-    "ORG", "CAP", "TABBY",
+    *ADMIN_ROLE_NAMES,                               # ORG, CAP, TABBY, EQUITY
     "INVITED ADJUDICATOR", "INDEPENDENT ADJUDICATOR",
 }
 
@@ -11,10 +14,16 @@ PREP_KEYWORDS = {"PREP"}
 DEBATE_ROOM_KEYWORD = "DEBATE ROOM"
 
 
-def _is_allowed(member: discord.Member) -> bool:
-    if member.guild_permissions.administrator:
+def _is_allowed(interaction: discord.Interaction) -> bool:
+    """EQUITY, all adjudicators, and organisers; falls back to owner check for a half-cached guild."""
+    if getattr(interaction.permissions, "administrator", False):
         return True
-    return any(r.name in ALLOWED_ROLES for r in member.roles)
+    guild = interaction.guild
+    if guild is not None and getattr(guild, "owner_id", None) == getattr(interaction.user, "id", None):
+        return True
+    if getattr(getattr(interaction.user, "guild_permissions", None), "administrator", False):
+        return True
+    return any(r.name in ALLOWED_ROLES for r in getattr(interaction.user, "roles", []))
 
 
 def _in_allin_channel(channel: discord.abc.GuildChannel) -> bool:
@@ -48,9 +57,9 @@ class AllInView(discord.ui.View):
         emoji="🔴",
     )
     async def push_back_all(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not _is_allowed(interaction.user):
+        if not _is_allowed(interaction):
             await interaction.response.send_message(
-                "⛔ Only **ORG / CAP / TABBY / Invited Adjudicator / Independent Adjudicator** "
+                "⛔ Only **ORG / CAP / TABBY / EQUITY / Invited Adjudicator / Independent Adjudicator** "
                 "may use the Push Back All button.",
                 ephemeral=True,
             )
@@ -84,13 +93,13 @@ class AllInView(discord.ui.View):
         failed = 0
         for prep_vc in prep_channels:
             for member in list(prep_vc.members):
-                try:
-                    await member.move_to(debate_room, reason="KAMLA Push Back All")
+                ok = await notify.best_effort(
+                    lambda m=member: m.move_to(debate_room, reason="KAMLA Push Back All"),
+                    label="allin-move",
+                )
+                if ok:
                     moved += 1
-                    await asyncio.sleep(0.1)
-                except discord.Forbidden:
-                    failed += 1
-                except Exception:
+                else:
                     failed += 1
 
         parts = [f"✅ Moved **{moved}** member(s) back to **{debate_room.name}**."]

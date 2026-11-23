@@ -75,7 +75,7 @@ async def test_only_the_developer_gets_the_role_through_the_invite():
     for who in (stranger, dev):
         g.live[code].uses += 1
         await cog.on_member_join(who)
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.07)
     assert stranger.granted == [] and dev.granted == ["KAMLA"]
 
 

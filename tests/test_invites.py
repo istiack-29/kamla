@@ -101,7 +101,7 @@ async def joined_via(cog, g, code, who):
     g.live[code].uses += 1
     for m in who:
         await cog.on_member_join(m)
-    await asyncio.sleep(0.2)
+    await asyncio.sleep(0.07)
 
 
 async def test_member_joining_via_each_link_gets_those_roles():
@@ -134,7 +134,7 @@ async def test_burst_of_joins_on_one_link_costs_one_lookup():
     calls = g.invite_calls
     for m in ms:
         await cog.on_member_join(m)
-    await asyncio.sleep(0.3)
+    await asyncio.sleep(0.07)
     assert g.invite_calls - calls == 1 and all(m.granted == ["VISITOR"] for m in ms)
 
 
@@ -146,13 +146,13 @@ async def test_ambiguous_joins_never_grant_roles():
     g.live[links[0]["code"]].uses += 1                    # two different invites changed,
     g.live[links[3]["code"]].uses += 1                    # including an admin ([O]) one
     await cog.on_member_join(a); await cog.on_member_join(b)
-    await asyncio.sleep(0.2)
+    await asyncio.sleep(0.07)
     assert a.granted == [] and b.granted == []
     # more invite uses than joins we witnessed (someone joined while we weren't looking)
     c = member(g, 3)
     g.live[links[3]["code"]].uses += 2
     await cog.on_member_join(c)
-    await asyncio.sleep(0.2)
+    await asyncio.sleep(0.07)
     assert c.granted == []
 
 
@@ -167,7 +167,7 @@ async def test_normal_invite_and_untracked_guild_do_nothing():
     assert m.granted == []
     other = InviteGuild()
     await cog.on_member_join(member(other, 5))
-    await asyncio.sleep(0.1)
+    await asyncio.sleep(0.07)
     assert other.invite_calls == 0                        # untracked guild: zero requests
     assert member(g, 9, bot=True).bot
 

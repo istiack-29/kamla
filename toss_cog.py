@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 import discord
 from discord import app_commands
 from discord.ext import commands
+
+
 TOSS_CHANNEL_NAME = "🪙︱toss-coin"
 GA_TEXT_CHANNEL_NAME = "📨︱ga-text"
 TOSS_ALLOWED_ROLES = {"CAP", "TABBY", "ORG"}
@@ -24,10 +26,15 @@ NON_VISITOR_ROLES = {
 }
 
 
-def _can_toss(member: discord.Member) -> bool:
-    if member.guild_permissions.administrator:
+def _can_toss(interaction: discord.Interaction) -> bool:
+    if getattr(interaction.permissions, "administrator", False):
         return True
-    return any(r.name in TOSS_ALLOWED_ROLES for r in member.roles)
+    guild = interaction.guild
+    if guild is not None and getattr(guild, "owner_id", None) == getattr(interaction.user, "id", None):
+        return True
+    if getattr(getattr(interaction.user, "guild_permissions", None), "administrator", False):
+        return True
+    return any(r.name in TOSS_ALLOWED_ROLES for r in getattr(interaction.user, "roles", []))
 
 
 def _is_non_visitor(member: discord.Member) -> bool:
@@ -68,7 +75,8 @@ class TossCog(commands.Cog):
             pass
 
         if content.lower() == "toss":
-            if not _can_toss(message.author):
+            if not any(r.name in TOSS_ALLOWED_ROLES for r in message.author.roles) and \
+                    not getattr(message.author.guild_permissions, "administrator", False):
                 try:
                     await message.channel.send(
                         f"⛔ {message.author.mention} — only **CAP / TABBY / ORG** may toss coins here.",

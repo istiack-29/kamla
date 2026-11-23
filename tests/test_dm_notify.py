@@ -1,4 +1,6 @@
 import types
+
+import pytest
 from unittest import mock
 
 import pytest
@@ -33,13 +35,15 @@ async def test_unknown_guild_404_is_not_a_crash_and_sends_no_dm(sent):
     assert sent == []                                                  # KAMLA is not in that server any more
 
 
-async def test_missing_audit_permission_still_sends_the_normal_leave_message(sent):
+async def test_missing_audit_permission_still_sends_the_normal_leave_message(sent, monkeypatch):
+    monkeypatch.setattr(dn, "_remove_sleep", fast_sleep)
     cog = dn.DMNotifyCog(bot=None)
     await cog.on_member_remove(member_leaving(http_error(403)))
     assert len(sent) == 1
 
 
-async def test_other_discord_errors_also_fall_back_to_the_leave_message(sent):
+async def test_other_discord_errors_also_fall_back_to_the_leave_message(sent, monkeypatch):
+    monkeypatch.setattr(dn, "_remove_sleep", fast_sleep)
     cog = dn.DMNotifyCog(bot=None)
     await cog.on_member_remove(member_leaving(http_error(500)))
     assert len(sent) == 1
