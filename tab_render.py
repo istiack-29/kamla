@@ -694,9 +694,12 @@ ROOMS_PER_RESULT_PAGE = 32      # same cap as the draw: /result never grows past
 
 
 RANK_COLORS = {1: "#16A34A", 2: "#DB2777", 3: "#CA8A04", 4: "#DC2626"}       # 1st green, 2nd pink, 3rd yellow/amber, 4th red
+RANK_LABELS = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}
 WIN_COLOR, LOSS_COLOR = "#16A34A", "#DC2626"
 RESULT_NEUTRAL = BORDER        # no result yet for this team: a plain, uncoloured border
 SCORE_SIZE = 19                # the speaker-score line under the team name — smaller than the name itself
+LABEL_SIZE = 22                # the 1st/2nd/3rd/4th (BP) or W/L (AP) label to the right of the team name
+LABEL_RESERVE = 58             # logical px of column width kept clear for that label, so a long name never runs into it
 
 
 def _speaker_score_line(scores: list) -> str:
@@ -717,6 +720,15 @@ def _result_team_color(bp: bool, team, rank_of: dict) -> str:
     return WIN_COLOR if team.win else LOSS_COLOR
 
 
+def _result_label(bp: bool, team, rank_of: dict) -> str:
+    """'1st'..'4th' for BP (by that debate's points), 'W'/'L' for AP — '' when there is no result yet."""
+    if bp:
+        return RANK_LABELS.get(rank_of.get(id(team)), "")
+    if team.win is None:
+        return ""
+    return "W" if team.win else "L"
+
+
 def _render_results_page(tournament: str, rnd: RoundInfo, results: list[ResultInfo], sides: list, page: int = 1,
                          total_pages: int = 1) -> bytes:
     """One results image, at most ROOMS_PER_RESULT_PAGE rooms — the same wide, compact table as the draw
@@ -734,9 +746,10 @@ def _render_results_page(tournament: str, rnd: RoundInfo, results: list[ResultIn
         for i, (key, _label) in enumerate(sides):
             t = by_side.get(key) or (res.teams[i] if key.startswith("Team") and i < len(res.teams) else None)
             if t is None:
-                cells.append(((t.name if t else "—") or "—", "", RESULT_NEUTRAL))
+                cells.append(((t.name if t else "—") or "—", "", RESULT_NEUTRAL, ""))
             else:
-                cells.append((t.name or "—", _speaker_score_line(t.speaker_scores), _result_team_color(bp, t, rank_of)))
+                cells.append((t.name or "—", _speaker_score_line(t.speaker_scores),
+                              _result_team_color(bp, t, rank_of), _result_label(bp, t, rank_of)))
         raw_rows.append(((res.venue or "—").strip(), cells))
 
     # column widths: room text, team names, and the (often wide) speaker-score line all count toward the width
@@ -747,7 +760,7 @@ def _render_results_page(tournament: str, rnd: RoundInfo, results: list[ResultIn
         longest = max([text_width(headers[i + 1], DRAW_HEAD)]
                      + [text_width(cells[i][0], DRAW_TEXT) for _v, cells in raw_rows]
                      + [text_width(cells[i][1], SCORE_SIZE) for _v, cells in raw_rows if cells[i][1]])
-        widths.append(int(min(longest + 2 * DRAW_PAD_X + 10, DRAW_COL_CAP.get("team", 10_000))))
+        widths.append(int(min(longest + 2 * DRAW_PAD_X + 10 + LABEL_RESERVE, DRAW_COL_CAP.get("team", 10_000) + LABEL_RESERVE)))
     inner = max(DRAW_MIN_WIDTH - 2 * DRAW_MARGIN, sum(widths))
     inner = min(inner, DRAW_MAX_WIDTH - 2 * DRAW_MARGIN)
     spare = inner - sum(widths)
@@ -767,15 +780,15 @@ def _render_results_page(tournament: str, rnd: RoundInfo, results: list[ResultIn
                 break
     total_w = sum(widths) + 2 * DRAW_MARGIN
 
-    laid = []                      # per row: (venue_lines, [ (name_lines, score_line, color) ]), row height
-    name_w = [w - 2 * DRAW_PAD_X - 6 for w in widths[1:]]
+    laid = []                      # per row: (venue_lines, [ (name_lines, score_line, color, label) ]), row height
+    name_w = [w - 2 * DRAW_PAD_X - 6 - LABEL_RESERVE for w in widths[1:]]
     for venue, cells in raw_rows:
         venue_lines = wrap(venue, DRAW_TEXT, widths[0] - 2 * DRAW_PAD_X)
         laid_cells = []
         max_lines = len(venue_lines)
-        for (name, score_line, color), w in zip(cells, name_w):
+        for (name, score_line, color, label), w in zip(cells, name_w):
             name_lines = wrap(name, DRAW_TEXT, w)
-            laid_cells.append((name_lines, score_line, color))
+            laid_cells.append((name_lines, score_line, color, label))
             max_lines = max(max_lines, len(name_lines) + (1 if score_line else 0))
         row_h = int(DRAW_TEXT * 1.38) * max_lines + 2 * DRAW_PAD_Y + 6       # +6: room for the colour border
         laid.append((venue_lines, laid_cells, row_h))
@@ -806,13 +819,15 @@ def _render_results_page(tournament: str, rnd: RoundInfo, results: list[ResultIn
                 cv.text((x + DRAW_PAD_X, cy), piece, DRAW_TEXT, NAVY, bold=True)
                 cy += int(DRAW_TEXT * 1.38)
             x += widths[0]
-            for (name_lines, score_line, color), w in zip(cells, widths[1:]):
+            for (name_lines, score_line, color, label), w in zip(cells, widths[1:]):
                 box = [x + 3, y + 3, x + w - 3, y + h - 3]
                 cv.rrect(box, 6, outline=color, width=1)
                 cv.rect([box[0], box[1] + 2, box[0] + 3, box[3] - 2], fill=color)      # left accent bar
                 cy = y + DRAW_PAD_Y + 3
+                if label:
+                    cv.text((box[2] - 10, cy), label, LABEL_SIZE, color, bold=True, anchor_right=True)
                 for piece in name_lines:
-                    cv.text((x + DRAW_PAD_X + 6, cy), piece, DRAW_TEXT, TEXT, bold=True)
+                    cv.text((x + DRAW_PAD_X + 6, cy), piece, DRAW_TEXT, TEXT)
                     cy += int(DRAW_TEXT * 1.38)
                 if score_line:
                     cv.text((x + DRAW_PAD_X + 6, cy), score_line, SCORE_SIZE, MUTED)
