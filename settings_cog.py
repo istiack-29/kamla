@@ -186,7 +186,7 @@ class SettingsView(discord.ui.View):
         if new_locked:
             note = (
                 "🔒 **Server is now LOCKED.**\n"
-                "New channels are deleted automatically (ORG members are notified by DM) and every "
+                "New channels are deleted automatically (the organisers are told here in the settings channel) and every "
                 f"chat gets a {lockdown.SLOWMODE_SECONDS}-second slowmode (applied in the background)."
             )
         else:

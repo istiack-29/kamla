@@ -13,17 +13,20 @@ import timer_cog
 from tests.fakes import http_error, FakeGuild, FakeChannel, FakeCategory
 
 BASELINE = {
-    "cogs": ["AllInCog", "AssignCog", "DMNotifyCog", "GamesCog", "PoiCog", "PollsCog", "RolesCog",
-             "SettingsCog", "SetupCog", "TimerCog", "TossCog", "WelcomeCog", "NicknameCog", "InviteRolesCog", "TabbycatCog"],
-    "commands": ["break", "close", "draw", "drawadj", "mention", "motion", "newpoll", "nicknames", "play", "rebuild",
-                 "refresh", "result", "st", "tab", "toss"],
+    "cogs": ["AllInCog", "GamesCog", "GuardsCog", "InviteRolesCog", "LinksCog", "MembersCog", "NicknameCog", "PollsCog",
+             "RolesCog", "SecurityCog", "SettingsCog", "SetupCog", "TabbycatCog", "TimerCog", "TossCog"],
+    # no /rebuild, /mention or /drawadj; /draw is the only draw command
+    "commands": ["break", "close", "draw", "motion", "newpoll", "nicknames", "play", "refresh", "result", "st", "tab",
+                 "toss"],
     "custom_ids": ["kamla:allin:push_back", "kamla:on_join:create_now", "kamla:role:debater",
-                   "kamla:role:independent_adj", "kamla:role:invited_adj", "kamla:role:visitor",
+                   "kamla:role:independent_adj", "kamla:role:invited_adj", "kamla:role:select", "kamla:role:visitor",
                    "kamla:s:add", "kamla:s:del", "kamla:s:fmt", "kamla:s:lock",
                    "kamla:timer:pause", "kamla:timer:skip"],
-    "listeners": {"on_member_join": 3, "on_member_remove": 1, "on_member_update": 2, "on_message": 6,
-                  "on_ready": 3, "on_invite_create": 1, "on_invite_delete": 1},
-    "views": ["AllInView", "OnJoinView", "OrphanTimerView", "RoleSelectView", "SettingsView"],
+    "listeners": {"on_message": 6, "on_ready": 4, "on_member_update": 1, "on_invite_create": 1, "on_invite_delete": 2,
+                  "on_member_join": 3, "on_guild_role_create": 1, "on_guild_role_delete": 1,
+                  "on_guild_role_update": 1, "on_member_remove": 1, "on_member_ban": 1, "on_member_unban": 1,
+                  "on_thread_create": 1, "on_guild_channel_create": 1},
+    "views": ["AllInView", "CreateNowView", "LegacyRoleView", "OrphanTimerView", "RoleSelectView", "SettingsView"],
 }
 
 

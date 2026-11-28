@@ -3,8 +3,8 @@ lockdown.py — what "🔒 Server locked" means.
 
 While a server is locked:
   1. No new channel can be created: KAMLA deletes it immediately (main.on_guild_channel_create)
-     and every ORG member is notified by DM about who tried and what the channel was called.
-     Several attempts in a short time are batched into ONE DM per ORG member.
+     and the organisers are told in the settings channel (never by DM) who tried and what the channel was
+     called. Several attempts in a short time are batched into ONE message.
   2. Every chat has a 5 second slowmode (text channels and the text chat of voice channels).
      Members with Manage Messages / Manage Channel (ORG, CAP, TABBY, EQUITY, KAMLA) are exempt,
      because Discord never applies slowmode to them.
@@ -130,7 +130,7 @@ def start_slowmode(guild: discord.Guild, seconds: int) -> asyncio.Task:
     return task
 
 
-# ── blocked channel creation → DM the ORG members ─────────────────────────────
+# ── blocked channel creation → a message in the settings channel (KAMLA never sends DMs) ─────────
 
 def report_blocked_channel(guild: discord.Guild, creator: Optional[discord.abc.User], channel_name: str) -> None:
     if creator is not None:
@@ -143,14 +143,10 @@ def report_blocked_channel(guild: discord.Guild, creator: Optional[discord.abc.U
         _flush_tasks[guild.id] = asyncio.get_running_loop().create_task(_flush(guild))
 
 
-def _recipients(guild: discord.Guild) -> list:
-    # guild.members may be partial in large servers (not chunked). Sending to the cached subset is
-    # better than waiting for a full member load on every notification.
-    orgs = [m for m in guild.members if not m.bot and any(r.name == "ORG" for r in m.roles)]
-    if orgs:
-        return orgs
-    owner = guild.get_member(guild.owner_id) if getattr(guild, "owner_id", None) else None
-    return [owner] if owner else []
+def _notice_channel(guild: discord.Guild):
+    """Where lock notices go: the (read-only for humans) settings channel; nowhere else, and never a DM."""
+    from naming import CH_SETTINGS
+    return discord.utils.get(guild.text_channels, name=CH_SETTINGS)
 
 
 async def _flush(guild: discord.Guild) -> None:
@@ -167,9 +163,12 @@ async def _flush(guild: discord.Guild) -> None:
             description="\n".join(lines) + "\n\nThe new channel was **deleted automatically** because the server is locked.",
             color=discord.Color.red(),
         )
-        embed.set_footer(text=f"{guild.name}  •  Unlock the server from ⚙️︱settings to allow new channels")
-        for member in _recipients(guild):
-            await notify.best_effort(lambda m=member: m.send(embed=embed), label="lock-dm")
+        embed.set_footer(text=f"{guild.name}  •  Unlock the server from 🛠️︱settings to allow new channels")
+        channel = _notice_channel(guild)
+        if channel is None:
+            log.info("Lock notice for guild %s not posted: there is no settings channel.", guild.id)
+            return
+        await notify.best_effort(lambda: channel.send(embed=embed), label="lock-notice")
     except asyncio.CancelledError:
         raise
     except Exception as e:  # noqa: BLE001

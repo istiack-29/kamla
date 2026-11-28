@@ -27,9 +27,18 @@ class FakeMessage:
         self.view = view
         self.mentions = []
         self.deleted = False
+        self.kw = {}
+        self.edits = []
 
     async def delete(self):
         self.deleted = True
+
+    async def edit(self, **kw):
+        self.edits.append(kw)
+        if "content" in kw:
+            self.content = kw["content"]
+        if "embed" in kw:
+            self.embed = kw["embed"]
 
 
 class FakeChannel:
@@ -50,9 +59,16 @@ class FakeChannel:
 
     async def send(self, content=None, **kw):
         msg = FakeMessage(self.guild.me, content or "", kw.get("embed"), kw.get("view"))
+        msg.kw = kw
         self.messages.append(msg)
         self.guild.sent += 1
         return msg
+
+    async def fetch_message(self, mid):
+        for m in self.messages:
+            if m.id == mid and not m.deleted:
+                return m
+        raise http_error(404)
 
     async def history(self, limit=100, **kw):  # used as: async for m in ch.history(...)
         self.history_calls += 1
@@ -109,6 +125,13 @@ class FakeRole:
         self.managed = managed
         self.permissions = permissions if permissions is not None else discord.Permissions()
         self.edit_calls = 0
+
+    @property
+    def mention(self):
+        return f"<@&{self.id}>"
+
+    def is_default(self):
+        return self.name == "@everyone"
 
     async def edit(self, **kw):
         self.edit_calls += 1

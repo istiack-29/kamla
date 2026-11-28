@@ -26,34 +26,107 @@ def bp(i):
                       chair="C", panel=["P"])
 
 
-def test_ap_draw_is_a_valid_png():
-    pages = tr.render_draw("Open", RND, [ap(1), ap(2)])
-    assert len(pages) == 1 and size_of(pages[0])[0] == tr.WIDTH * tr.SCALE
+def test_ap_draw_is_a_valid_wide_png():
+    pages = tr.render_draw("Open", RND, [ap(1), ap(2)], tr.MODE_ALL)
+    w, h = size_of(pages[0])
+    assert len(pages) == 1 and w >= tr.DRAW_MIN_WIDTH * tr.SCALE
+    assert w > 4 * h                                          # wide, not tall
 
 
 def test_bp_draw_and_teams_only_draw():
-    assert len(tr.render_draw("Open", RND, [bp(1), bp(2)])) == 1
-    teams_only = RoundInfo(seq=2, name="Round 2", draw_status="T")
-    png = tr.render_draw("Open", teams_only, [ap(1, chair="Hidden")])[0]            # adjudicator columns omitted
-    assert size_of(png)[0] == tr.WIDTH * tr.SCALE
+    assert len(tr.render_draw("Open", RND, [bp(1), bp(2)], tr.MODE_ALL)) == 1
+    png = tr.render_draw("Open", RND, [ap(1, chair="", panel=())])[0]        # no allocation at all
+    assert size_of(png)[0] >= tr.DRAW_MIN_WIDTH * tr.SCALE
 
 
 def test_many_debates_stay_one_image_as_tall_as_needed():
     t0 = time.monotonic()
-    pages = tr.render_draw("Open", RND, [ap(i) for i in range(1, 41)])   # 40 debates: same code path, 3× faster at scale 1
+    pages = tr.render_matchup("Open", RND, [ap(i) for i in range(1, 41)], tr.MODE_ALL)
     assert len(pages) == 1
     w, h = size_of(pages[0])
-    assert h > 2100 // tr.SCALE and max(w, h) <= tr.MAX_SIDE_PX
+    assert h > 1500 and max(w, h) <= tr.MAX_SIDE_PX
     assert len(pages[0]) <= tr.MAX_BYTES
     assert time.monotonic() - t0 < 30
 
 
+def test_rows_are_compact():
+    one = size_of(tr.render_matchup("Open", RND, [ap(1)], tr.MODE_ALL)[0])[1]
+    ten = size_of(tr.render_matchup("Open", RND, [ap(i) for i in range(1, 11)], tr.MODE_ALL)[0])[1]
+    per_row = (ten - one) / 9 / tr.SCALE
+    assert per_row < 52                                       # logical units per room: dense, single-line rows
+
+
 def test_scale_constant_exists_and_is_in_range():
-    # In tests SCALE=1 (fast), in production SCALE=2 (high-res). The range 1–4 is what the env
-    # var accepts; the production default of 2 is enforced by the .env on the VM, not here.
     assert 1 <= tr.SCALE <= 4
     w, _ = size_of(tr.render_draw("Open", RND, [ap(1)])[0])
-    assert w == tr.WIDTH * tr.SCALE           # whatever the scale, the width is WIDTH × SCALE
+    assert w >= tr.DRAW_MIN_WIDTH * tr.SCALE and w <= tr.DRAW_MAX_WIDTH * tr.SCALE
+
+
+# ── BP / AP columns ───────────────────────────────────────────────────────────
+
+def test_bp_has_exactly_four_team_columns_and_ap_exactly_two():
+    assert tr._side_columns([bp(1)]) == [("OG", "OG"), ("OO", "OO"), ("CG", "CG"), ("CO", "CO")]
+    assert tr._side_columns([ap(1)]) == [("Gov", "Government"), ("Opp", "Opposition")]
+
+
+def test_team_names_are_aligned_to_their_columns_even_when_the_data_order_differs():
+    d = DebateInfo(id=1, venue="R", teams=[TeamSlot("CO", "d"), TeamSlot("OG", "a"), TeamSlot("CG", "c"), TeamSlot("OO", "b")])
+    assert tr._team_names(d, tr._side_columns([d])) == ["a", "b", "c", "d"]
+
+
+# ── adjudicators: one allocation per matchup, ©  Ⓟ  Ⓣ ─────────────────────────
+
+def adj(i, chair="Chair", panel=(), trainees=()):
+    return DebateInfo(id=i, venue=f"Room {i}", teams=[TeamSlot("Gov", "A"), TeamSlot("Opp", "B")],
+                      chair=chair, panel=list(panel), trainees=list(trainees))
+
+
+def test_markers_and_order_chair_then_panel_then_trainee():
+    d = adj(1, chair="Ann", panel=["Bob", "Cy"], trainees=["Di"])
+    assert tr.adjudicator_entries(d) == [("Ann", "©"), ("Bob", "Ⓟ"), ("Cy", "Ⓟ"), ("Di", "Ⓣ")]
+    assert tr.adjudicator_text(d) == "Ann©, BobⓅ, CyⓅ, DiⓉ"
+    assert (tr.MARK_CHAIR, tr.MARK_PANEL, tr.MARK_TRAINEE) == ("©", "Ⓟ", "Ⓣ")
+
+
+def test_only_one_chair_and_nobody_is_listed_twice():
+    d = adj(1, chair="Ann", panel=["ann", "Bob", " Bob ", "", "  "], trainees=["Bob", "Ann"])
+    assert tr.adjudicator_entries(d) == [("Ann", "©"), ("Bob", "Ⓟ")]
+    assert sum(1 for _n, m in tr.adjudicator_entries(d) if m == "©") == 1
+    assert tr.adjudicator_text(adj(2, chair="", panel=[], trainees=[])) == "—"
+
+
+def test_markers_are_drawn_as_badges_so_no_font_can_turn_them_into_boxes():
+    runs = tr.split_runs("Ann©, BobⓅ, CyⓉ")
+    assert [r for s, r in runs if s == "K"] == ["©", "Ⓟ", "Ⓣ"]
+    assert tr.text_width("Ⓟ", 24) == pytest.approx(24 * tr.MARK_W)
+    plain = tr.render_matchup("Open", RND, [adj(1, chair="Ann")], tr.MODE_ADJ)[0]
+    marked = tr.render_matchup("Open", RND, [adj(1, chair="Ann", panel=["Bob"], trainees=["Cy"])], tr.MODE_ADJ)[0]
+    assert plain != marked
+
+
+# ── the three draw types ───────────────────────────────────────────────────────
+
+def test_without_an_allocation_every_type_becomes_teams_only():
+    no_alloc = [ap(1, chair="", panel=()), ap(2, chair="", panel=())]
+    teams = tr.render_matchup("Open", RND, no_alloc, tr.MODE_TEAMS)
+    assert tr.render_matchup("Open", RND, no_alloc, tr.MODE_ALL) == teams
+    assert tr.render_matchup("Open", RND, no_alloc, tr.MODE_ADJ) == teams
+    assert tr.render_matchup("Open", RND, no_alloc, "nonsense") == teams
+    assert not tr.has_adjudicator_allocation(no_alloc)
+
+
+def test_with_an_allocation_all_adj_and_teams_are_three_different_images():
+    debates = [ap(1, panel=["P1"]), adj(2, panel=["P2"], trainees=["T"])]
+    imgs = {m: tr.render_matchup("Open", RND, debates, m)[0] for m in (tr.MODE_ALL, tr.MODE_ADJ, tr.MODE_TEAMS)}
+    assert len(set(imgs.values())) == 3
+    assert tr.has_adjudicator_allocation(debates)
+
+
+def test_draw_never_crashes_on_hostile_input():
+    weird = [adj(1, chair="", panel=[], trainees=[]), adj(2, chair="ড. করিম", panel=["🎉🎉🎉"], trainees=["x" * 200])]
+    for mode in (tr.MODE_ALL, tr.MODE_ADJ, tr.MODE_TEAMS):
+        assert tr.render_matchup("Open" * 80, RND, weird, mode)
+        assert tr.render_matchup("", RND, [], mode)
 
 
 def test_team_emoji_are_drawn_not_dropped():
@@ -165,45 +238,3 @@ def test_speaker_break_of_100_rows_is_one_image():
 def test_adjudicator_break_renders():
     pages = tr.render_adjudicator_break("Open", ["Dr Chair", "পানেল ওয়ান", "🧑‍⚖️ Judge J"])
     assert len(pages) == 1 and size_of(pages[0])[1] > 300
-
-
-# ── adjudicator draw (/drawadj): independent chair/panel/trainee columns ──────
-
-def adj(i, chair="Chair", panel=(), trainees=()):
-    return DebateInfo(id=i, venue=f"Room {i}", teams=[TeamSlot("Gov", "A"), TeamSlot("Opp", "B")],
-                      chair=chair, panel=list(panel), trainees=list(trainees))
-
-
-def _header_texts_of(png: bytes) -> list[str]:
-    """We can't OCR the PNG, so this just documents the expected column SET via the render call succeeding;
-    the real assertions below check tr.render_draw_adjudicators doesn't raise and produces distinct output
-    per configuration (covered by the byte-difference checks)."""
-    return []
-
-
-def test_only_chair_when_no_panel_or_trainee_exist_in_the_round():
-    a = tr.render_draw_adjudicators("Open", RND, [adj(1), adj(2)])
-    assert a  # renders fine with just Venue/Gov/Opp/Chair
-
-
-def test_panel_column_hidden_when_no_debate_has_a_panellist():
-    with_trainee_only = [adj(1, trainees=["T1"]), adj(2)]
-    a = tr.render_draw_adjudicators("Open", RND, with_trainee_only)
-    chair_trainee_only = tr.render_draw_adjudicators("Open", RND, [adj(1, chair="C", trainees=["T1"])])
-    assert a and chair_trainee_only
-    # a debate with ONLY chair+panel vs ONLY chair+trainee must differ (different column sets)
-    chair_panel_only = tr.render_draw_adjudicators("Open", RND, [adj(1, chair="C", panel=["P1"])])
-    assert chair_panel_only != chair_trainee_only
-
-
-def test_trainee_column_present_only_when_some_debate_has_one():
-    none_have_trainees = [adj(1, panel=["P1"]), adj(2, panel=["P2"])]
-    one_has_trainee = [adj(1, panel=["P1"]), adj(2, panel=["P2"], trainees=["T1"])]
-    assert tr.render_draw_adjudicators("Open", RND, none_have_trainees) != \
-        tr.render_draw_adjudicators("Open", RND, one_has_trainee)
-
-
-def test_draw_adj_never_crashes_on_hostile_input():
-    weird = [adj(1, chair="", panel=[], trainees=[]), adj(2, chair="ড. করিম", panel=["🎉🎉🎉"], trainees=["x" * 200])]
-    assert tr.render_draw_adjudicators("Open" * 80, RND, weird)
-    assert tr.render_draw_adjudicators("", RND, [])

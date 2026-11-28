@@ -1,14 +1,22 @@
 import asyncio
 import logging
-import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
 import discord
+import time
 from config import (
-    KAMLA_ROLE_NAMES, ADMIN_ROLE_NAMES, config_manager
+    KAMLA_ROLE_NAMES, ADMIN_ROLE_NAMES, config_manager, with_thread_lock
 )
 from ratelimit import bulk, classify, describe, Kind
+import naming
+from naming import (
+    CAT_ORGCOM, CAT_GA, CAT_PLAY, CAT_INFO, CAT_SECURITY, CH_SECURITY, CH_SETTINGS, CH_ORG, CH_DOCUMENT, VC_ORG,
+    VC_CONTROL, CH_GA_TEXT, CH_MOTION, CH_ANNOUNCEMENT, CH_BREAK, CH_MATCHUP, CH_BALLOT, CH_POLL, CH_YES_NO, VC_GA,
+    VC_CLASH, CH_TTT, CH_RPS, CH_TOSS, CH_SCHEDULE, CH_FORMS, CH_DEBATER_BRIEF, CH_JUDGE_BRIEF, CH_EQUITY_BRIEF,
+    CH_TIMER, VC_DEBATE, VC_ADJ, CH_DEVELOPERS, CH_MEMBERS, CH_GET_ROLE, CH_HOW_TO, CH_LINKS, ROOM_CATEGORY_RE,
+    AP_PREP, BP_PREP, prep_name, room_category,
+)
 
 log = logging.getLogger("kamla.builder")
 
@@ -54,37 +62,29 @@ ORG_ACCESS_ROLES = ["ORG", "CAP", "TABBY", "EQUITY", "INVITED ADJUDICATOR"]
 
 # ── Protected structure ────────────────────────────────────────────────────────
 
-PROTECTED_CATEGORIES = {
-    "⚜️︱ORGCOM",
-    "🏟️︱GRAND AUDITORIUM",
-    "🎮︱PLAY",
-    "ℹ️︱INFORMATION",
-}
+PROTECTED_CATEGORIES = {CAT_ORGCOM, CAT_GA, CAT_PLAY, CAT_INFO, CAT_SECURITY}
 
-PROTECTED_TOP_LEVEL_CHANNELS = {
-    "👐🏻︱meet-the-developer",
-    "👋🏻︱welcome",
-    "❓︱get-role",
-    "🦧︱how-to-use-this-server",
-}
+PROTECTED_TOP_LEVEL_CHANNELS = {CH_DEVELOPERS, CH_MEMBERS, CH_GET_ROLE, CH_HOW_TO, CH_LINKS}
 
 CATEGORY_CHANNEL_STRUCTURE: dict[str, dict] = {
-    "⚜️︱ORGCOM": {
-        "text":  ["⚙️︱settings", "🏴︱org", "📂︱document"],
-        "voice": ["ORG", "Control Room"],
+    CAT_ORGCOM: {
+        "text":  [CH_SETTINGS, CH_ORG, CH_DOCUMENT],
+        "voice": [VC_ORG, VC_CONTROL],
     },
-    "🏟️︱GRAND AUDITORIUM": {
-        "text":  ["📨︱ga-text", "🎓︱motion", "🎓︱announcement", "🎓︱break",
-                  "🎓︱matchup", "🎓︱ballot", "📊︱poll", "📊︱yes-no-voting"],
-        "voice": ["🏟️︱GRAND AUDITORIUM", "😤︱CLASH-EQUITY ROOM"],
+    CAT_GA: {
+        "text":  [CH_GA_TEXT, CH_MOTION, CH_ANNOUNCEMENT, CH_BREAK, CH_MATCHUP, CH_BALLOT, CH_POLL, CH_YES_NO],
+        "voice": [VC_GA, VC_CLASH],
     },
-    "🎮︱PLAY": {
-        "text":  ["❌︱tic-tac-toe︱⭕", "🤛︱rock✊-paper📰-scissors✌️", "🪙︱toss-coin"],
+    CAT_PLAY: {
+        "text":  [CH_TTT, CH_RPS, CH_TOSS],
         "voice": [],
     },
-    "ℹ️︱INFORMATION": {
-        "text":  ["schedule", "important-forms", "debater-briefing",
-                  "judge-briefing", "equity-briefing"],
+    CAT_INFO: {
+        "text":  [CH_SCHEDULE, CH_FORMS, CH_DEBATER_BRIEF, CH_JUDGE_BRIEF, CH_EQUITY_BRIEF],
+        "voice": [],
+    },
+    CAT_SECURITY: {
+        "text":  [CH_SECURITY],
         "voice": [],
     },
 }
@@ -118,16 +118,11 @@ def _role_ow(admin: bool = False, view: bool = True, send: bool = True) -> disco
 DISCORD_MAX_CHANNELS = 500
 DISCORD_MAX_CATEGORIES = 50
 
-TOP_LEVEL_CHANNELS = [
-    "👐🏻︱meet-the-developer",
-    "👋🏻︱welcome",
-    "❓︱get-role",
-    "🦧︱how-to-use-this-server",
-]
-INFO_CHANNELS = ["schedule", "important-forms", "debater-briefing",
-                 "judge-briefing", "equity-briefing"]
-GA_ANNOUNCE_CHANNELS = ["🎓︱motion", "🎓︱announcement", "🎓︱break",
-                        "🎓︱matchup", "🎓︱ballot", "📊︱poll", "📊︱yes-no-voting"]
+TOP_LEVEL_CHANNELS = [CH_DEVELOPERS, CH_MEMBERS, CH_GET_ROLE, CH_HOW_TO, CH_LINKS]
+INFO_CHANNELS = [CH_SCHEDULE, CH_FORMS, CH_DEBATER_BRIEF, CH_JUDGE_BRIEF, CH_EQUITY_BRIEF]
+GA_ANNOUNCE_CHANNELS = [CH_MOTION, CH_ANNOUNCEMENT, CH_BREAK, CH_MATCHUP, CH_BALLOT, CH_POLL, CH_YES_NO]
+# Channels KAMLA creates before /st runs (the installer's two management channels).
+MANAGEMENT_CHANNELS = 2
 
 
 def base_channel_count() -> int:
@@ -141,12 +136,12 @@ def base_channel_count() -> int:
 def room_channel_count(fmt: str) -> int:
     """Channels in one ROOM XX category, category itself included."""
     preps = 2 if fmt.lower() == "ap" else 4
-    return 1 + 3 + 1 + preps + 1          # category + timer/poi/all-in + DEBATE ROOM + preps + ADJUDICATION
+    return 1 + 1 + 1 + preps + 1          # category + timer + DEBATE ROOM + preps + ADJUDICATION
 
 
 def max_rooms_for_fresh_build(fmt: str) -> int:
-    """Largest room count a freshly wiped server can hold (the kamla-config channel survives a wipe)."""
-    by_channels = (DISCORD_MAX_CHANNELS - 1 - base_channel_count()) // room_channel_count(fmt)
+    """Largest room count a fresh server can hold (the two management channels already exist)."""
+    by_channels = (DISCORD_MAX_CHANNELS - MANAGEMENT_CHANNELS - base_channel_count()) // room_channel_count(fmt)
     by_categories = DISCORD_MAX_CATEGORIES - len(CATEGORY_CHANNEL_STRUCTURE)
     return max(0, min(by_channels, by_categories))
 
@@ -308,12 +303,14 @@ async def _reconcile(channel, overwrites: dict, report: BuildReport, what: str, 
 
 
 async def _ensure_category(guild, name, overwrites, report):
+    overwrites = with_thread_lock(guild, overwrites)
     matches = [c for c in guild.categories if c.name == name]
     if matches:
         cat = _pick(matches, f"category {name!r}")
         await _reconcile(cat, overwrites, report, f"category {name}")
         report.reused.append(f"category {name}")
         return cat, False
+    await _pace(guild)
     cat = await bulk.run(lambda: guild.create_category(name, overwrites=overwrites, reason="KAMLA tournament setup"),
                          label=f"create category {name}")
     report.created.append(f"category {name}")
@@ -321,6 +318,7 @@ async def _ensure_category(guild, name, overwrites, report):
 
 
 async def _ensure_text(guild, name, category, overwrites, report):
+    overwrites = with_thread_lock(guild, overwrites)
     pool = category.text_channels if category else [c for c in guild.text_channels if c.category_id is None]
     matches = [c for c in pool if c.name == name]
     where = f"#{name}" + (f" in {category.name}" if category else "")
@@ -332,12 +330,14 @@ async def _ensure_text(guild, name, category, overwrites, report):
     kwargs = {"overwrites": overwrites, "reason": "KAMLA tournament setup"}
     if category is not None:
         kwargs["category"] = category
+    await _pace(guild)
     ch = await bulk.run(lambda: guild.create_text_channel(name, **kwargs), label=f"create {where}")
     report.created.append(where)
     return ch, True
 
 
 async def _ensure_voice(guild, name, category, overwrites, report, user_limit=None):
+    overwrites = with_thread_lock(guild, overwrites)
     pool = category.voice_channels if category else [c for c in guild.voice_channels if c.category_id is None]
     matches = [c for c in pool if c.name == name]
     where = f"🔊{name}" + (f" in {category.name}" if category else "")
@@ -351,6 +351,7 @@ async def _ensure_voice(guild, name, category, overwrites, report, user_limit=No
         kwargs["category"] = category
     if user_limit:
         kwargs["user_limit"] = user_limit
+    await _pace(guild)
     ch = await bulk.run(lambda: guild.create_voice_channel(name, **kwargs), label=f"create {where}")
     report.created.append(where)
     return ch, True
@@ -386,43 +387,44 @@ async def _post_if_needed(channel_and_created, poster, report: BuildReport, what
     await _step(report, f"post {what}", poster)
 
 
-# ── Wipe ──────────────────────────────────────────────────────────────────────
+# KAMLA never wipes a server: there is no wipe, no mass deletion of channels or roles. A server that already holds
+# other people's channels or roles is reported as "not a fresh server" by installer.check_compatibility and no setup
+# is offered; KAMLA only ever creates, reuses or edits resources that carry its own names.
 
-async def wipe_server(guild: discord.Guild) -> None:
-    """
-    Completely wipe the server — all channels, categories, and roles.
-    Keeps only: kamla-config channel, @everyone, and the bot's own managed role.
-    Deletions are paced; an already-deleted resource counts as success, so a retry after
-    an interruption simply continues. Raises BuildIncomplete (with an accurate report) if
-    something could not be deleted, instead of silently building on top of leftovers.
-    """
-    report = BuildReport()
-    async with _marked_building(guild):
-        for channel in list(guild.channels):
-            if "kamla-config" in channel.name:
-                continue
-            async def delete_channel(ch=channel):
-                try:
-                    await bulk.run(lambda: ch.delete(reason="KAMLA server wipe"), label=f"delete {ch.name}")
-                except discord.NotFound:
-                    pass
-            await _step(report, f"delete channel {channel.name}", delete_channel)
 
-        bot_managed_ids = {r.id for r in guild.me.roles if r.managed}
-        protected = {guild.default_role.id} | bot_managed_ids
-        for role in sorted(guild.roles, key=lambda r: r.position):
-            if role.id in protected:
-                continue
-            async def delete_role(r=role):
-                try:
-                    await bulk.run(lambda: r.delete(reason="KAMLA server wipe"), label=f"delete role {r.name}")
-                except discord.NotFound:
-                    pass
-            await _step(report, f"delete role {role.name}", delete_role)
+# ── Pacing / progress ─────────────────────────────────────────────────────────────────────────────────────────
+CHANNEL_INTERVAL = 2.0          # one channel (or category) is created at most every 2 seconds
+_sleep = asyncio.sleep          # injectable for tests
+_clock = time.monotonic
+_last_create: dict[int, float] = {}
+_trackers: dict[int, object] = {}
 
-    if not report.ok:
-        raise BuildIncomplete(report, "Could not completely wipe the server.")
-    log.info("Wipe finished for guild %s.", guild.id)
+
+async def _pace(guild: discord.Guild) -> None:
+    """Wait until CHANNEL_INTERVAL seconds have passed since this guild's previous channel creation."""
+    last = _last_create.get(guild.id)
+    if last is not None:
+        wait = CHANNEL_INTERVAL - (_clock() - last)
+        if wait > 0:
+            await _sleep(wait)
+    _last_create[guild.id] = _clock()
+
+
+def attach_tracker(guild: discord.Guild, tracker) -> None:
+    _trackers[guild.id] = tracker
+
+
+def detach_tracker(guild: discord.Guild) -> None:
+    _trackers.pop(guild.id, None)
+
+
+async def _progress(guild: discord.Guild, report: "BuildReport", phase: str) -> None:
+    tracker = _trackers.get(guild.id)
+    if tracker is not None:
+        try:
+            await tracker.update(report, phase)
+        except Exception as exc:  # noqa: BLE001 - a status display must never break a build
+            log.debug("tracker update failed: %s", describe(exc))
 
 
 async def _create_roles(guild: discord.Guild, report: BuildReport | None = None) -> dict[str, discord.Role]:
@@ -466,20 +468,47 @@ async def _create_roles(guild: discord.Guild, report: BuildReport | None = None)
 
 
 async def _forbid_member_invites(guild: discord.Guild, report: BuildReport) -> None:
-    """Nobody may invite anybody: remove 'Create Invite' from @everyone (every KAMLA role is
-    created without it too). Only the server owner and KAMLA itself can still create invites."""
+    """Nobody may invite anybody and nobody may start a thread: remove 'Create Invite' and the thread
+    permissions from @everyone (every KAMLA role is created without them too). Only the server owner and KAMLA
+    itself can still create invites; threads are blocked per channel as well (see enforce_thread_lock)."""
     everyone = guild.default_role
     perms = everyone.permissions
-    if not perms.create_instant_invite:
+    wanted = dict(create_instant_invite=False, create_public_threads=False, create_private_threads=False,
+                  send_messages_in_threads=False)
+    if all(getattr(perms, name) is False for name in wanted):
         return
     new = discord.Permissions(perms.value)
-    new.update(create_instant_invite=False)
+    new.update(**wanted)
 
     async def go():
-        await bulk.run(lambda: everyone.edit(permissions=new, reason="KAMLA: members cannot create invites"),
-                       label="remove @everyone create-invite")
-        report.reconciled.append("@everyone: Create Invite removed")
-    await _step(report, "remove 'Create Invite' from @everyone", go)
+        await bulk.run(lambda: everyone.edit(permissions=new, reason="KAMLA: no member invites, no threads"),
+                       label="harden @everyone")
+        report.reconciled.append("@everyone: Create Invite and thread permissions removed")
+    await _step(report, "remove 'Create Invite' and thread permissions from @everyone", go)
+
+
+async def enforce_thread_lock(guild: discord.Guild, report: BuildReport | None = None) -> tuple[int, int, int]:
+    """Deny thread creation to @everyone on EVERY channel and category of the guild, then verify it.
+    Returns (checked, fixed, unverified). A channel that is already locked costs no request."""
+    from config import THREAD_DENY, thread_locked
+    report = report if report is not None else BuildReport()
+    channels = [c for c in guild.channels if hasattr(c, "overwrites_for")]
+    fixed = 0
+    for channel in channels:
+        if thread_locked(channel):
+            continue
+
+        async def lock(ch=channel):
+            ow = ch.overwrites_for(guild.default_role)
+            ow.update(**THREAD_DENY)
+            await bulk.run(lambda: ch.set_permissions(guild.default_role, overwrite=ow, reason="KAMLA: no threads"),
+                           label=f"thread lock {ch.name}")
+        failed_before = len(report.failed)
+        await _step(report, f"thread lock {channel.name}", lock)
+        if len(report.failed) == failed_before:
+            fixed += 1
+    unverified = sum(1 for ch in channels if not thread_locked(ch))
+    return len(channels), fixed, unverified
 
 
 def _bot_ow(guild):
@@ -489,7 +518,7 @@ def _bot_ow(guild):
     # the announcement channels deny it to @everyone (see _build_announce_overwrites).
     return _allow("view_channel", "send_messages", "read_message_history",
                   "manage_messages", "embed_links", "attach_files",
-                  "connect", "speak", "move_members", "create_instant_invite", "manage_channels")
+                  "connect", "speak", "move_members", "create_instant_invite", "manage_channels", "manage_threads")
 
 
 def _build_orgcom_overwrites(guild, roles):
@@ -505,6 +534,33 @@ def _build_orgcom_overwrites(guild, roles):
             continue
         if rn in roles:
             ow[roles[rn]] = discord.PermissionOverwrite(view_channel=False)
+    return ow
+
+
+def _build_settings_overwrites(guild, roles):
+    """The settings panel: organisers see it, NOBODY can write in it (its buttons still work)."""
+    ow = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False, send_messages=False),
+        guild.me: _bot_ow(guild),
+    }
+    for rn in ORG_ACCESS_ROLES:
+        if rn in roles:
+            ow[roles[rn]] = discord.PermissionOverwrite(view_channel=True, read_message_history=True, send_messages=False)
+    for rn in KAMLA_ROLE_NAMES:
+        if rn not in ORG_ACCESS_ROLES and rn in roles:
+            ow[roles[rn]] = discord.PermissionOverwrite(view_channel=False)
+    return ow
+
+
+def _build_links_overwrites(guild, roles):
+    """The role-invite links grant roles, so only the organiser roles can see them; nobody posts there."""
+    ow = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False, send_messages=False),
+        guild.me: _bot_ow(guild),
+    }
+    for rn in ADMIN_ROLE_NAMES:
+        if rn in roles:
+            ow[roles[rn]] = discord.PermissionOverwrite(view_channel=True, read_message_history=True, send_messages=False)
     return ow
 
 
@@ -643,29 +699,6 @@ def _room_voice_ow(guild, roles, *, hide_from=(), no_speak=()):
     return ow
 
 
-def build_params(setup_data: dict) -> dict:
-    return {
-        "format": str(setup_data["format"]).lower(),
-        "rooms": int(setup_data["rooms"]),
-        "tournament_name": setup_data["tournament_name"],
-        "timezone": setup_data["timezone"],
-    }
-
-
-async def find_resumable(guild: discord.Guild, setup_data: dict) -> bool:
-    """True when an earlier build with IDENTICAL settings was interrupted after the wipe.
-    Resuming reconciles the existing structure instead of wiping and starting from zero."""
-    cfg = await config_manager.get_config(guild)
-    pending = cfg.get("pending_build") if cfg else None
-    return bool(pending and pending.get("wiped") and pending.get("params") == build_params(setup_data))
-
-
-async def mark_build_state(guild: discord.Guild, setup_data: dict, *, wiped: bool) -> None:
-    await config_manager.update_config(
-        guild, pending_build={"params": build_params(setup_data), "wiped": wiped}
-    )
-
-
 async def build_server(guild, fmt, rooms, timezone, tournament_name, creator_id, progress=None) -> BuildReport:
     """Idempotent: existing matching resources are reused, so running it again (or resuming
     after a failure) reconciles instead of duplicating. Raises BuildIncomplete when something
@@ -710,8 +743,10 @@ async def _build_server_inner(
 ) -> BuildReport:
     report = BuildReport()
     await _tell(progress, "Creating roles…")
+    await _progress(guild, report, "roles")
     roles = await _create_roles(guild, report)
     await _forbid_member_invites(guild, report)
+    await _progress(guild, report, "roles_done")
 
     await bulk.best_effort(lambda: guild.edit(name=tournament_name, reason="KAMLA tournament setup"),
                            label="rename server")
@@ -719,73 +754,83 @@ async def _build_server_inner(
 
     await _tell(progress, "Creating core channels…")
     pub_ow = _build_public_overwrites(guild)
+    links_ow = _build_links_overwrites(guild, roles)
     top = {}
     for name in TOP_LEVEL_CHANNELS:
-        top[name] = await _step(report, f"#{name}", lambda n=name: _ensure_text(guild, n, None, pub_ow, report))
+        ow = links_ow if name == CH_LINKS else pub_ow
+        top[name] = await _step(report, f"#{name}", lambda n=name, o=ow: _ensure_text(guild, n, None, o, report))
+        await _progress(guild, report, "structure")
 
     orgcom_ow = _build_orgcom_overwrites(guild, roles)
-    _, orgcom = await _ensure_tree(guild, report, "⚜️︱ORGCOM", orgcom_ow, [
-        ("text", "⚙️︱settings", orgcom_ow), ("text", "🏴︱org", orgcom_ow), ("text", "📂︱document", orgcom_ow),
-        ("voice", "ORG", orgcom_ow), ("voice", "Control Room", orgcom_ow),
+    settings_ow = _build_settings_overwrites(guild, roles)
+    _, orgcom = await _ensure_tree(guild, report, CAT_ORGCOM, orgcom_ow, [
+        ("text", CH_SETTINGS, settings_ow), ("text", CH_ORG, orgcom_ow), ("text", CH_DOCUMENT, orgcom_ow),
+        ("voice", VC_ORG, orgcom_ow), ("voice", VC_CONTROL, orgcom_ow),
     ])
 
     ga_all_ow = _build_all_role_overwrites(guild, roles, send=True)
     ga_ann_ow = _build_announce_overwrites(guild, roles)
-    ga_entries = [("text", "📨︱ga-text", ga_all_ow)]
+    ga_entries = [("text", CH_GA_TEXT, ga_all_ow)]
     ga_entries += [("text", n, ga_ann_ow) for n in GA_ANNOUNCE_CHANNELS]
-    ga_entries += [("voice", "🏟️︱GRAND AUDITORIUM", _build_all_role_overwrites(guild, roles)),
-                   ("voice", "😤︱CLASH-EQUITY ROOM", _build_all_role_overwrites(guild, roles))]
-    await _ensure_tree(guild, report, "🏟️︱GRAND AUDITORIUM", _build_all_role_overwrites(guild, roles), ga_entries)
+    ga_entries += [("voice", VC_GA, _build_all_role_overwrites(guild, roles)),
+                   ("voice", VC_CLASH, _build_all_role_overwrites(guild, roles))]
+    await _ensure_tree(guild, report, CAT_GA, _build_all_role_overwrites(guild, roles), ga_entries)
 
     play_ow = _build_play_overwrites(guild, roles)
-    await _ensure_tree(guild, report, "🎮︱PLAY", play_ow, [
-        ("text", "❌︱tic-tac-toe︱⭕", play_ow),
-        ("text", "🤛︱rock✊-paper📰-scissors✌️", play_ow),
-        ("text", "🪙︱toss-coin", _build_toss_overwrites(guild, roles)),
+    await _ensure_tree(guild, report, CAT_PLAY, play_ow, [
+        ("text", CH_TTT, play_ow),
+        ("text", CH_RPS, play_ow),
+        ("text", CH_TOSS, _build_toss_overwrites(guild, roles)),
     ])
 
     info_send_ow = _build_announce_overwrites(guild, roles)
-    await _ensure_tree(guild, report, "ℹ️︱INFORMATION", _build_all_role_overwrites(guild, roles, send=False),
+    await _ensure_tree(guild, report, CAT_INFO, _build_all_role_overwrites(guild, roles, send=False),
                        [("text", n, info_send_ow) for n in INFO_CHANNELS])
 
-    settings = orgcom.get("⚙️︱settings")
+    # Security: visible to everybody, writable by nobody (see security_cog for what it watches).
+    _, security = await _ensure_tree(guild, report, CAT_SECURITY, pub_ow, [("text", CH_SECURITY, pub_ow)])
+
+    settings = orgcom.get(CH_SETTINGS)
     previous = config_manager.get_cached(guild.id) or {}
-    cfg_data = {
+    cfg_data = dict(previous)                       # installer_id, security counters, link message ids… survive
+    cfg_data.update({
         "format":              fmt,
         "rooms":               rooms,
         "timezone":            timezone,
         "tournament_name":     tournament_name,
         "created_by":          creator_id,
-        "created_at":          discord.utils.utcnow().isoformat(),
+        "created_at":          previous.get("created_at") or discord.utils.utcnow().isoformat(),
         "settings_channel_id": settings[0].id if settings else None,
-        "locked":              False,
-    }
-    if previous.get("pending_build"):
-        cfg_data["pending_build"] = previous["pending_build"]      # keep the resume marker until we finish
-    if previous.get("invite_roles"):
-        cfg_data["invite_roles"] = previous["invite_roles"]        # validated against live invites when reused
+        "locked":              previous.get("locked", False),
+    })
     await config_manager.set_config(guild, cfg_data)
 
     await _tell(progress, "Posting guide messages…")
-    await _post_if_needed(top.get("👐🏻︱meet-the-developer"), lambda: _post_meet_developer(top["👐🏻︱meet-the-developer"][0]), report, "meet-the-developer")
-    await _post_if_needed(top.get("👋🏻︱welcome"), lambda: _post_welcome(guild), report, "welcome")
-    await _post_if_needed(top.get("❓︱get-role"), lambda: _post_get_role(guild), report, "get-role")
-    await _post_if_needed(top.get("🦧︱how-to-use-this-server"), lambda: _post_how_to_use(guild), report, "how-to-use")
+    await _post_if_needed(top.get(CH_DEVELOPERS), lambda: _post_meet_developer(top[CH_DEVELOPERS][0]), report, "meet-our-developers")
+    await _post_if_needed(top.get(CH_MEMBERS), lambda: _post_members_info(top[CH_MEMBERS][0]), report, "members-update")
+    await _post_if_needed(top.get(CH_GET_ROLE), lambda: _post_get_role(guild), report, "get-role")
+    await _post_if_needed(top.get(CH_HOW_TO), lambda: _post_how_to_use(guild), report, "how-to-use")
     if settings:
         await _post_if_needed(settings, lambda: _post_settings_panel(settings[0], cfg_data), report, "settings panel")
+    sec = security.get(CH_SECURITY)
+    if sec:
+        await _post_if_needed(sec, lambda: _post_security_panel(sec[0]), report, "security panel")
 
     await _create_rooms(guild, roles, fmt, rooms, start_index=1, report=report, progress=progress)
 
+    await _progress(guild, report, "permissions")
+    await enforce_thread_lock(guild, report)
+
+    # Role-invite links (🔗︱links). Needs Create Invite + Manage Roles; a failure is reported, not hidden.
+    async def post_links():
+        from links_cog import refresh_links
+        await refresh_links(guild, installer_id=creator_id)
+    if top.get(CH_LINKS):
+        await _step(report, "role invite links", post_links)
+
     if not report.ok:
         raise BuildIncomplete(report)
-    cfg_data.pop("pending_build", None)
-    await config_manager.set_config(guild, cfg_data)       # clears the resume marker
     return report
-
-
-AP_PREP_NAMES = {"GOVT PREP", "OPP PREP"}
-BP_PREP_NAMES = {"OG PREP", "OO PREP", "CG PREP", "CO PREP"}
-ROOM_CATEGORY_RE = re.compile(r"^ROOM (?P<number>\d{2})$")
 
 
 async def switch_format_rooms(guild: discord.Guild, new_fmt: str, rooms: int) -> BuildReport:
@@ -797,22 +842,22 @@ async def switch_format_rooms(guild: discord.Guild, new_fmt: str, rooms: int) ->
     adj_ow  = _room_voice_ow(guild, roles, hide_from=("DEBATER", "VISITOR"))
     all_prep = AP_PREP_NAMES | BP_PREP_NAMES
     fmt = new_fmt.lower()
-    wanted = ([("OG PREP", 2), ("OO PREP", 2), ("CG PREP", 2), ("CO PREP", 2)] if fmt == "bp"
-              else [("GOVT PREP", 3), ("OPP PREP", 3)])
+    wanted = ([(prep_name(n), 2) for n in BP_PREP] if fmt == "bp"
+              else [(prep_name(n), 3) for n in AP_PREP])
     wanted_names = {n for n, _ in wanted}
 
     async with _marked_building(guild):
         for i in range(1, rooms + 1):
-            cat = discord.utils.get(guild.categories, name=f"ROOM {i:02d}")
+            cat = discord.utils.get(guild.categories, name=room_category(i)) or discord.utils.get(guild.categories, name=f"ROOM {i:02d}")
             if not cat:
                 continue
             have = {ch.name for ch in cat.voice_channels}
-            if (have & all_prep) == wanted_names and "ADJUDICATION" in have:
+            if (have & all_prep) == wanted_names and VC_ADJ in have:
                 report.reused.append(f"room {i:02d} layout")
                 continue
 
             for ch in list(cat.voice_channels):
-                if ch.name in (all_prep - wanted_names) or ch.name == "ADJUDICATION":
+                if ch.name in (all_prep - wanted_names) or ch.name == VC_ADJ:
                     async def drop(c=ch):
                         try:
                             await bulk.run(lambda: c.delete(reason="KAMLA format switch"), label=f"delete {c.name}")
@@ -820,11 +865,11 @@ async def switch_format_rooms(guild: discord.Guild, new_fmt: str, rooms: int) ->
                             pass
                     await _step(report, f"delete {ch.name} in ROOM {i:02d}", drop)
 
-            for prep_name, limit in wanted:
-                await _step(report, f"{prep_name} in ROOM {i:02d}",
-                            lambda n=prep_name, l=limit, c=cat: _ensure_voice(guild, n, c, prep_ow, report, l))
+            for prep_channel, limit in wanted:
+                await _step(report, f"{prep_channel} in ROOM {i:02d}",
+                            lambda n=prep_channel, l=limit, c=cat: _ensure_voice(guild, n, c, prep_ow, report, l))
             await _step(report, f"ADJUDICATION in ROOM {i:02d}",
-                        lambda c=cat: _ensure_voice(guild, "ADJUDICATION", c, adj_ow, report))
+                        lambda c=cat: _ensure_voice(guild, VC_ADJ, c, adj_ow, report))
 
     if not report.ok:
         raise BuildIncomplete(report)
@@ -847,52 +892,33 @@ async def _create_rooms(
     report = report if report is not None else BuildReport()
     cat_ow    = _room_category_ow(guild, roles)
     text_ow   = _room_text_ow(guild, roles, hide_from=("VISITOR",), allow_send=True)
-    allin_ow  = _room_text_ow(guild, roles, hide_from=("DEBATER", "VISITOR"), allow_send=False)
     debate_ow = _room_voice_ow(guild, roles, no_speak=("VISITOR",))
     prep_ow   = _room_voice_ow(guild, roles, hide_from=("VISITOR",))
     adj_ow    = _room_voice_ow(guild, roles, hide_from=("DEBATER", "VISITOR"))
 
     if fmt.lower() == "ap":
-        preps = [("GOVT PREP", 3), ("OPP PREP", 3)]
+        preps = [(prep_name(n), 3) for n in AP_PREP]
     else:
-        preps = [("OG PREP", 2), ("OO PREP", 2), ("CG PREP", 2), ("CO PREP", 2)]
+        preps = [(prep_name(n), 2) for n in BP_PREP]
 
     for i in range(start_index, start_index + count):
         await _tell(progress, f"Creating rooms… {i - start_index + 1}/{count}")
-        room_name = f"ROOM {i:02d}"
-        entries = [("text", "timer", text_ow), ("text", "poi", text_ow), ("text", "all-in", allin_ow),
-                   ("voice", "DEBATE ROOM", debate_ow)]
+        entries = [("text", CH_TIMER, text_ow), ("voice", VC_DEBATE, debate_ow)]
         entries += [("voice", n, prep_ow, limit) for n, limit in preps]
-        entries += [("voice", "ADJUDICATION", adj_ow)]
-        _, children = await _ensure_tree(guild, report, room_name, cat_ow, entries)
-
-        all_in = children.get("all-in")
-        if all_in:
-            await _post_if_needed(all_in, lambda ch=all_in[0]: _post_all_in_panel(ch), report, f"{room_name} all-in panel")
+        entries += [("voice", VC_ADJ, adj_ow)]
+        await _ensure_tree(guild, report, room_category(i), cat_ow, entries)
+        await _progress(guild, report, "structure")
 
     if standalone and not report.ok:
         raise BuildIncomplete(report)
     return report
 
 
-async def _post_all_in_panel(channel: discord.TextChannel) -> None:
-    from allin_cog import AllInView
-    await _send(
-        channel,
-        embed=discord.Embed(
-            title="🔴 Push Back All",
-            description="Press the button below to move everyone from prep rooms back to **DEBATE ROOM**.\n\n"
-                        "⛔ Text messages are not allowed in this channel.",
-            color=discord.Color.red(),
-        ),
-        view=AllInView(),
-    )
-
-
 async def remove_room(guild: discord.Guild, index: int) -> BuildReport:
     """Delete ROOM {index} (children first). Already-missing resources count as success."""
     report = BuildReport()
-    cat = discord.utils.get(guild.categories, name=f"ROOM {index:02d}")
+    cat = (discord.utils.get(guild.categories, name=room_category(index))
+           or discord.utils.get(guild.categories, name=f"ROOM {index:02d}"))
     if not cat:
         return report
     async with _marked_building(guild):
@@ -914,20 +940,29 @@ async def remove_room(guild: discord.Guild, index: int) -> BuildReport:
     return report
 
 
+SUPPORT_SERVER_URL = "https://discord.gg/9zhXq4MNHs"
+SUPPORT_SERVER_LABEL = "JOIN KAMLA Support Server"
+
+
+def developer_view() -> discord.ui.View:
+    """The buttons under the developer message: the support server, and the tournament creation site."""
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(label=SUPPORT_SERVER_LABEL, style=discord.ButtonStyle.link, url=SUPPORT_SERVER_URL))
+    view.add_item(discord.ui.Button(label="Create Tournament", style=discord.ButtonStyle.link,
+                                    url="https://kamla-bot.pages.dev"))
+    return view
+
+
 async def _post_meet_developer(channel: discord.TextChannel) -> None:
     embed = discord.Embed(
-        title="👐 Meet the Developer",
+        title="👨‍💻 Meet Our Developers",
         description=(
             "KAMLA was built by **Istiack Ahamed Khan (Founder & Developer)** & **KM Mamunoor Islam (Developer)**\n\n"
-            "Use the buttons below to get in touch or create a tournament."
+            "Need help? Join the KAMLA support server, or create a tournament with the buttons below."
         ),
         color=discord.Color.blurple(),
     )
-    view = discord.ui.View(timeout=None)
-    view.add_item(discord.ui.Button(label="Get In Touch", style=discord.ButtonStyle.link,
-                                    url="https://discord.gg/zKWJaMEHKf"))
-    view.add_item(discord.ui.Button(label="Create Tournament", style=discord.ButtonStyle.link,
-                                    url="https://kamla-bot.pages.dev"))
+    view = developer_view()
 
     import pathlib
     logo_path = pathlib.Path(__file__).parent / "m.png"
@@ -936,82 +971,52 @@ async def _post_meet_developer(channel: discord.TextChannel) -> None:
         # A discord.File is consumed by one send; build a fresh one per attempt.
         await bulk.run(
             lambda: channel.send(embed=embed, file=discord.File(str(logo_path), filename="m.png"), view=view),
-            label="send meet-the-developer",
+            label="send meet-our-developers",
         )
     else:
         await _send(channel, embed=embed, view=view)
 
 
-async def _post_welcome(guild: discord.Guild) -> None:
-    channel = discord.utils.get(guild.text_channels, name="👋🏻︱welcome")
-    if not channel:
-        return
-    embed = discord.Embed(
-        title="👋 Welcome to the Tournament Server!",
-        description=(
-            "This server is powered by **KAMLA** — an automated tournament management bot.\n\n"
-            "**How to get a role:**\n"
-            "1. Head to **❓︱get-role**\n"
-            "2. Click the button that matches your role\n"
-            "3. Your role will be assigned automatically\n\n"
-            "**Roles:**\n"
-            "🔵 **Invited Adjudicator** — Officially invited judges\n"
-            "🟣 **Independent Adjudicator** — Self-registered judges\n"
-            "🩵 **Debater** — Competing speakers\n"
-            "⬜ **Visitor** — Observers and guests\n\n"
-            "Admin roles (ORG/CAP/TABBY/EQUITY) are assigned by organisers only."
-        ),
-        color=discord.Color.blurple(),
-    )
-    await _send(channel, embed=embed)
+async def _post_members_info(channel: discord.TextChannel) -> None:
+    await _send(channel, embed=discord.Embed(
+        title="👥 Members Update",
+        description=("Joins, leaves, bans and unbans of this server are logged here automatically, with the "
+                     "moderator responsible when Discord's audit log provides it.\n\n"
+                     "This channel is **read-only** for everyone."),
+        color=discord.Color.blurple()))
 
 
 async def _post_get_role(guild: discord.Guild) -> None:
-    channel = discord.utils.get(guild.text_channels, name="❓︱get-role")
+    channel = discord.utils.get(guild.text_channels, name=CH_GET_ROLE)
     if not channel:
         return
-    from roles_cog import RoleSelectView
-    owner = f"<@{guild.owner_id}>" if getattr(guild, "owner_id", None) else "the tournament ORG"
-    embed = discord.Embed(
-        title="❓ Get Your Role",
-        description=(
-            "Click a button below to claim your role.\n\n"
-            "You may only hold **one role** at a time — your previous role will be removed automatically."
-        ),
-        color=discord.Color.blurple(),
-    )
-    embed.add_field(
-        name="🎖️ CA · Equity · Tabby · Org",
-        value=(
-            "Please **do not** use the buttons above.\n"
-            f"Message the server owner {owner} and they will give you your role."
-        ),
-        inline=False,
-    )
-    await _send(channel, embed=embed, view=RoleSelectView())
+    from roles_cog import RoleSelectView, build_get_role_embed
+    await _send(channel, embed=build_get_role_embed(guild), view=RoleSelectView())
 
 
 async def _post_how_to_use(guild: discord.Guild) -> None:
-    channel = discord.utils.get(guild.text_channels, name="🦧︱how-to-use-this-server")
+    channel = discord.utils.get(guild.text_channels, name=CH_HOW_TO)
     if not channel:
         return
-    embed = discord.Embed(title="🦧 How to Use This Server", color=discord.Color.blurple())
+    embed = discord.Embed(title="📖 How to Use This Server", color=discord.Color.blurple())
     embed.add_field(name="📌 Channels",
-        value="• **welcome** — Read this first\n• **get-role** — Claim your role\n"
+        value=f"• **{CH_GET_ROLE}** — Claim your role\n• **{CH_MEMBERS}** — Joins, leaves, bans\n"
               "• **GRAND AUDITORIUM** — Main hub\n• **INFORMATION** — Official documents\n"
               "• **ROOM XX** — Individual debate rooms", inline=False)
-    embed.add_field(name="⏱️ Timer",
-        value="In **#timer**, send a time: `10m` `1h` `15s` `1h10m` `10m30s`\n"
-              "Only lowercase d/h/m/s — no symbols or spaces.", inline=False)
-    embed.add_field(name="🙋 POI",
-        value="In **#poi**, type `poi` (any case) to request a Point of Information.",
-        inline=False)
+    embed.add_field(name="⏱️ Timer (everywhere)",
+        value="In a room's **timer** channel send a time: `5m` `2h` `4h45m` `2 hours 30 minutes` (max 5 hours).\n"
+              "In any other channel start with a dot: `.5m` `.4h45m`. The dot only switches the timer on — "
+              "`.5m` is **5 minutes**.", inline=False)
     embed.add_field(name="🔴 All-In",
-        value="In **#all-in**, only **ORG / CAP / TABBY / Invited / Independent Adjudicator** "
-              "can press **Push Back All** to pull everyone back from prep to the debate room. "
-              "Text messages are not allowed.",
+        value="Type `.allin` in a room's timer channel to pull everyone from the prep rooms back to the debate room. "
+              "Not available to Visitors, Independent Adjudicators and Debaters.",
         inline=False)
     await _send(channel, embed=embed)
+
+
+async def _post_security_panel(channel: discord.TextChannel) -> None:
+    from security_cog import post_security_panel
+    await bulk.run(lambda: post_security_panel(channel), label="send security panel")
 
 
 async def _post_settings_panel(channel: discord.TextChannel, cfg: dict) -> None:
@@ -1022,17 +1027,19 @@ async def _post_settings_panel(channel: discord.TextChannel, cfg: dict) -> None:
 
 # ── Channel / Category Restoration ────────────────────────────────────────────
 
+AP_PREP_NAMES = {prep_name(n) for n in AP_PREP}
+BP_PREP_NAMES = {prep_name(n) for n in BP_PREP}
+
+
 def _room_number(category_name: str) -> int | None:
     match = ROOM_CATEGORY_RE.fullmatch(category_name)
     return int(match.group("number")) if match else None
 
 
 def _room_channel_names(fmt: str) -> tuple[list[str], list[str]]:
-    text = ["timer", "poi", "all-in"]
-    prep = ["GOVT PREP", "OPP PREP"] if fmt.lower() == "ap" else [
-        "OG PREP", "OO PREP", "CG PREP", "CO PREP"
-    ]
-    return text, ["DEBATE ROOM", *prep, "ADJUDICATION"]
+    text = [CH_TIMER]
+    prep = [prep_name(n) for n in (AP_PREP if fmt.lower() == "ap" else BP_PREP)]
+    return text, [VC_DEBATE, *prep, VC_ADJ]
 
 
 _guard_locks: dict[int, asyncio.Lock] = {}
@@ -1147,12 +1154,13 @@ async def _restore_category(guild: discord.Guild, cat_name: str) -> None:
     roles = {r.name: r for r in guild.roles}
 
     # Compute the right overwrites for this category
-    ow = _category_overwrites(guild, roles, cat_name)
+    ow = with_thread_lock(guild, _category_overwrites(guild, roles, cat_name))
 
     # Check if it already got recreated while we were sleeping
     existing_cat = discord.utils.get(guild.categories, name=cat_name)
     if existing_cat is None:
         try:
+            await _pace(guild)
             existing_cat = await bulk.run(lambda: guild.create_category(cat_name, overwrites=ow),
                                           label=f"restore category {cat_name}")
             log.info("Recreated category: %s", cat_name)
@@ -1175,6 +1183,10 @@ async def _restore_category(guild: discord.Guild, cat_name: str) -> None:
 
     # Re-post content for channels that need it
     await _repost_channel_content(guild, cat_name, existing_cat)
+    if cat_name == CAT_SECURITY:
+        sec = discord.utils.get(existing_cat.text_channels, name=CH_SECURITY)
+        if sec is not None and not await _bot_already_posted(sec):
+            await _post_security_panel(sec)
 
 
 async def _restore_top_level_channel(guild: discord.Guild, ch_name: str) -> None:
@@ -1183,8 +1195,11 @@ async def _restore_top_level_channel(guild: discord.Guild, ch_name: str) -> None
     if existing:
         return  # already back
 
-    pub_ow = _build_public_overwrites(guild)
+    roles = {r.name: r for r in guild.roles}
+    pub_ow = with_thread_lock(guild, _build_links_overwrites(guild, roles) if ch_name == CH_LINKS
+                              else _build_public_overwrites(guild))
     try:
+        await _pace(guild)
         new_ch = await bulk.run(lambda: guild.create_text_channel(ch_name, overwrites=pub_ow),
                                 label=f"restore {ch_name}")
         log.info("Recreated top-level channel: %s", ch_name)
@@ -1193,14 +1208,20 @@ async def _restore_top_level_channel(guild: discord.Guild, ch_name: str) -> None
         return
 
     # Re-post embedded content
-    if ch_name == "👐🏻︱meet-the-developer":
+    if ch_name == CH_DEVELOPERS:
         await _post_meet_developer(new_ch)
-    elif ch_name == "👋🏻︱welcome":
-        await _post_welcome(guild)
-    elif ch_name == "❓︱get-role":
+    elif ch_name == CH_MEMBERS:
+        await _post_members_info(new_ch)
+    elif ch_name == CH_GET_ROLE:
         await _post_get_role(guild)
-    elif ch_name == "🦧︱how-to-use-this-server":
+    elif ch_name == CH_HOW_TO:
         await _post_how_to_use(guild)
+    elif ch_name == CH_LINKS:
+        try:
+            from links_cog import refresh_links
+            await refresh_links(guild)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Could not refill the links channel after restoring it: %s", describe(e))
 
 
 async def _restore_single_channel(
@@ -1218,16 +1239,19 @@ async def _restore_single_channel(
     if existing:
         return  # already back
 
-    ow = _channel_overwrites(guild, roles, cat_name, ch_name)
+    ow = with_thread_lock(guild, _channel_overwrites(guild, roles, cat_name, ch_name))
     try:
+        await _pace(guild)
         if is_voice:
             await bulk.run(lambda: guild.create_voice_channel(ch_name, category=cat, overwrites=ow),
                            label=f"restore {ch_name}")
         else:
             new_ch = await bulk.run(lambda: guild.create_text_channel(ch_name, category=cat, overwrites=ow),
                                     label=f"restore {ch_name}")
+            if ch_name == CH_SECURITY:
+                await _post_security_panel(new_ch)
             # Re-post settings panel if it's the settings channel
-            if ch_name == "⚙️︱settings":
+            if ch_name == CH_SETTINGS:
                 from config import config_manager
                 cfg = config_manager.get_cached(guild.id) or {}
                 if cfg:
@@ -1242,7 +1266,7 @@ async def _restore_room_category(guild: discord.Guild, room_index: int) -> None:
     cfg = await _saved_config(guild)
     fmt = cfg.get("format", "ap")
     roles = {r.name: r for r in guild.roles}
-    room_name = f"ROOM {room_index:02d}"
+    room_name = room_category(room_index)
 
     existing = discord.utils.get(guild.categories, name=room_name)
     if existing is None:
@@ -1279,25 +1303,19 @@ async def _restore_room_channel(
     if existing:
         return
 
-    if channel_name == "all-in":
-        overwrites = _room_text_ow(
-            guild, roles, hide_from=("DEBATER", "VISITOR"), allow_send=False
-        )
-    elif is_voice:
-        if channel_name == "DEBATE ROOM":
+    if is_voice:
+        if channel_name == VC_DEBATE:
             overwrites = _room_voice_ow(guild, roles, no_speak=("VISITOR",))
-        elif channel_name == "ADJUDICATION":
-            overwrites = _room_voice_ow(
-                guild, roles, hide_from=("DEBATER", "VISITOR")
-            )
+        elif channel_name == VC_ADJ:
+            overwrites = _room_voice_ow(guild, roles, hide_from=("DEBATER", "VISITOR"))
         else:
             overwrites = _room_voice_ow(guild, roles, hide_from=("VISITOR",))
     else:
-        overwrites = _room_text_ow(
-            guild, roles, hide_from=("VISITOR",), allow_send=True
-        )
+        overwrites = _room_text_ow(guild, roles, hide_from=("VISITOR",), allow_send=True)
+    overwrites = with_thread_lock(guild, overwrites)
 
     try:
+        await _pace(guild)
         if is_voice:
             user_limit = 3 if fmt.lower() == "ap" else 2
             await bulk.run(
@@ -1310,12 +1328,10 @@ async def _restore_room_channel(
                 label=f"restore {channel_name}",
             )
         else:
-            new_channel = await bulk.run(
+            await bulk.run(
                 lambda: guild.create_text_channel(channel_name, category=category, overwrites=overwrites),
                 label=f"restore {channel_name}",
             )
-            if channel_name == "all-in":
-                await _post_all_in_panel(new_channel)
         log.info("Recreated channel #%s in %s", channel_name, category.name)
     except Exception as e:
         log.error("Failed to recreate room channel %s: %s", channel_name, describe(e))
@@ -1350,12 +1366,7 @@ async def normalize_kamla_order(guild: discord.Guild) -> None:
 
 
 async def _normalize_once(guild: discord.Guild) -> None:
-    desired_category_names = [
-        "⚜️︱ORGCOM",
-        "🏟️︱GRAND AUDITORIUM",
-        "🎮︱PLAY",
-        "ℹ️︱INFORMATION",
-    ]
+    desired_category_names = [CAT_ORGCOM, CAT_GA, CAT_PLAY, CAT_INFO, CAT_SECURITY]
     rooms = sorted(
         (
             (room_index, category)
@@ -1403,20 +1414,22 @@ async def _normalize_once(guild: discord.Guild) -> None:
 
 
 def _category_overwrites(guild: discord.Guild, roles: dict, cat_name: str) -> dict:
-    if cat_name == "⚜️︱ORGCOM":
+    if cat_name == CAT_ORGCOM:
         return _build_orgcom_overwrites(guild, roles)
-    elif cat_name == "🏟️︱GRAND AUDITORIUM":
+    elif cat_name == CAT_GA:
         return _build_all_role_overwrites(guild, roles)
-    elif cat_name == "🎮︱PLAY":
+    elif cat_name == CAT_PLAY:
         return _build_play_overwrites(guild, roles)
-    elif cat_name == "ℹ️︱INFORMATION":
+    elif cat_name == CAT_INFO:
         return _build_all_role_overwrites(guild, roles, send=False)
+    elif cat_name == CAT_SECURITY:
+        return _build_public_overwrites(guild)
     return {}
 
 
-GRAND_AUDITORIUM = "🏟️︱GRAND AUDITORIUM"
+GRAND_AUDITORIUM = CAT_GA
 # The channels KAMLA's Tabbycat commands post into. Nobody may delete or rename them.
-TAB_CHANNELS = ("🎓︱matchup", "🎓︱motion", "🎓︱ballot", "🎓︱break")
+TAB_CHANNELS = (CH_MATCHUP, CH_MOTION, CH_BALLOT, CH_BREAK)
 
 
 async def protect_tab_channels(guild: discord.Guild) -> int:
@@ -1448,20 +1461,20 @@ async def protect_tab_channels(guild: discord.Guild) -> int:
 
 
 def _channel_overwrites(guild: discord.Guild, roles: dict, cat_name: str, ch_name: str) -> dict:
-    if cat_name == "⚜️︱ORGCOM":
-        return _build_orgcom_overwrites(guild, roles)
-    elif cat_name == "🏟️︱GRAND AUDITORIUM":
-        announce_channels = ["🎓︱motion", "🎓︱announcement", "🎓︱break",
-                             "🎓︱matchup", "🎓︱ballot", "📊︱poll", "📊︱yes-no-voting"]
-        if ch_name in announce_channels:
+    if cat_name == CAT_ORGCOM:
+        return _build_settings_overwrites(guild, roles) if ch_name == CH_SETTINGS else _build_orgcom_overwrites(guild, roles)
+    elif cat_name == CAT_GA:
+        if ch_name in GA_ANNOUNCE_CHANNELS:
             return _build_announce_overwrites(guild, roles)
         return _build_all_role_overwrites(guild, roles, send=True)
-    elif cat_name == "🎮︱PLAY":
-        if ch_name == "🪙︱toss-coin":
+    elif cat_name == CAT_PLAY:
+        if ch_name == CH_TOSS:
             return _build_toss_overwrites(guild, roles)
         return _build_play_overwrites(guild, roles)
-    elif cat_name == "ℹ️︱INFORMATION":
+    elif cat_name == CAT_INFO:
         return _build_announce_overwrites(guild, roles)
+    elif cat_name == CAT_SECURITY:
+        return _build_public_overwrites(guild)
     return {}
 
 
@@ -1471,8 +1484,8 @@ async def _repost_channel_content(
     cat: discord.CategoryChannel,
 ) -> None:
     """Re-post embedded bot messages in channels that need them after restoration."""
-    if cat_name == "⚜️︱ORGCOM":
-        settings_ch = discord.utils.get(cat.text_channels, name="⚙️︱settings")
+    if cat_name == CAT_ORGCOM:
+        settings_ch = discord.utils.get(cat.text_channels, name=CH_SETTINGS)
         if settings_ch:
             from config import config_manager
             cfg = config_manager.get_cached(guild.id) or {}
@@ -1484,3 +1497,49 @@ async def _repost_channel_content(
                         await _post_settings_panel(settings_ch, cfg)
                 except Exception as e:  # noqa: BLE001 - settings panel is cosmetic
                     log.debug("Could not post settings panel after restore: %s", describe(e))
+
+
+# ── Migration of servers built by an older KAMLA ──────────────────────────────────────────────────────────────
+
+async def migrate_legacy_names(guild: discord.Guild) -> list[str]:
+    """Rename KAMLA's own old channels to the `{emoji}︱{name}` names and remove the retired dedicated `all-in`
+    channels (All-In is now `.allin` in the timer channel). Renames only: a channel is matched by its EXACT old name
+    and, for room channels, its parent ROOM category, so nothing a person created themselves is ever touched.
+    Returns what was done. Idempotent: a second run finds nothing to do."""
+    done: list[str] = []
+    if guild.id in _building_guilds:
+        return done
+
+    async def rename(channel, new):
+        if any(c.name == new and c.id != channel.id and getattr(c, "category_id", None) == getattr(channel, "category_id", None)
+               for c in guild.channels):
+            return                                              # the new name is taken: never create a duplicate
+        old = channel.name
+        if await bulk.best_effort(lambda: channel.edit(name=new, reason="KAMLA naming convention"), label="rename"):
+            done.append(f"{old} -> {new}")
+
+    category_ids = {c.id for c in guild.categories}
+    for channel in list(guild.channels):
+        if channel.id in category_ids:
+            number = _room_number(channel.name)
+            if number is not None and channel.name == f"ROOM {number:02d}":
+                await rename(channel, room_category(number))
+            continue
+        category = getattr(channel, "category", None)
+        in_room = category is not None and _room_number(category.name) is not None
+        if in_room:
+            if channel.name == "all-in" and channel in guild.text_channels:
+                if await bulk.best_effort(lambda c=channel: c.delete(reason="KAMLA: All-In is now `.allin`"),
+                                          label="remove all-in"):
+                    done.append(f"removed #{channel.name}")
+                continue
+            new = naming.LEGACY_ROOM_CHILDREN.get(channel.name)
+        else:
+            new = naming.LEGACY_RENAMES.get(channel.name)
+            if new is not None and channel.name in ("ORG", "Control Room", "schedule", "important-forms",
+                                                    "debater-briefing", "judge-briefing", "equity-briefing"):
+                if category is None or category.name not in (CAT_ORGCOM, CAT_INFO):
+                    new = None                                  # only inside KAMLA's own categories
+        if new and new != channel.name:
+            await rename(channel, new)
+    return done

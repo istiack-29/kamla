@@ -95,7 +95,7 @@ def _guild_open_polls(guild_id: int) -> list[Poll]:
 
 def _parse_targets(guild: discord.Guild, raw: str | None) -> tuple[set[int], set[int], list[discord.Member]]:
     """Parse the `for` string (containing real mention tokens) into role ids,
-    user ids, and a flat, de-duplicated audience list for DM notifications."""
+    user ids, and a flat, de-duplicated audience list."""
     if not raw:
         return set(), set(), []
 
@@ -440,12 +440,18 @@ class PollsCog(commands.Cog):
         await interaction.followup.send("✅ Yes/No vote created below." if is_yesno else "✅ Poll created below.",
                                         ephemeral=True)
 
-        # DM fan-out (can be hundreds of members when a role is targeted): sequential and
-        # paced through the shared coordinator; closed DMs are expected and not retried.
-        for member in audience:
+        # KAMLA never sends DMs. A targeted poll is announced with ONE message in the poll's own channel that
+        # mentions only the targeted roles / people (nobody else can be pinged by it).
+        if role_ids or user_ids:
+            mentions = " ".join([f"<@&{r}>" for r in sorted(role_ids)] + [f"<@{u}>" for u in sorted(user_ids)])
             await notify.best_effort(
-                lambda m=member: m.send(f"📊 A poll has been opened for you in {channel.mention}. Please participate."),
-                label="poll-dm",
+                lambda: channel.send(
+                    f"📊 {mentions} a poll has been opened for you. Please participate.",
+                    allowed_mentions=discord.AllowedMentions(
+                        everyone=False,
+                        roles=[discord.Object(id=r) for r in role_ids],
+                        users=[discord.Object(id=u) for u in user_ids])),
+                label="poll-announce",
             )
 
     @app_commands.command(name="close", description="Close an active poll or yes/no vote.")

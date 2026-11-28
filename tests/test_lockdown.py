@@ -115,44 +115,68 @@ async def test_second_lock_is_a_noop_and_quick_toggle_supersedes():
     assert a.slowmode_delay == 5
 
 
-class Org:
-    def __init__(self, uid, roles=("ORG",)):
-        self.id, self.bot = uid, False
-        self.roles = [types.SimpleNamespace(name=r) for r in roles]
-        self.dms = []
+class SettingsChannel:
+    """The 🛠️︱settings channel: lock notices go here (as channel messages), never to anybody's DMs."""
+    def __init__(self):
+        from naming import CH_SETTINGS
+        self.name = CH_SETTINGS
+        self.posted = []
 
     async def send(self, embed=None, **kw):
-        self.dms.append(embed)
+        self.posted.append(embed)
 
 
-async def test_blocked_channels_notify_every_org_member_once_per_burst():
-    o1, o2, deb = Org(1), Org(2), Org(3, roles=("DEBATER",))
-    g = guild_with(members=[o1, o2, deb])
+class Person:
+    """A member whose .send would be a DM: it must never be called."""
+    def __init__(self, uid):
+        self.id, self.bot, self.dms = uid, False, []
+
+    async def send(self, *a, **kw):
+        self.dms.append((a, kw))
+
+
+def notice_guild(*people):
+    ch = SettingsChannel()
+    g = types.SimpleNamespace(id=4242, name="G", text_channels=[ch], members=list(people))
+    return g, ch
+
+
+async def test_blocked_channels_are_reported_once_per_burst_in_the_settings_channel():
+    org, deb = Person(1), Person(3)
+    g, settings = notice_guild(org, deb)
     creator = types.SimpleNamespace(mention="<@7>", name="eve")
     for name in ("spam-1", "spam-2", "spam-3"):
         lockdown.report_blocked_channel(g, creator, name)
     await asyncio.sleep(0.07)
-    assert len(o1.dms) == 1 and len(o2.dms) == 1 and not deb.dms            # one DM each, debaters not told
-    text = o1.dms[0].description
+    assert len(settings.posted) == 1                                          # one message for the whole burst
+    text = settings.posted[0].description
     assert "<@7>" in text and all(f"#spam-{i}" in text for i in (1, 2, 3))
+    assert org.dms == [] and deb.dms == []                                    # nobody is ever DMed
 
 
-async def test_unknown_creator_and_owner_fallback():
-    owner = Org(99, roles=("DEBATER",))
-    g = guild_with(members=[owner])                                           # no ORG members at all
+async def test_unknown_creator_is_still_reported_in_the_channel():
+    g, settings = notice_guild()
     lockdown.report_blocked_channel(g, None, "x")
     await asyncio.sleep(0.07)
-    assert len(owner.dms) == 1 and "audit log was unavailable" in owner.dms[0].description
+    assert len(settings.posted) == 1 and "audit log was unavailable" in settings.posted[0].description
 
 
-async def test_closed_dms_do_not_crash():
-    class Closed(Org):
+async def test_no_settings_channel_means_no_notice_and_no_crash():
+    g = types.SimpleNamespace(id=1, name="G", text_channels=[], members=[Person(1)])
+    lockdown.report_blocked_channel(g, None, "x")
+    await asyncio.sleep(0.07)                                                 # must simply not raise or DM
+    assert g.members[0].dms == []
+
+
+async def test_a_failing_notice_does_not_crash():
+    class Closed(SettingsChannel):
         async def send(self, **kw):
             from tests.fakes import http_error
             raise http_error(403)
-    g = guild_with(members=[Closed(1)])
+    ch = Closed()
+    g = types.SimpleNamespace(id=2, name="G", text_channels=[ch], members=[])
     lockdown.report_blocked_channel(g, None, "x")
-    await asyncio.sleep(0.07)                                                # must simply not raise
+    await asyncio.sleep(0.07)
 
 
 # ── integration with main.on_guild_channel_create ─────────────────────────────

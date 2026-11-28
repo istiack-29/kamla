@@ -124,3 +124,85 @@ async def test_creator_gets_the_chosen_organiser_role_after_setup():
     await setup_cog._assign_creator_role(guild, creator, "ORG")                 # replaces: one role per person
     assert [r.name for r in creator.roles] == ["ORG"]
     await setup_cog._assign_creator_role(types.SimpleNamespace(id=6, roles=[]), Member(), "ORG")   # no role: no crash
+
+
+# ── the redesigned panel ───────────────────────────────────────────────────────
+
+def test_panel_is_a_select_menu_with_a_description_per_role():
+    view = roles_cog.RoleSelectView()
+    select = view.children[0]
+    assert isinstance(select, discord.ui.Select) and select.custom_id == roles_cog.SELECT_ID
+    assert [o.value for o in select.options] == ["INVITED ADJUDICATOR", "INDEPENDENT ADJUDICATOR", "DEBATER", "VISITOR"]
+    assert all(o.description and len(o.description) <= 100 for o in select.options)
+    assert view.is_persistent()                                         # survives a restart
+
+
+def test_old_button_panels_keep_working_with_the_same_ids():
+    ids = {b.custom_id for b in roles_cog.LegacyRoleView().children}
+    assert ids == {"kamla:role:invited_adj", "kamla:role:independent_adj", "kamla:role:debater", "kamla:role:visitor"}
+    assert roles_cog.LegacyRoleView().is_persistent()
+
+
+async def test_select_callback_assigns_the_chosen_role(monkeypatch):
+    seen = []
+
+    async def fake(interaction, name):
+        seen.append(name)
+    monkeypatch.setattr(roles_cog, "_assign_role", fake)
+    sel = roles_cog.RoleSelect()
+    monkeypatch.setattr(type(sel), "values", property(lambda self: ["DEBATER"]))
+    await sel.callback(mock.MagicMock())
+    assert seen == ["DEBATER"]
+
+
+async def test_kamla_needs_manage_roles_and_a_higher_role_and_says_so():
+    roles = guild_roles()
+    for r in roles:
+        r.position = 5
+    me = types.SimpleNamespace(guild_permissions=types.SimpleNamespace(manage_roles=False, administrator=False),
+                               top_role=types.SimpleNamespace(position=9))
+    i = interaction(Member(), roles)
+    i.guild = types.SimpleNamespace(id=1, roles=roles, me=me)
+    await roles_cog._assign_role(i, "DEBATER")
+    assert "Manage Roles" in said(i)
+    me.guild_permissions.manage_roles = True
+    me.top_role.position = 2                                            # KAMLA's role is BELOW the tournament roles
+    j = interaction(Member(), roles)
+    j.guild = types.SimpleNamespace(id=1, roles=roles, me=me)
+    await roles_cog._assign_role(j, "DEBATER")
+    assert "drag **KAMLA's role to the top**" in said(j)
+
+
+async def test_an_expired_interaction_is_handled_quietly():
+    roles = guild_roles()
+    m = Member()
+    i = interaction(m, roles)
+    i.response.defer = mock.AsyncMock(side_effect=discord.NotFound(mock.MagicMock(status=404), "Unknown interaction"))
+    await roles_cog._assign_role(i, "DEBATER")                          # must not raise
+    assert not m.roles
+
+
+async def test_double_click_does_not_assign_twice():
+    import asyncio
+    roles = guild_roles()
+    m = Member()
+    i = interaction(m, roles)
+    gate = asyncio.Event()
+
+    async def slow_defer(**kw):
+        await gate.wait()
+    i.response.defer = slow_defer
+    first = asyncio.create_task(roles_cog._assign_role(i, "DEBATER"))
+    await asyncio.sleep(0.01)
+    j = interaction(m, roles)
+    await roles_cog._assign_role(j, "DEBATER")
+    assert "already being processed" in said(j)
+    gate.set()
+    await first
+    assert [r.name for r in m.roles] == ["DEBATER"]
+
+
+def test_the_panel_never_creates_a_kamla_role():
+    import pathlib
+    src = pathlib.Path(roles_cog.__file__).read_text(encoding="utf-8")
+    assert "create_role" not in src

@@ -22,7 +22,7 @@ class Msg:
         self.log = log
         self.embeds = []
 
-    async def edit(self, embed=None, view=None):
+    async def edit(self, content=None, embed=None, view=None):
         self.embeds.append(embed)
 
 
@@ -33,11 +33,12 @@ class Chan:
         self.sent = []            # plain-content messages, in order
         self.msgs = []
 
-    async def send(self, content=None, embed=None, view=None):
-        if content is not None:
+    async def send(self, content=None, embed=None, view=None, **kw):
+        if embed is None and content is not None:       # announcements; the timer message itself carries an embed
             self.sent.append(content)
         m = Msg(self.sent)
         m.first_embed, m.view = embed, view
+        m.first_content = content
         self.msgs.append(m)
         return m
 
@@ -75,18 +76,18 @@ async def test_announcements_in_order_and_exact_wording():
     ]
 
 
-async def test_status_embed_has_no_clock_and_counts_minutes():
-    ch, task = start(0.3)
+async def test_status_embed_is_one_large_line_and_a_footer():
+    ch, task = start(0.3)                                  # a "3 minute" timer
     await ready(ch)
-    assert "0 min running" in ch.msgs[0].first_embed.description
+    first = ch.msgs[0].first_embed
+    assert first.description == "# 3 Min Running"
+    assert not first.title and not first.fields           # no title, no fields
+    assert first.footer.text.endswith("by Cmd") and first.footer.text.startswith("Started ")
     await asyncio.wait_for(task, 5)
     await asyncio.sleep(0.15)
-    texts = [e.description for e in ch.msgs[0].embeds]
-    assert any("1 min running" in t for t in texts)
-    assert texts[-1] == "✅ **Time's up**"
-    for e in [ch.msgs[0].first_embed, *ch.msgs[0].embeds]:
+    assert ch.msgs[0].embeds[-1].description == "# 3 Min Finished"
+    for e in [first, *ch.msgs[0].embeds]:
         assert not re.search(r"\d+:\d{2}", e.description or "")      # never a m:ss countdown
-        assert not (e.title or "").startswith("⏱  ")
 
 
 async def test_short_timers_do_not_spam():
@@ -196,7 +197,7 @@ def _timer_message(content):
     return msg, chan
 
 
-@pytest.mark.parametrize("text", ["99999d", "25h", "86401s", "999999999999d"])
+@pytest.mark.parametrize("text", ["6h", "5h 1s", "18001s", "99999h", ".5h 1 min"])
 async def test_too_long_a_timer_is_refused_and_nothing_starts(text):
     cog = tc.TimerCog(bot=None)
     msg, chan = _timer_message(text)
@@ -205,7 +206,7 @@ async def test_too_long_a_timer_is_refused_and_nothing_starts(text):
     assert 77 not in tc._active_timers
 
 
-async def test_one_day_is_the_longest_allowed(monkeypatch):
+async def test_five_hours_is_the_longest_allowed(monkeypatch):
     from tests.fakes import FakeConfig
     monkeypatch.setattr(tc, "config_manager", FakeConfig())
     started = []
@@ -215,10 +216,11 @@ async def test_one_day_is_the_longest_allowed(monkeypatch):
         await asyncio.sleep(10)
     monkeypatch.setattr(tc, "_run_countdown", fake_run)
     cog = tc.TimerCog(bot=None)
-    msg, chan = _timer_message("1d")
+    msg, chan = _timer_message("5h")
     await cog.on_message(msg)
     await asyncio.sleep(0.01)
-    assert started == [86400] and 77 in tc._active_timers
+    assert started == [18000] and 77 in tc._active_timers
+    assert not msg.delete.await_count                       # the user's message is never deleted
     tc._active_timers[77].cancel()
 
 
@@ -241,41 +243,41 @@ def field(embed, name):
     return next((f.value for f in embed.fields if f.name == name), None)
 
 
-def test_running_timer_shows_a_live_discord_countdown_and_a_progress_bar():
+@pytest.fixture
+def real_minute(monkeypatch):
+    monkeypatch.setattr(tc, "MINUTE", 60.0)
+
+
+def test_running_timer_shows_a_live_discord_countdown_next_to_the_minimal_embed(real_minute):
     st, t = fake_state(600)
     e = tc.render(st)
-    assert field(e, "Ends") == "<t:1000600:T> · <t:1000600:R>"          # Discord renders the countdown itself
-    assert "▱▱▱▱▱▱▱▱▱▱" in e.description and "▰" not in e.description
-    t["clock"] = 300.0                                                  # halfway
-    assert "▰▰▰▰▰▱▱▱▱▱" in tc.render(st).description
-    t["clock"] = 600.0
-    assert "▰▰▰▰▰▰▰▰▰▰" in tc.render(st).description
+    assert e.description == "# 10 Min Running" and not e.fields and not e.title
+    assert tc.render_content(st) == "⏳ Ends <t:1000600:T> · <t:1000600:R>"      # Discord renders the countdown itself
 
 
-def test_the_text_never_contains_a_ticking_clock():
+def test_the_text_never_contains_a_ticking_clock(real_minute):
     st, t = fake_state(125)
     t["clock"] = 61.0
     e = tc.render(st)
-    assert not re.search(r"\d+:\d{2}", e.description)                   # the only countdown is the <t:..:R> field
+    assert not re.search(r"\d+:\d{2}", e.description)
 
 
-def test_paused_shows_static_time_left_and_resume_re_anchors_the_end():
+def test_paused_shows_static_time_left_and_resume_re_anchors_the_end(real_minute):
     st, t = fake_state(600)
     t["clock"] = 100.0
     st.pause()
-    e = tc.render(st)
-    assert field(e, "Ends") is None and "paused" in field(e, "Time left")
-    t["clock"], t["wall"] = 400.0, 1_000_400.0                          # five minutes of POI go by
+    assert tc.render(st).description == "# 10 Min Paused"
+    assert tc.render_content(st).startswith("⏸") and "paused" in tc.render_content(st)
+    t["clock"], t["wall"] = 400.0, 1_000_400.0                          # five minutes of pause go by
     st.resume()
     assert st.end_epoch == 1_000_400 + 500                              # 500 s were left when it was resumed
-    assert field(tc.render(st), "Ends") == "<t:1000900:T> · <t:1000900:R>"
+    assert "<t:1000900:R>" in tc.render_content(st)
 
 
-def test_finished_timer_has_no_countdown_field():
+def test_finished_timer_has_no_countdown(real_minute):
     st, _ = fake_state(60)
     st.phase = "ended"
-    e = tc.render(st)
-    assert e.description == "✅ **Time's up**" and field(e, "Ends") is None and field(e, "Time left") is None
+    assert tc.render(st).description == "# 1 Min Finished" and tc.render_content(st) is None
 
 
 async def test_the_countdown_costs_no_more_edits_than_before():

@@ -68,7 +68,7 @@ def interaction(user, guild=None, channel=None):
     guild = guild or FakeGuild()
     matchup, motion, ballot, brk = (Chan("🎓︱matchup"), Chan("🎓︱motion"), Chan("🎓︱ballot"), Chan("🎓︱break"))
     guild.text_channels = [matchup, motion, ballot, brk]
-    guild.channels_by = {"draw": matchup, "drawadj": matchup, "motion": motion, "result": ballot, "break": brk}
+    guild.channels_by = {"draw": matchup, "motion": motion, "result": ballot, "break": brk}
     i = mock.MagicMock()
     i.user, i.guild = user, guild
     i.channel = channel or Chan("general")
@@ -148,7 +148,7 @@ async def test_each_kind_goes_only_to_its_own_channel(env):
         i = interaction(member("CAP"), guild)
         assert await env.cog._post(i, kind, [("a.png", b"x")]) is True
         for k, chan in guild.channels_by.items():
-            same_channel = cog_mod.CHANNELS[k] == cog_mod.CHANNELS[kind]   # draw and drawadj share one channel
+            same_channel = cog_mod.CHANNELS[k] == cog_mod.CHANNELS[kind]
             assert len(chan.sent) == (1 if same_channel else 0), (kind, k)
         assert i.channel.sent == []
 
@@ -645,32 +645,75 @@ async def test_tabbycat_outage_uses_cached_data_or_reports(env):
     assert "❌" in last_text(i2) or "Could not" in last_text(i2)
 
 
-# ── /drawadj ───────────────────────────────────────────────────────────────────
+# ── /draw (the only draw command): round + type ───────────────────────────────
 
-async def test_drawadj_posts_team_and_adjudicator_image_to_matchup_channel(env):
+@pytest.fixture
+def modes(monkeypatch):
+    """Record the mode /draw renders with."""
+    seen = []
+    real = cog_mod.tab_render.render_matchup
+
+    def spy(tournament, rnd, debates, mode="all"):
+        seen.append(mode)
+        return real(tournament, rnd, debates, mode)
+    monkeypatch.setattr(cog_mod.tab_render, "render_matchup", spy)
+    return seen
+
+
+def test_there_is_no_drawadj_command_any_more():
+    assert not hasattr(cog_mod.TabbycatCog, "drawadj")
+    assert "drawadj" not in cog_mod.CHANNELS
+    assert hasattr(cog_mod.TabbycatCog, "draw")
+
+
+@pytest.mark.parametrize("type_,mode", [(None, "all"), ("all", "all"), ("adj only", "adj"), ("teams only", "teams"),
+                                        ("ADJ ONLY", "adj")])
+async def test_draw_with_adjudicators_released_honours_the_type(env, modes, type_, mode):
     guild = FakeGuild()
     await connect(env, guild)
     i = interaction(member("CAP"), guild, channel=Chan("somewhere-else"))
-    await env.cog.drawadj.callback(env.cog, i, 1)                 # Round 1: adjudicators released
-    matchup = guild.channels_by["drawadj"]
-    assert len(matchup.sent) == 1 and matchup.sent[0]["files"][0].filename.startswith("drawadj-")
+    await env.cog.draw.callback(env.cog, i, 1, type_)                 # Round 1: adjudicators released
+    matchup = guild.channels_by["draw"]
+    assert len(matchup.sent) == 1 and matchup.sent[0]["files"][0].filename.startswith("draw-")
+    assert modes == [mode]
 
 
-async def test_drawadj_unavailable_for_rounds_without_released_adjudicators(env):
+@pytest.mark.parametrize("type_", [None, "all", "adj only", "teams only"])
+async def test_a_round_without_an_allocation_is_always_teams_only(env, modes, type_):
     guild = FakeGuild()
     await connect(env, guild)
-    for seq in (2, 3):                                             # draft round, teams-only round
-        i = interaction(member("TABBY"), guild)
-        await env.cog.drawadj.callback(env.cog, i, seq)
-        assert "/refresh" in last_text(i)
-    assert not guild.channels_by["drawadj"].sent
+    i = interaction(member("TABBY"), guild)
+    await env.cog.draw.callback(env.cog, i, 3, type_)                 # Round 3: draw released, adjudicators not yet
+    assert modes == ["teams"] and len(guild.channels_by["draw"].sent) == 1
 
 
-async def test_drawadj_autocomplete_lists_only_adjudicator_released_rounds(env):
+async def test_an_unknown_type_is_refused_before_anything_is_posted(env, modes):
     guild = FakeGuild()
     await connect(env, guild)
-    names = [c.name for c in await choices(env, cog_mod.TabbycatCog._drawadj_ac, guild)]
-    assert names[0] == "Round 1" and "Round 3" not in names        # R3 has a draw but no adjudicators yet
+    i = interaction(member("CAP"), guild)
+    await env.cog.draw.callback(env.cog, i, 1, "everything")
+    assert "must be one of" in i.response.send_message.await_args.args[0]
+    assert not guild.channels_by["draw"].sent and modes == []
+
+
+async def test_draw_type_options_depend_on_the_round(env):
+    guild = FakeGuild()
+    await connect(env, guild)
+
+    async def options(round_value):
+        kw = {} if round_value is None else {"round": round_value}
+        return [c.value for c in await choices(env, cog_mod.TabbycatCog._draw_type_ac, guild, **kw)]
+    assert await options(1) == ["all", "adj only", "teams only"]       # allocation exists: all three
+    assert await options(3) == ["teams only"]                          # none yet: adjudicator options are not offered
+    assert await options(None) == ["teams only"]                       # round not chosen yet
+    assert await options(cog_mod.NONE_VALUE) == ["teams only"]
+
+
+async def test_draw_round_autocomplete_lists_rounds_with_a_released_draw(env):
+    guild = FakeGuild()
+    await connect(env, guild)
+    names = [c.name for c in await choices(env, cog_mod.TabbycatCog._draw_ac, guild)]
+    assert "Round 1" in names and "Round 3" in names
 
 
 # ── /result on a silent/closed round: double confirmation ──────────────────────

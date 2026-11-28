@@ -14,6 +14,7 @@ import keep_alive as keep_alive_mod
 from keep_alive import keep_alive
 from config import config_manager
 import ratelimit
+import naming
 from ratelimit import Kind, classify, describe, retry_after_of, spawn
 
 load_dotenv()
@@ -26,17 +27,17 @@ COGS = [
     "setup_cog",
     "settings_cog",
     "roles_cog",
-    "assign_cog",
-    "dm_notify_cog",
     "timer_cog",
-    "poi_cog",
     "allin_cog",
     "games_cog",
     "toss_cog",
     "polls_cog",
-    "welcome_cog",
     "nickname_cog",
     "invite_roles_cog",
+    "links_cog",
+    "members_cog",
+    "guards",
+    "security_cog",
     "tabbycat_cog",
 ]
 
@@ -77,15 +78,16 @@ class KamlaBot(commands.Bot):
             except Exception as e:
                 log.error("Failed to load cog %s: %s", cog, e)
 
-        from roles_cog    import RoleSelectView
+        from roles_cog    import RoleSelectView, LegacyRoleView
         from allin_cog    import AllInView
         from settings_cog import SettingsView
-        from setup_cog    import OnJoinView
+        from installer    import CreateNowView
 
         self.add_view(RoleSelectView())
-        self.add_view(AllInView())
+        self.add_view(LegacyRoleView())          # Get Role panels posted before the select-menu redesign
+        self.add_view(AllInView())               # `Push Back All` button of older panels (same function as `.allin`)
         self.add_view(SettingsView())
-        self.add_view(OnJoinView(installer_id=0))
+        self.add_view(CreateNowView())           # installer-only; authorised against the stored installer id
         # NOTE: games_cog / polls_cog views are intentionally NOT registered here.
         # Their state (active matches, active polls) is memory-only by design, so
         # a restart loses it along with the match/poll; buttons left over from a
@@ -140,6 +142,23 @@ class KamlaBot(commands.Bot):
         keep_alive_mod.set_status("connected")
         log.info("Ready — logged in as %s (ID: %s) in %d guild(s).", self.user, self.user.id, len(self.guilds))
         spawn(self._protect_tab_channels_everywhere(), name="protect-tab-channels")
+        spawn(self._hierarchy_watch(), name="hierarchy-watch")
+
+    async def _hierarchy_watch(self) -> None:
+        """While KAMLA's role is below roles it manages, remind the installer in server-status — at most once per
+        5 minutes per server (installer.REMINDER_INTERVAL), never by DM."""
+        import installer as installer_mod
+        while not self.is_closed():
+            for guild in list(self.guilds):
+                try:
+                    cfg = config_manager.get_cached(guild.id) or {}
+                    if cfg.get("format") or cfg.get("installer_id"):
+                        await installer_mod.remind_hierarchy(guild)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    log.debug("hierarchy check failed in guild %s: %s", guild.id, describe(e))
+            await asyncio.sleep(60)
 
     async def _protect_tab_channels_everywhere(self) -> None:
         """Startup sweep: matchup/motion/ballot/break deleted while KAMLA was offline come back, and older
@@ -170,11 +189,9 @@ class KamlaBot(commands.Bot):
                  ratelimit.watcher.snapshot())
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
+        """Immediately create ⚙️︱kamla-config and 📊︱server-status, then post "I'M HERE" with the compatibility
+        check. KAMLA never sends DMs: everything goes to server channels."""
         log.info("Joined guild: %s (%s)", guild.name, guild.id)
-        try:
-            await config_manager.ensure_config_channel(guild)
-        except Exception as e:
-            log.warning("Could not create config channel in guild %s: %s", guild.id, describe(e))
 
         installer: discord.Member | None = None
         try:
@@ -187,36 +204,25 @@ class KamlaBot(commands.Bot):
                     break
         except discord.Forbidden:
             pass
+        except discord.HTTPException as e:
+            log.debug("Could not read the audit log on join: %s", describe(e))
+
+        import installer as installer_mod
+        try:
+            await installer_mod.setup_on_join(guild, installer)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Could not create the installation channels in guild %s: %s", guild.id, describe(e))
+            # Last resort: one short public notice (never a DM) so the server knows what KAMLA needs.
+            channel = guild.system_channel
+            if channel is not None and channel.permissions_for(guild.me).send_messages:
+                try:
+                    await channel.send("⚠️ KAMLA needs the **Administrator** permission (or Manage Channels + "
+                                       "Manage Roles) to set itself up. Re-invite KAMLA with those permissions.")
+                except discord.HTTPException:
+                    pass
 
         from webhook import send_join_log
         await send_join_log(guild, installer)
-
-        channel = guild.system_channel
-        if channel is None:
-            for ch in guild.text_channels:
-                if ch.permissions_for(guild.me).send_messages:
-                    channel = ch
-                    break
-
-        if channel is None:
-            return
-
-        from setup_cog import OnJoinView
-        embed = discord.Embed(
-            title="🎉 KAMLA has arrived!",
-            description=(
-                f"Hello {installer.mention if installer else 'there'}! "
-                "I'm **KAMLA** — your automated tournament server manager.\n\n"
-                "Click **CREATE NOW** to build your tournament server instantly.\n"
-                "Only the person who added me can use this button."
-            ),
-            color=discord.Color.blurple(),
-        )
-        embed.set_footer(text="KAMLA • Tournament Automation Bot")
-        await channel.send(
-            embed=embed,
-            view=OnJoinView(installer_id=installer.id if installer else 0),
-        )
 
     async def on_guild_remove(self, guild: discord.Guild) -> None:
         from webhook import mark_guild_deleted
@@ -240,10 +246,10 @@ class KamlaBot(commands.Bot):
     async def on_guild_channel_create(self, channel: discord.abc.GuildChannel) -> None:
         guild = channel.guild
 
-        if "kamla-config" in channel.name:
+        if "kamla-config" in channel.name or channel.name == naming.CH_STATUS:
             return
 
-        # Never interfere while KAMLA is building / wiping
+        # Never interfere while KAMLA is building
         from server_builder import _building_guilds, _restoring_guilds
         if guild.id in _building_guilds or guild.id in _restoring_guilds:
             return
@@ -288,11 +294,11 @@ class KamlaBot(commands.Bot):
         except Exception as e:
             log.warning("Could not delete a channel created while the server is locked: %s", describe(e))
 
-        # Tell every ORG member (batched into one DM when several attempts happen together)
+        # Tell the organisers in the settings channel (batched; never a DM)
         lockdown.report_blocked_channel(guild, creator, channel_name)
 
         try:
-            settings_ch = discord.utils.get(guild.text_channels, name="⚙️︱settings")
+            settings_ch = discord.utils.get(guild.text_channels, name=naming.CH_SETTINGS)
             if settings_ch and settings_ch.permissions_for(guild.me).send_messages:
                 await settings_ch.send(
                     f"🔒 A new channel **#{channel_name}** was automatically deleted "
@@ -320,6 +326,18 @@ class KamlaBot(commands.Bot):
                 )
             except Exception as e:
                 log.error("Could not recreate config channel in guild %s: %s", guild.id, describe(e))
+            return
+
+        # ── Status channel guard: the installer's channel comes back, same overwrites ──────────────
+        if channel.name == naming.CH_STATUS and not isinstance(channel, discord.CategoryChannel):
+            import installer as installer_mod
+            await asyncio.sleep(1)
+            try:
+                cfg = config_manager.get_cached(guild.id) or {}
+                who = guild.get_member(installer_mod.installer_of(guild, cfg))
+                await installer_mod.ensure_status_channel(guild, who)
+            except Exception as e:  # noqa: BLE001
+                log.error("Could not recreate the status channel in guild %s: %s", guild.id, describe(e))
             return
 
         # ── Protected channel/category guard ────────────────────────────────

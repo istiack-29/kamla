@@ -7,6 +7,7 @@ from datetime import timedelta
 import discord
 
 from ratelimit import notify, describe
+from naming import CH_CONFIG
 
 log = logging.getLogger("kamla.config")
 
@@ -14,7 +15,7 @@ log = logging.getLogger("kamla.config")
 # every message (POI, timers) do not re-read the config channel history each time.
 _MISS_TTL = 60.0
 
-CHANNEL_NAME = "🔒︱kamla-config"
+CHANNEL_NAME = CH_CONFIG
 WARNING_MSG = (
     "⚠️ **DO NOT DELETE THIS CHANNEL.** KAMLA USES IT AS ITS INTERNAL STORAGE.\n"
     "Deleting this channel will cause KAMLA to recreate it and restore the last known configuration."
@@ -120,6 +121,44 @@ def find_config_channel(guild: discord.Guild):
     return hidden[0] if hidden else None
 
 
+# Nobody may start a thread anywhere KAMLA manages: these three are denied to @everyone on every channel (a deny on
+# @everyone also removes grants that come from a role's base permissions; Administrators bypass overwrites, which is
+# why a listener deletes stray threads as a fallback — see guards.py).
+THREAD_DENY = dict(create_public_threads=False, create_private_threads=False, send_messages_in_threads=False)
+
+
+def with_thread_lock(guild: discord.Guild, overwrites: dict) -> dict:
+    """A copy of `overwrites` whose @everyone entry also denies every thread permission."""
+    out = dict(overwrites or {})
+    base = out.get(guild.default_role)
+    ow = discord.PermissionOverwrite.from_pair(*base.pair()) if base is not None else discord.PermissionOverwrite()
+    ow.update(**THREAD_DENY)
+    out[guild.default_role] = ow
+    return out
+
+
+def thread_locked(channel) -> bool:
+    """True when @everyone is already denied all three thread permissions on this channel."""
+    try:
+        ow = channel.overwrites_for(channel.guild.default_role)
+    except Exception:  # noqa: BLE001
+        return False
+    return all(getattr(ow, name) is False for name in THREAD_DENY)
+
+
+def kamla_role(guild: discord.Guild) -> discord.Role | None:
+    """KAMLA's ONE role: the bot's own (integration / managed) role. KAMLA never creates a second role of that
+    name; this is where everything that needs 'the KAMLA role' gets it."""
+    role = getattr(guild, "self_role", None)
+    if role is not None:
+        return role
+    me = getattr(guild, "me", None)
+    for r in getattr(me, "roles", []) or []:
+        if getattr(r, "managed", False):
+            return r
+    return None
+
+
 class ConfigManager:
     _cache: dict[int, dict] = {}
     _channel_ids: dict[int, int] = {}
@@ -131,21 +170,24 @@ class ConfigManager:
             self._channel_ids[guild.id] = existing.id
             return existing
 
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        overwrites = with_thread_lock(guild, {
+            # hidden AND read-only: it stores secrets, and nobody — owner included — may write in it (guards.py
+            # deletes anything that is not KAMLA's own message as a fallback).
+            guild.default_role: discord.PermissionOverwrite(view_channel=False, send_messages=False),
             guild.me: discord.PermissionOverwrite(
                 view_channel=True,
                 send_messages=True,
                 read_message_history=True,
                 manage_messages=True,
                 manage_channels=True,
+                manage_threads=True,
             ),
-        }
+        })
         try:
             channel = await guild.create_text_channel(
                 CHANNEL_NAME,
                 overwrites=overwrites,
-                topic="KAMLA internal configuration storage. DO NOT DELETE.",
+                topic="KAMLA internal configuration storage (read-only). DO NOT DELETE.",
                 reason="KAMLA config storage channel",
             )
             await channel.send(WARNING_MSG)

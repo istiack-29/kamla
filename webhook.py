@@ -218,7 +218,7 @@ _DEV_INVITE_TTL = 1800.0
 
 
 def forget_dev_invite(guild_id: int) -> None:
-    """Call after a rebuild: the wipe deletes the invite and the role, so the next lookup must re-create them."""
+    """Forget the cached invite so the next lookup re-checks it."""
     _dev_invite_cache.pop(guild_id, None)
 
 
@@ -329,7 +329,7 @@ async def edit_join_log(guild: discord.Guild, config: dict) -> None:
     tour_name = config.get("tournament_name", "—")
     lock_txt  = "🔒 Locked" if locked else "🔓 Unlocked"
 
-    # The invite/role can disappear (a rebuild wipes channels and roles), so it is re-checked here.
+    # The invite can be revoked, so it is re-checked here.
     invite_url = await _dev_invite(guild)
 
     embed = {

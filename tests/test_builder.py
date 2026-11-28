@@ -1,6 +1,7 @@
 
 import pytest
 
+import naming
 import server_builder as sb
 from ratelimit import RequestCoordinator
 from tests.fakes import FakeGuild, FakeConfig, http_error
@@ -16,9 +17,12 @@ def fast(monkeypatch):
 
     async def noop(*a, **k):
         return None
-    for name in ("_post_meet_developer", "_post_welcome", "_post_get_role", "_post_how_to_use",
-                 "_post_settings_panel", "_post_all_in_panel"):
+    for name in ("_post_meet_developer", "_post_members_info", "_post_get_role", "_post_how_to_use",
+                 "_post_settings_panel", "_post_security_panel"):
         monkeypatch.setattr(sb, name, noop)
+    import links_cog
+    monkeypatch.setattr(links_cog, "refresh_links", noop)            # covered in test_links.py
+    monkeypatch.setattr(sb, "CHANNEL_INTERVAL", 0.0)                  # pacing is covered in test_install.py
     return fast_bulk
 
 
@@ -37,7 +41,7 @@ async def test_fresh_build_creates_expected_structure():
     g = FakeGuild()
     rep = await build(g, rooms=2)
     assert len(g.channels) == EXPECTED_BASE + 2 * sb.room_channel_count("ap")
-    assert {"ROOM 01", "ROOM 02"} <= set(names(g, "category"))
+    assert {naming.room_category(1), naming.room_category(2)} <= set(names(g, "category"))
     assert rep.ok and len([r for r in g.roles if r.name == "ORG"]) == 1
 
 
@@ -56,30 +60,30 @@ async def test_name_matching_is_exact_and_parent_aware():
     await g.create_text_channel("timer-old")                  # similar name must NOT be reused
     await build(g, rooms=1)
     assert "timer-old" in names(g, "text")
-    assert names(g, "text").count("timer") == 1
+    assert names(g, "text").count(naming.CH_TIMER) == 1
 
 
 # 5. partial failure then resume
 async def test_partial_build_resumes_without_duplicates():
     g = FakeGuild()
-    g.fail["poi"] = [http_error(400, code=50035)]             # permanent failure in ROOM 01
+    g.fail[naming.CH_TIMER] = [http_error(400, code=50035)]   # permanent failure in ROOM 01
     with pytest.raises(sb.BuildIncomplete) as ei:
         await build(g, rooms=2)
-    assert any("poi" in what for what, _, _ in ei.value.report.failed)
+    assert any("timer" in what for what, _, _ in ei.value.report.failed)
     created_first = len(g.create_calls)
     rep = await build(g, rooms=2)                             # fault gone
     new = g.create_calls[created_first:]
-    assert [n for _, n in new].count("poi") == 1          # only the failed one is retried (ROOM 02's was created)
+    assert [n for _, n in new].count(naming.CH_TIMER) == 1          # only the failed one is retried (ROOM 02's was created)
     assert rep.ok
     assert len(g.channels) == EXPECTED_BASE + 2 * sb.room_channel_count("ap")
-    assert names(g, "text").count("poi") == 2                 # one per room, no duplicates
+    assert names(g, "text").count(naming.CH_TIMER) == 2                 # one per room, no duplicates
     assert len(new) < 12                                      # only the missing pieces were created
 
 
 # 8. one transient failure does not restart the workflow
 async def test_transient_failure_retries_only_that_call():
     g = FakeGuild()
-    g.fail["⚙️︱settings"] = [http_error(503)]
+    g.fail[naming.CH_SETTINGS] = [http_error(503)]
     await build(g, rooms=1)
     total = EXPECTED_BASE + sb.room_channel_count("ap")
     assert len(g.channels) == total
@@ -89,7 +93,7 @@ async def test_transient_failure_retries_only_that_call():
 # 7. missing permissions: stop quickly instead of hammering
 async def test_permission_errors_abort_quickly():
     g = FakeGuild()
-    for n in sb.TOP_LEVEL_CHANNELS + ["⚜️︱ORGCOM", "🛅︱ASSIGN"]:
+    for n in sb.TOP_LEVEL_CHANNELS + [naming.CAT_ORGCOM]:
         g.fail[n] = [http_error(403)] * 5
     with pytest.raises(sb.BuildIncomplete) as ei:
         await build(g)
@@ -117,27 +121,21 @@ async def test_concurrent_jobs_rejected():
     assert g.id not in sb._building_guilds
 
 
-async def test_resume_marker_matches_params():
-    g = FakeGuild()
-    data = {"format": "ap", "rooms": 3, "tournament_name": "T", "timezone": "+06:00", "role_name": "ORG"}
-    assert not await sb.find_resumable(g, data)
-    await sb.mark_build_state(g, data, wiped=True)
-    assert await sb.find_resumable(g, data)
-    assert not await sb.find_resumable(g, {**data, "rooms": 4})
-    assert await sb.find_resumable(g, {**data, "role_name": "CAP"})   # creator role is not structural
-
-
 def test_capacity_limits():
-    assert sb.max_rooms_for_fresh_build("ap") == 46 and sb.max_rooms_for_fresh_build("bp") == 46
+    for fmt in ("ap", "bp"):
+        limit = sb.max_rooms_for_fresh_build(fmt)
+        assert limit > 20
+        used = sb.MANAGEMENT_CHANNELS + sb.base_channel_count() + limit * sb.room_channel_count(fmt)
+        assert used <= sb.DISCORD_MAX_CHANNELS and limit + len(sb.CATEGORY_CHANNEL_STRUCTURE) <= sb.DISCORD_MAX_CATEGORIES
     assert sb.capacity_problem_fresh_build("ap", 1000)
-    assert sb.capacity_problem_fresh_build("bp", 46) is None
+    assert sb.capacity_problem_fresh_build("bp", sb.max_rooms_for_fresh_build("bp")) is None
 
 
 async def test_switch_format_idempotent():
     g = FakeGuild()
     await build(g, rooms=2, fmt="ap")
     await sb.switch_format_rooms(g, "bp", 2)
-    assert names(g, "voice").count("OG PREP") == 2 and "GOVT PREP" not in names(g, "voice")
+    assert names(g, "voice").count(naming.prep_name("OG PREP")) == 2 and naming.prep_name("GOVT PREP") not in names(g, "voice")
     before = len(g.create_calls)
     await sb.switch_format_rooms(g, "bp", 2)
     assert len(g.create_calls) == before

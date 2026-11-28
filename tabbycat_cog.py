@@ -5,7 +5,7 @@ tabbycat_cog.py — Tabbycat integration for KAMLA.
               (also: /tab status, /tab disconnect)
   /refresh    CAP / ORG / TABBY. Re-reads rounds, motions, draws, results and breaks from Tabbycat and
               reports what is available.
-  /draw  /motion  /result  /break
+  /draw  /motion  /result  /break   (/draw has ONE command: round + type = all | adj only | teams only)
               CAP / ORG / TABBY. After the command, Discord shows a  round:  box (a dropdown, like AP/BP in /st)
               that lists ONLY the rounds whose draw / motions / results are released. The last line of the list is
               always "⚠️ ... please /refresh to get latest update!", and it is the only line when nothing is released.
@@ -55,7 +55,6 @@ FAIL_BACKOFF = 15.0           # after a failed auto-refresh don't hammer the sit
 MAX_FILES_PER_MESSAGE = 10
 CHANNELS = {
     "draw": "🎓︱matchup",
-    "drawadj": "🎓︱matchup",      # same channel as /draw: it's still a draw, just with adjudicators added
     "motion": "🎓︱motion",
     "result": "🎓︱ballot",
     "break": "🎓︱break",
@@ -124,6 +123,23 @@ def is_operator(member) -> bool:
     perms = getattr(member, "guild_permissions", None)
     return (bool(_member_roles(member) & set(OPERATOR_ROLES)) or bool(perms and perms.administrator)
             or getattr(member.guild, "owner_id", None) == member.id)
+
+
+DRAW_TYPE_ALL, DRAW_TYPE_ADJ, DRAW_TYPE_TEAMS = "all", "adj only", "teams only"
+DRAW_MODES = {DRAW_TYPE_ALL: tab_render.MODE_ALL, DRAW_TYPE_ADJ: tab_render.MODE_ADJ, DRAW_TYPE_TEAMS: tab_render.MODE_TEAMS}
+
+
+def _namespace_value(interaction, *names):
+    """A value already typed into another option of the same command (autocomplete only sees the namespace)."""
+    ns = getattr(interaction, "namespace", None)
+    for name in names:
+        value = getattr(ns, name, None)
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return value
+    return None
 
 
 class TabModal(discord.ui.Modal, title="Connect Tabbycat"):
@@ -686,8 +702,17 @@ class TabbycatCog(commands.Cog):
     async def _draw_ac(self, i: discord.Interaction, current: str):
         return await self._round_choices(i, current, "draw")
 
-    async def _drawadj_ac(self, i: discord.Interaction, current: str):
-        return await self._round_choices(i, current, "drawadj")
+    async def _draw_type_ac(self, i: discord.Interaction, current: str):
+        """The `type` options depend on the round already chosen: a round with no adjudicator allocation only offers
+        "teams only" — unavailable adjudicator options are never listed."""
+        offered = [DRAW_TYPE_TEAMS]
+        seq = _namespace_value(i, "round", "round_")
+        if isinstance(seq, int) and seq != NONE_VALUE and await self._tab_config(i.guild):
+            cache = await self._autocomplete_cache(i.guild)
+            rnd = self._pick_round(cache, "drawadj", seq) if cache is not None else None
+            if rnd is not None:
+                offered = [DRAW_TYPE_ALL, DRAW_TYPE_ADJ, DRAW_TYPE_TEAMS]
+        return [app_commands.Choice(name=n, value=n) for n in offered if current.lower() in n.lower()]
 
     async def _motion_ac(self, i: discord.Interaction, current: str):
         return await self._round_choices(i, current, "motion")
@@ -824,31 +849,28 @@ class TabbycatCog(commands.Cog):
 
     # ── /draw  /motion  /result  /break ───────────────────────────────────────
 
-    @app_commands.command(name="draw", description="Post a round's draw as an image.")
-    @app_commands.describe(round_="Round (only rounds with a released draw are listed)")
-    @app_commands.rename(round_="round")
-    @app_commands.autocomplete(round_=_draw_ac)
+    @app_commands.command(name="draw", description="Post a round's draw (teams, adjudicators, or both) as an image.")
+    @app_commands.describe(round_="Round (only rounds with a released draw are listed)",
+                           type_="What to show — adjudicator options appear only when the round has an allocation")
+    @app_commands.rename(round_="round", type_="type")
+    @app_commands.autocomplete(round_=_draw_ac, type_=_draw_type_ac)
     @app_commands.guild_only()
-    async def draw(self, interaction: discord.Interaction, round_: int):
-        async def build(client, cache, rnd):
-            debates = await client.pairings(rnd)
-            if not debates:
-                return []
-            return await asyncio.to_thread(tab_render.render_draw, cache.tournament, rnd, debates)
-        await self._run(interaction, "draw", round_, build)
+    async def draw(self, interaction: discord.Interaction, round_: int, type_: Optional[str] = None):
+        """The ONLY draw command. type: all | adj only | teams only. A round without an adjudicator allocation is
+        always drawn as "teams only" (whatever was asked), so a request can never show an empty adjudicator column."""
+        wanted = DRAW_MODES.get((type_ or DRAW_TYPE_ALL).strip().lower())
+        if wanted is None:
+            await interaction.response.send_message(
+                f"⚠️ `type` must be one of: {', '.join(f'`{n}`' for n in DRAW_MODES)}.", ephemeral=True)
+            return
 
-    @app_commands.command(name="drawadj", description="Post a round's team + adjudicator allocation as an image.")
-    @app_commands.describe(round_="Round (only rounds with adjudicators released are listed)")
-    @app_commands.rename(round_="round")
-    @app_commands.autocomplete(round_=_drawadj_ac)
-    @app_commands.guild_only()
-    async def drawadj(self, interaction: discord.Interaction, round_: int):
         async def build(client, cache, rnd):
             debates = await client.pairings(rnd)
             if not debates:
                 return []
-            return await asyncio.to_thread(tab_render.render_draw_adjudicators, cache.tournament, rnd, debates)
-        await self._run(interaction, "drawadj", round_, build)
+            mode = wanted if rnd.adjudicators_released else tab_render.MODE_TEAMS
+            return await asyncio.to_thread(tab_render.render_matchup, cache.tournament, rnd, debates, mode)
+        await self._run(interaction, "draw", round_, build)
 
     @app_commands.command(name="motion", description="Reveal a round's info slide and motion as images.")
     @app_commands.describe(round_="Round (only rounds with released motions are listed)")

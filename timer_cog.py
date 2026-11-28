@@ -8,38 +8,97 @@ import time
 from datetime import datetime, timezone, timedelta
 from config import config_manager, ADMIN_ROLE_NAMES
 from ratelimit import timer_edits, edits, describe
+from naming import is_kind
+import allin_cog
 
 log = logging.getLogger("kamla.timer")
 
 _active_timers: dict[int, asyncio.Task] = {}
+# The starter is named in every follow-up message, but only 'Times up' actually pings them (no repeated notifications).
+_QUIET = discord.AllowedMentions.none()
 _pens_tasks: set[asyncio.Task] = set()
 
 # Module constants (tests shrink them so a "minute" takes a fraction of a second).
 MINUTE = 60.0
 PENS_DROP_DELAY = 15.0
-# A debate timer never needs more than a day. Without a cap a message like `99999d` made the countdown build a
-# list with one entry per minute (over 100 million) and froze / crashed the whole bot.
-MAX_SECONDS = 24 * 3600
+# The longest timer KAMLA runs. (An unbounded value used to make the countdown build a list with one entry per
+# minute and froze the bot; 5 hours is also the product rule.)
+MAX_SECONDS = 5 * 3600
 
-# Strict time format: only digits + lowercase d/h/m/s (e.g. 1d2h3m4s, 10m, 30s)
-_TIME_STRICT = re.compile(r'^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$')
-# Loose detector: any digit followed by lowercase d/h/m/s anywhere
-_HAS_TIMEY = re.compile(r'\d+[dhms]')
+_UNIT_WORDS = {
+    "h": r"h|hr|hrs|hour|hours|houre|houres",
+    "m": r"m|min|mins|minute|minutes|minuet|minuets|minut|minuts|mint|mints",
+    "s": r"s|sec|secs|second|seconds|secnd|secnds",
+}
+# one "<digits><unit>" group; longer spellings are listed first by the alternation order below
+_GROUP = re.compile(
+    r"(?P<n>\d{1,6})\s*(?P<u>" + "|".join(f"(?:{w})" for w in (_UNIT_WORDS["h"], _UNIT_WORDS["m"], _UNIT_WORDS["s"])) + r")(?![a-z])",
+    re.IGNORECASE)
+_SEPARATORS = re.compile(r"\s*(?:,|and|&|\+)?\s*", re.IGNORECASE)
+
+
+def _unit_of(word: str) -> str:
+    w = word.lower()
+    for key, alts in _UNIT_WORDS.items():
+        if w in alts.split("|"):
+            return key
+    return ""
 
 
 def parse_time(text: str) -> int | None:
-    """Strict parse. Returns total seconds or None.
-    Only allows: digits + lowercase d/h/m/s. No spaces, no special chars.
-    """
+    """Total seconds for a duration such as ``5m``, ``2 hours 30 minutes``, ``4 h 45 m`` or ``4h5min``
+    (case-insensitive, flexible spacing, common spelling variants). ``None`` when it is not a duration.
+
+    The text must be the duration ONLY: a leading activation dot is handled by :func:`classify_message`.
+    Each unit may appear once; whole numbers only. Does NOT apply the 5-hour limit (the caller reports it)."""
     if not text:
         return None
-    m = _TIME_STRICT.fullmatch(text)
-    if not m or not any(m.groups()):
-        return None
-    d, h, mi, s = m.groups()
-    total = (int(d or 0) * 86400 + int(h or 0) * 3600
-             + int(mi or 0) * 60 + int(s or 0))
-    return total if total > 0 else None
+    pos, total, seen = 0, 0, set()
+    text = text.strip()
+    while pos < len(text):
+        m = _GROUP.match(text, pos)
+        if m is None:
+            return None
+        unit = _unit_of(m.group("u"))
+        if not unit or unit in seen:
+            return None
+        seen.add(unit)
+        total += int(m.group("n")) * {"h": 3600, "m": 60, "s": 1}[unit]
+        pos = m.end()
+        sep = _SEPARATORS.match(text, pos)
+        pos = sep.end() if sep else pos
+    return total if total > 0 and seen else None
+
+
+_TIMERISH = re.compile(r"^\.?\s*\d")
+
+
+def classify_message(content: str, in_timer_channel: bool) -> tuple[str, int]:
+    """Decide what a chat message means for the timer.
+
+    Returns ``(kind, seconds)`` where kind is
+      * ``"timer"``    – a valid timer; ``seconds`` is its length,
+      * ``"too_long"`` – a valid duration above :data:`MAX_SECONDS`,
+      * ``"invalid"``  – (timer channel only) it starts like a time but is not one → short help,
+      * ``"ignore"``   – anything else: it is ordinary chat and must never trigger anything.
+
+    The dot is an ACTIVATION PREFIX, never a decimal point: ``.5m`` is 5 minutes. In the dedicated timer channel
+    the dot is optional (``5m`` / ``.5m``); everywhere else the message must start with one."""
+    text = (content or "").strip()
+    has_dot = text.startswith(".")
+    if not in_timer_channel and not has_dot:
+        return "ignore", 0
+    body = text[1:].strip() if has_dot else text
+    if body.startswith("."):                      # "..5m" is not an activation
+        return ("invalid", 0) if in_timer_channel and _TIMERISH.match(text) else ("ignore", 0)
+    seconds = parse_time(body)
+    if seconds is None:
+        if in_timer_channel and len(text) <= 40 and _TIMERISH.match(text):
+            return "invalid", 0
+        return "ignore", 0
+    if seconds > MAX_SECONDS:
+        return "too_long", seconds
+    return "timer", seconds
 
 
 def fmt_clock(seconds: int) -> str:
@@ -82,11 +141,28 @@ def _tz_label(tz_str: str) -> str:
 
 
 HELP_TEXT = (
-    "⏱️ This is the **timer** channel.\n"
-    "Send a time to start a countdown:\n"
-    "`10s` · `7m` · `1h` · `1h30m` · `10m30s`\n"
-    "Only **digits + lowercase d/h/m/s** are allowed — no spaces, no symbols."
+    "⏱️ Send a time to start a timer: `5m` · `2h` · `4h45m` · `2 hours 30 minutes` (max 5 hours).\n"
+    "In other channels start with a dot: `.5m` · `.4h45m`."
 )
+
+
+def title_for(total_seconds: float) -> str:
+    """'5 Min', '4 Hr 45 Min', '1 Min 30 Sec', '45 Sec' — the length of the timer, for the big embed text."""
+    seconds = int(round(total_seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    parts = []
+    if h:
+        parts.append(f"{h} Hr")
+    if m:
+        parts.append(f"{m} Min")
+    if s or not parts:
+        parts.append(f"{s} Sec")
+    return " ".join(parts)
+
+
+def is_timer_channel(channel) -> bool:
+    return isinstance(channel, discord.TextChannel) and is_kind(channel.name, "timer")
 
 
 class TimerCog(commands.Cog):
@@ -104,63 +180,55 @@ class TimerCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
+        """One timer for every channel — there is no separate POI feature any more.
+
+        * In the dedicated ⏱️︱timer channel: `5m`, `2h`, `4h45m` (dot optional).
+        * Anywhere else: the message must start with a dot (`.5m`, `.4h 45m`).
+        * `.allin` (timer / legacy poi channels) is handed to the existing All-In implementation.
+        The user's message is NEVER deleted, and anything that is not a timer is ignored."""
         if message.author.bot or not message.guild:
             return
-        if not isinstance(message.channel, discord.TextChannel):
+        channel = message.channel
+        if not isinstance(channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel)):
             return
-        if message.channel.name.lower() != "timer":
-            return
-
-        raw = message.content or ""
-        content = raw.strip()
-
-        # Always delete the user's message
-        try:
-            await message.delete()
-        except Exception as e:  # noqa: BLE001 - message delete is best-effort
-            log.debug("Could not delete timer message: %s", describe(e))
-
-        # Empty / no time-like content at all → generic help
-        if not content or not _HAS_TIMEY.search(content):
-            await message.channel.send(
-                f"{message.author.mention}\n{HELP_TEXT}",
-                delete_after=10,
-            )
+        content = (message.content or "").strip()
+        if not content:
             return
 
-        duration = parse_time(content)
-        if duration is None:
-            # Has digit+letter pattern but failed strict parse
-            # (e.g. ".7m", "!7m", "/7m", "7M", "7 m")
-            await message.channel.send(
-                f"⚠️ {message.author.mention} — invalid format. "
-                "Don't use special characters or capital letters.\n"
-                "Use exactly like: `10s` · `7m` · `1h30m` · `10m30s`",
-                delete_after=10,
-            )
+        if content.lower() == ".allin":
+            await allin_cog.handle_allin_message(message)
             return
 
-        if duration > MAX_SECONDS:
-            await message.channel.send(
-                f"⚠️ {message.author.mention} — the longest timer is {fmt_human(MAX_SECONDS)} (`1d`). "
-                "Please use a shorter time.",
-                delete_after=10,
-            )
+        kind, seconds = classify_message(content, is_timer_channel(channel))
+        if kind == "ignore":
+            return
+        if kind == "invalid":
+            await _say(channel, f"⚠️ {message.author.mention} that is not a valid time.\n{HELP_TEXT}", delete_after=12)
+            return
+        if kind == "too_long":
+            await _say(channel, f"⚠️ {message.author.mention} the longest timer is {title_for(MAX_SECONDS)}.",
+                       delete_after=10)
             return
 
-        # Cancel any existing timer in this channel
-        old = _active_timers.pop(message.channel.id, None)
+        # A new timer replaces the one running in this channel.
+        old = _active_timers.pop(channel.id, None)
         if old and not old.done():
             old.cancel()    # its handler marks the old message "Replaced" and disables its buttons
 
-        cfg = await config_manager.get_config(message.guild)
+        cfg = await config_manager.get_config(message.guild)         # {} before installation: timers still work
         tz_str = cfg.get("timezone", "+00:00")
         tz_mins = _tz_offset_mins(tz_str)
 
-        task = asyncio.create_task(
-            _run_countdown(message.channel, message.author, duration, tz_mins, tz_str)
-        )
-        _active_timers[message.channel.id] = task
+        task = asyncio.create_task(_run_countdown(channel, message.author, seconds, tz_mins, tz_str))
+        _active_timers[channel.id] = task
+
+
+async def _say(channel, text: str, *, delete_after: float | None = None, **kw) -> None:
+    """A transient bot reply in the channel; never raises (the channel may not allow it)."""
+    try:
+        await channel.send(text, delete_after=delete_after, **kw)
+    except Exception as e:  # noqa: BLE001 - best effort
+        log.debug("Could not post a timer notice: %s", describe(e))
 
 
 def _mins_text(seconds: float) -> str:
@@ -228,52 +296,34 @@ class TimerState:
             self.wake.set()
 
 
-def _bar(state: TimerState, width: int = 10) -> str:
-    frac = state.running() / state.total if state.total else 1.0
-    filled = max(0, min(width, round(frac * width)))
-    return "▰" * filled + "▱" * (width - filled)
-
-
 def render(state: TimerState) -> discord.Embed:
-    """Status only. There is deliberately NO per-second clock in the text: the live countdown is Discord's own
-    relative timestamp (<t:..:R>), drawn by each viewer's client, so the message is edited once a minute / on
-    pause / resume / end only — the rate-limit budget is unchanged."""
-    minutes = int(state.running() // MINUTE)
-    live = state.phase == "running"
-    if live:
-        if state.paused:
-            status, color = f"⏸ **Paused** · POI · {minutes} min run so far", discord.Color.orange()
-        else:
-            frac = state.running() / state.total if state.total else 1
-            color = (discord.Color.green() if frac < 0.5 else
-                     discord.Color.gold() if frac < 0.75 else discord.Color.red())
-            status = f"▶ **{minutes} min running**"
-        status += f"\n{_bar(state)}"
-    elif state.phase == "ended":
-        status, color = "✅ **Time's up**", discord.Color.dark_grey()
-    elif state.phase == "skipped":
-        status, color = "⏭ **Skipped**", discord.Color.dark_grey()
-    else:
-        status, color = "🔁 **Replaced by a new timer**", discord.Color.dark_grey()
-    embed = discord.Embed(title="⏱ Timer", description=status, color=color)
-    embed.add_field(name="Length", value=fmt_human(int(state.total)), inline=True)
-    embed.add_field(name="Commander", value=state.starter.display_name, inline=True)
-    if live and state.paused:
-        embed.add_field(name="Time left", value=f"⏸ {fmt_human(int(state.remaining()))} (paused)", inline=True)
-    elif live:
-        embed.add_field(name="Ends", value=f"<t:{state.end_epoch}:T> · <t:{state.end_epoch}:R>", inline=True)
-    footer = f"Started {state.started_fmt} ({state.tz_label})"
-    if state.ended_fmt:
-        footer += f"  •  Ended {state.ended_fmt}"
-    embed.set_footer(text=footer)
+    """Minimal on purpose: ONE large line ("5 Min Running") and a footer with the start time and the starter.
+    No title, description block or fields. The live Discord countdown (<t:..:R>, drawn by each viewer's client,
+    so it costs no edits) lives in the message content, see :func:`render_content`."""
+    word = {"running": "Paused" if state.paused else "Running", "ended": "Finished",
+            "skipped": "Skipped", "replaced": "Replaced"}.get(state.phase, "Running")
+    colors = {"Running": discord.Color.green(), "Paused": discord.Color.orange(),
+              "Finished": discord.Color.dark_grey(), "Skipped": discord.Color.dark_grey(),
+              "Replaced": discord.Color.dark_grey()}
+    embed = discord.Embed(description=f"# {title_for(state.total * 60.0 / MINUTE)} {word}", color=colors[word])
+    embed.set_footer(text=f"Started {state.started_fmt} ({state.tz_label}) • by {state.starter.display_name}")
     return embed
+
+
+def render_content(state: TimerState) -> str | None:
+    """The countdown line next to the embed: empty once the timer is over."""
+    if state.phase != "running":
+        return None
+    if state.paused:
+        return f"⏸ {fmt_human(int(state.remaining()))} left (paused)"
+    return f"⏳ Ends <t:{state.end_epoch}:T> · <t:{state.end_epoch}:R>"
 
 
 PAUSE_ID, SKIP_ID = "kamla:timer:pause", "kamla:timer:skip"
 
 
 class TimerView(discord.ui.View):
-    """Pause (POI) / Resume and Skip. Only the commander or an admin may use them —
+    """Pause / Resume and Skip. Only the commander or an admin may use them —
     otherwise any debater could pause or skip a speech."""
 
     def __init__(self, state: TimerState):
@@ -297,7 +347,7 @@ class TimerView(discord.ui.View):
                 "Only the timer's commander or an admin can use these buttons.", ephemeral=True)
         return ok
 
-    @discord.ui.button(label="Pause (POI)", emoji="⏸", style=discord.ButtonStyle.secondary, custom_id=PAUSE_ID)
+    @discord.ui.button(label="Pause", emoji="⏸", style=discord.ButtonStyle.secondary, custom_id=PAUSE_ID)
     async def pause_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._allowed(interaction):
             return
@@ -307,11 +357,11 @@ class TimerView(discord.ui.View):
             return
         if st.paused:
             st.resume()
-            button.label, button.emoji = "Pause (POI)", "⏸"
+            button.label, button.emoji = "Pause", "⏸"
         else:
             st.pause()
             button.label, button.emoji = "Resume", "▶"
-        await interaction.response.edit_message(embed=render(st), view=self)
+        await interaction.response.edit_message(content=render_content(st), embed=render(st), view=self)
 
     @discord.ui.button(label="Skip", emoji="⏭", style=discord.ButtonStyle.danger, custom_id=SKIP_ID)
     async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -323,7 +373,7 @@ class TimerView(discord.ui.View):
             return
         st.skip(interaction.user)
         self.disable_all()
-        await interaction.response.edit_message(embed=render(st), view=self)
+        await interaction.response.edit_message(content=render_content(st), embed=render(st), view=self)
 
 
 class OrphanTimerView(discord.ui.View):
@@ -338,7 +388,7 @@ class OrphanTimerView(discord.ui.View):
         await interaction.response.edit_message(
             content="⌛ This timer stopped because KAMLA restarted. Send the time again to start a new one.", view=None)
 
-    @discord.ui.button(label="Pause (POI)", emoji="⏸", style=discord.ButtonStyle.secondary, custom_id=PAUSE_ID)
+    @discord.ui.button(label="Pause", emoji="⏸", style=discord.ButtonStyle.secondary, custom_id=PAUSE_ID)
     async def pause_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._lost(interaction)
 
@@ -350,7 +400,7 @@ class OrphanTimerView(discord.ui.View):
 async def _pens_drop(channel, starter) -> None:
     try:
         await asyncio.sleep(PENS_DROP_DELAY)
-        await edits.run(lambda: channel.send(content=f"Adjudicators Pens Drop {starter.mention}"),
+        await edits.run(lambda: channel.send(content=f"Adjudicators Pens Drop {starter.mention}", allowed_mentions=_QUIET),
                         label="timer-pens-drop")
     except asyncio.CancelledError:
         raise
@@ -373,14 +423,15 @@ async def _run_countdown(
     state = TimerState(channel, starter, total, started_fmt, tz_label)
     view = TimerView(state)
     state.view = view
-    state.msg = await edits.run(lambda: channel.send(embed=render(state), view=view), label="timer-start")
+    state.msg = await edits.run(lambda: channel.send(content=render_content(state), embed=render(state), view=view),
+                                label="timer-start")
 
     # One edit per whole minute / pause / resume / end, instead of one per second.
     edit_key = ("timer", channel.id, state.id)
 
     async def _edit() -> None:
         try:
-            await state.msg.edit(embed=render(state), view=view)   # rendered when sent => never stale
+            await state.msg.edit(content=render_content(state), embed=render(state), view=view)   # rendered when sent => never stale
         except discord.NotFound:
             state.gone = True
 
@@ -408,7 +459,7 @@ async def _run_countdown(
             for t, text in announcements:
                 if t not in fired and running >= t - 1e-6:
                     fired.add(t)
-                    await edits.run(lambda tx=text: channel.send(content=tx), label="timer-announce")
+                    await edits.run(lambda tx=text: channel.send(content=tx, allowed_mentions=_QUIET), label="timer-announce")
 
             minute = int(running // MINUTE)
             if minute > last_minute:
@@ -445,7 +496,7 @@ async def _run_countdown(
             task.add_done_callback(_pens_tasks.discard)
         elif state.phase == "skipped":
             who = getattr(state.skipped_by, "display_name", "someone")
-            await edits.run(lambda: channel.send(content=f"⏭ Timer skipped by {who} {mention}"),
+            await edits.run(lambda: channel.send(content=f"⏭ Timer skipped by {who} {mention}", allowed_mentions=_QUIET),
                             label="timer-skipped")
     except asyncio.CancelledError:
         # A newer timer replaced this one (or the bot is stopping).

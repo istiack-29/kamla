@@ -19,9 +19,12 @@ def fast(monkeypatch):
 
     async def noop(*a, **k):
         return None
-    for name in ("_post_meet_developer", "_post_welcome", "_post_get_role", "_post_how_to_use",
-                 "_post_settings_panel", "_post_all_in_panel"):
+    for name in ("_post_meet_developer", "_post_members_info", "_post_get_role", "_post_how_to_use",
+                 "_post_settings_panel", "_post_security_panel"):
         monkeypatch.setattr(sb, name, noop)
+    import links_cog
+    monkeypatch.setattr(links_cog, "refresh_links", noop)
+    monkeypatch.setattr(sb, "CHANNEL_INTERVAL", 0.0)
 
 
 async def built():

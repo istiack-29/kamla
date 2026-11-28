@@ -6,7 +6,6 @@ import pytest
 
 import server_builder as sb
 import setup_cog
-import assign_cog
 from ratelimit import RequestCoordinator
 from tests.fakes import FakeGuild, FakeConfig
 
@@ -20,9 +19,12 @@ def fast(monkeypatch):
 
     async def noop(*a, **k):
         return None
-    for name in ("_post_meet_developer", "_post_welcome", "_post_how_to_use",
-                 "_post_settings_panel", "_post_all_in_panel"):
+    for name in ("_post_meet_developer", "_post_members_info", "_post_how_to_use",
+                 "_post_settings_panel", "_post_security_panel"):
         monkeypatch.setattr(sb, name, noop)
+    import links_cog
+    monkeypatch.setattr(links_cog, "refresh_links", noop)
+    monkeypatch.setattr(sb, "CHANNEL_INTERVAL", 0.0)
 
 
 async def build(g, rooms=1):
@@ -97,7 +99,7 @@ async def test_organisers_still_see_every_private_channel_without_admin():
         for r in staff:
             assert ch.overwrites[r].view_channel is True, (ch.name, r.name)
         checked += 1
-    assert checked > 40
+    assert checked > 35
 
 
 async def test_get_role_mentions_server_owner_and_names_organiser_roles():
@@ -123,22 +125,12 @@ def inter(guild, roles=(), admin=False):
     return i
 
 
-async def test_rebuild_and_mention_enforce_organiser_roles_themselves():
-    cog = setup_cog.SetupCog(bot=None)
-    stranger = inter(FakeGuild(), roles=["DEBATER"])
-    await cog.rebuild.callback(cog, stranger)
-    assert "need an admin role" in stranger.response.send_message.await_args.args[0]
-
-    acog = assign_cog.AssignCog(bot=None)
-    s2 = inter(FakeGuild(), roles=["VISITOR"])
-    await acog.mention.callback(acog, s2, types.SimpleNamespace(mention="@u"), mock.MagicMock())
-    assert "Only ORG" in s2.response.send_message.await_args.args[0]
-
-    # an organiser (no Administrator bit) is let through to the real logic
-    ch = mock.MagicMock(); ch.send = mock.AsyncMock(); ch.mention = "#c"
-    org = inter(FakeGuild(), roles=["TABBY"])
-    await acog.mention.callback(acog, org, types.SimpleNamespace(mention="@u"), ch)
-    ch.send.assert_awaited()
+async def test_rebuild_and_mention_commands_no_longer_exist():
+    import main
+    import importlib
+    assert importlib.util.find_spec("assign_cog") is None
+    assert not hasattr(setup_cog.SetupCog, "rebuild")
+    assert "assign_cog" not in main.COGS
 
 
 async def test_slash_commands_are_not_hidden_behind_the_administrator_gate(tmp_path, monkeypatch):
@@ -148,8 +140,10 @@ async def test_slash_commands_are_not_hidden_behind_the_administrator_gate(tmp_p
     with mock.patch.object(type(bot.tree), "sync", new=mock.AsyncMock(return_value=[])):
         await bot.setup_hook()
     try:
-        for name in ("st", "rebuild", "mention", "nicknames"):
+        for name in ("st", "nicknames"):
             assert bot.tree.get_command(name).default_permissions is None, name
+        for gone in ("rebuild", "mention", "drawadj"):
+            assert bot.tree.get_command(gone) is None, gone
     finally:
         await bot.close()
 
@@ -181,27 +175,6 @@ def test_strangers_are_not_organisers():
     assert not setup_cog.is_organiser(_interaction(roles=[], owner_id=None))
 
 
-async def test_st_and_rebuild_explain_a_missing_bot_membership_with_a_working_invite_link():
-    cog = setup_cog.SetupCog(bot=None)
-    for call in ("st", "rebuild"):
-        i = _interaction(perms=discord.Permissions.all(), in_guild=False)
-        if call == "st":
-            await cog.st.callback(cog, i, types.SimpleNamespace(value="ap"), 5, "T", types.SimpleNamespace(value="ORG"))
-        else:
-            await cog.rebuild.callback(cog, i)
-        text = i.response.send_message.await_args.args[0]
-        assert "not a real member" in text and "slash commands only" in text
-        assert "client_id=4242" in text and "scope=bot" in text and "guild_id=7" in text
-        assert i.response.send_message.await_args.kwargs["ephemeral"] is True
-
-
-async def test_rebuild_still_refuses_strangers_when_the_bot_is_a_member():
-    cog = setup_cog.SetupCog(bot=None)
-    i = _interaction(roles=["DEBATER"])
-    await cog.rebuild.callback(cog, i)
-    assert "need an admin role" in i.response.send_message.await_args.args[0]
-
-
 # ── Regression: the SAME owner-recognition fix must hold everywhere "is this an organiser?"
 # is checked, not just in /st and /rebuild. These three call sites used to each re-derive their own,
 # weaker version of the check (no owner_id fallback, no interaction.permissions fallback), so the
@@ -218,34 +191,6 @@ async def test_settings_panel_guard_recognises_the_owner_even_when_half_cached()
     stranger_interaction = _interaction(roles=["DEBATER"])
     assert await view._guard(stranger_interaction) is False
     stranger_interaction.response.send_message.assert_awaited_once()
-
-
-async def test_mention_recognises_the_owner_even_when_half_cached():
-    import assign_cog
-    cog = assign_cog.AssignCog(bot=None)
-    i = _interaction(owner_id=1)
-    i.response.send_message = mock.AsyncMock()
-    channel = mock.AsyncMock()
-    channel.mention = "#general"
-    target = types.SimpleNamespace(mention="@user")
-    await cog.mention.callback(cog, i, target, channel)
-    channel.send.assert_awaited_once_with("@user")               # proceeded instead of being refused
-
-    i2 = _interaction(roles=["DEBATER"])
-    i2.response.send_message = mock.AsyncMock()
-    channel2 = mock.AsyncMock()
-    await cog.mention.callback(cog, i2, target, channel2)
-    channel2.send.assert_not_awaited()
-    assert "Only ORG" in i2.response.send_message.await_args.args[0]
-
-
-async def test_mention_outside_a_guild_is_refused_cleanly_instead_of_crashing():
-    import assign_cog
-    cog = assign_cog.AssignCog(bot=None)
-    i = mock.MagicMock(guild=None)
-    i.response.send_message = mock.AsyncMock()
-    await cog.mention.callback(cog, i, types.SimpleNamespace(mention="@user"), mock.AsyncMock())
-    assert "must be used in a server" in i.response.send_message.await_args.args[0]
 
 
 async def test_nicknames_recognises_the_owner_even_when_half_cached(monkeypatch):

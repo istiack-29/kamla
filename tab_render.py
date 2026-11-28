@@ -154,6 +154,13 @@ def _prep(text: str) -> str:
 
 # ── text engine ───────────────────────────────────────────────────────────────
 
+# Adjudicator role markers. The bundled font has no circled-letter glyphs (Ⓟ and Ⓣ would be empty boxes), so each
+# marker is drawn as a small badge — a ring with its letter — which looks identical on every machine.
+MARK_CHAIR, MARK_PANEL, MARK_TRAINEE = "©", "Ⓟ", "Ⓣ"
+MARK_LETTER = {MARK_CHAIR: "C", MARK_PANEL: "P", MARK_TRAINEE: "T"}
+MARK_W = 1.12                  # badge advance as a multiple of the font size (ring + a little air before the comma)
+
+
 def _is_bengali(ch: str) -> bool:
     return "\u0980" <= ch <= "\u09FF"
 
@@ -168,6 +175,9 @@ def split_runs(text: str) -> list[tuple[str, str]]:
     def add_text(chunk: str) -> None:
         nonlocal last_text_script
         for ch in chunk:
+            if ch in MARK_LETTER:
+                runs.append(("K", ch))
+                continue
             if _is_bengali(ch):
                 script = "B"
             elif ch.isalpha():
@@ -210,6 +220,8 @@ def _run_width(script: str, run: str, size: float) -> float:
     if script == "M":
         tile = _emoji_tile(run, _emoji_tile_h(size, MEASURE))
         return (tile.width if tile else 0) / MEASURE
+    if script == "K":
+        return size * MARK_W
     return _font(script, round(size * MEASURE)).getlength(run) / MEASURE
 
 
@@ -307,6 +319,17 @@ class Canvas:
         xp = float(self._p(x))
         stroke = max(1, S // 2) if bold else 0
         for script, run in split_runs(text):
+            if script == "K":
+                diameter = size * 0.84 * S
+                cy = baseline - 0.34 * px
+                ring = max(1, round(px * 0.075))
+                left = xp + 0.04 * px
+                self.d.ellipse([left, cy - diameter / 2, left + diameter, cy + diameter / 2], outline=fill, width=ring)
+                letter_font = _font("E", max(6, round(px * 0.52)))
+                self.d.text((left + diameter / 2, cy), MARK_LETTER[run], font=letter_font, fill=fill, anchor="mm",
+                            stroke_width=0)
+                xp += size * MARK_W * S
+                continue
             if script == "M":
                 tile = _emoji_tile(run, _emoji_tile_h(size, S))
                 if tile is not None:
@@ -473,60 +496,162 @@ def render_table(kicker: str, title: str, subtitle: str, columns: list[Column], 
 
 # ── draw ──────────────────────────────────────────────────────────────────────
 
-def _side_columns(debates: list[DebateInfo]) -> list[str]:
+# The draw follows the Tabbycat public-draw table: one wide, compact row per room — Room, the team columns, then ONE
+# "Adjudicators" column with every name inline ("Name©, Name Ⓟ, Name Ⓣ"). It is wide, not tall.
+DRAW_MIN_WIDTH, DRAW_MAX_WIDTH = 1900, 3400
+DRAW_MARGIN, DRAW_PAD_X, DRAW_PAD_Y = 28, 16, 7
+DRAW_TEXT, DRAW_HEAD, DRAW_TITLE = 24, 16, 34
+DRAW_COL_CAP = {"team": 470, "adj": 1100}      # a longer cell wraps instead of stretching the image further
+MODE_ALL, MODE_ADJ, MODE_TEAMS = "all", "adj", "teams"
+
+BP_SIDES = [("OG", "OG"), ("OO", "OO"), ("CG", "CG"), ("CO", "CO")]
+AP_SIDES = [("Gov", "Government"), ("Opp", "Opposition")]
+
+
+def _side_columns(debates: list[DebateInfo]) -> list[tuple[str, str]]:
+    """(key used by the data, heading shown) — exactly four for BP, exactly two for AP."""
     n = max((len(d.teams) for d in debates), default=2)
     if n == 4:
-        return ["OG", "OO", "CG", "CO"]
+        return list(BP_SIDES)
     if n == 2:
-        return ["Gov", "Opp"]
-    return [f"Team {i + 1}" for i in range(n)]
+        return list(AP_SIDES)
+    return [(f"Team {i + 1}", f"Team {i + 1}") for i in range(n)]
 
 
-def _team_cells(d: DebateInfo, sides: list[str]) -> list[Cell]:
+def _team_names(d: DebateInfo, sides: list[tuple[str, str]]) -> list[str]:
     by_side = {t.side: t.name for t in d.teams}
     out = []
-    for i, s in enumerate(sides):
-        name = by_side.get(s) or (d.teams[i].name if len(d.teams) == len(sides) and i < len(d.teams) and s.startswith("Team") else "—")
-        out.append(cell(name or "—", 28))
+    for i, (key, _label) in enumerate(sides):
+        name = by_side.get(key)
+        if not name and len(d.teams) == len(sides) and key.startswith("Team"):
+            name = d.teams[i].name
+        out.append((name or "").strip() or "—")
     return out
 
 
-def render_draw(tournament: str, rnd: RoundInfo, debates: list[DebateInfo]) -> list[bytes]:
-    """Team matchup only — never adjudicators, whatever /draw is used for: this is the /draw command's image."""
-    sides = _side_columns(debates)
-    columns = [Column("Venue", 1.1)] + [Column(s, 2.0, SIDE_COLORS.get(s, NAVY_2)) for s in sides]
-    rows = []
-    for d in debates:
-        row = [cell(d.venue or "—", 28, NAVY, bold=True)]
-        row += _team_cells(d, sides)
-        rows.append(row)
-    return render_table(tournament or "Tournament", f"{rnd.name}  ·  Draw", f"{len(debates)} debates", columns, rows)
+def adjudicator_entries(d: DebateInfo) -> list[tuple[str, str]]:
+    """[(name, marker)] for ONE allocation: a single chair first, then panellists, then trainees. A person is listed once
+    (a name appearing in two roles keeps the higher one), blanks are skipped."""
+    seen: set[str] = set()
+    out: list[tuple[str, str]] = []
+    for name, mark in ([(d.chair, MARK_CHAIR)] + [(p, MARK_PANEL) for p in d.panel]
+                       + [(t, MARK_TRAINEE) for t in d.trainees]):
+        clean = (name or "").strip()
+        key = clean.casefold()
+        if not clean or key in seen:
+            continue
+        seen.add(key)
+        out.append((clean, mark))
+    return out
 
 
-def render_draw_adjudicators(tournament: str, rnd: RoundInfo, debates: list[DebateInfo]) -> list[bytes]:
-    """Team matchup PLUS the adjudicator allocation — Chair / Panellist / Trainee are three independent
-    columns, each shown only if at least one debate in this round actually has someone in it. (Only call this
-    for a round whose adjudicators are released — the /drawadj command enforces that.)"""
+def adjudicator_text(d: DebateInfo) -> str:
+    """'Alice©, Bob Ⓟ, Cy Ⓣ' — the chair's © hugs the name (as in the Tabbycat table), the others follow the same rule."""
+    entries = adjudicator_entries(d)
+    return ", ".join(f"{name}{mark}" for name, mark in entries) if entries else "—"
+
+
+def has_adjudicator_allocation(debates: list[DebateInfo]) -> bool:
+    return any(adjudicator_entries(d) for d in debates)
+
+
+def _dotted(card: Canvas, x0: float, x1: float, y: float, fill: str) -> None:
+    x = x0
+    while x < x1:
+        card.line([x, y, min(x + 2, x1), y], fill=fill, width=1)
+        x += 4
+
+
+def render_matchup(tournament: str, rnd: RoundInfo, debates: list[DebateInfo], mode: str = MODE_ALL) -> list[bytes]:
+    """The /draw image. mode: "all" (teams + adjudicators), "adj" (adjudicators only), "teams".
+    A round without any adjudicator allocation is always rendered as "teams", whatever was asked."""
+    if mode not in (MODE_ALL, MODE_ADJ, MODE_TEAMS) or not has_adjudicator_allocation(debates):
+        mode = MODE_TEAMS
     sides = _side_columns(debates)
-    show_panel = any(d.panel for d in debates)
-    show_trainee = any(d.trainees for d in debates)
-    columns = [Column("Venue", 1.0)] + [Column(s, 1.7, SIDE_COLORS.get(s, NAVY_2)) for s in sides] + [Column("Chair", 1.3)]
-    if show_panel:
-        columns.append(Column("Panellist", 1.6))
-    if show_trainee:
-        columns.append(Column("Trainee", 1.6))
-    rows = []
+    show_teams, show_adj = mode in (MODE_ALL, MODE_TEAMS), mode in (MODE_ALL, MODE_ADJ)
+
+    headers = ["Room"] + ([label for _k, label in sides] if show_teams else []) + (["Adjudicators"] if show_adj else [])
+    kinds = ["room"] + (["team"] * len(sides) if show_teams else []) + (["adj"] if show_adj else [])
+    rows: list[list[str]] = []
     for d in debates:
-        row = [cell(d.venue or "—", 28, NAVY, bold=True)]
-        row += _team_cells(d, sides)
-        row.append(cell(d.chair or "—", 28))
-        if show_panel:
-            row.append(cell(", ".join(p for p in d.panel if p) or "—", 26, MUTED))
-        if show_trainee:
-            row.append(cell(", ".join(t for t in d.trainees if t) or "—", 26, MUTED))
+        row = [(d.venue or "—").strip()]
+        if show_teams:
+            row += _team_names(d, sides)
+        if show_adj:
+            row.append(adjudicator_text(d))
         rows.append(row)
-    return render_table(tournament or "Tournament", f"{rnd.name}  ·  Adjudicator Draw", f"{len(debates)} debates",
-                        columns, rows)
+
+    # natural width of every column (content or heading), capped so one huge cell wraps instead of stretching the image
+    widths = []
+    for idx, kind in enumerate(kinds):
+        longest = max([text_width(headers[idx], DRAW_HEAD)] + [text_width(r[idx], DRAW_TEXT) for r in rows])
+        cap = DRAW_COL_CAP.get(kind, 10_000)
+        widths.append(int(min(longest + 2 * DRAW_PAD_X + 6, cap)))
+    inner = max(DRAW_MIN_WIDTH - 2 * DRAW_MARGIN, sum(widths))
+    inner = min(inner, DRAW_MAX_WIDTH - 2 * DRAW_MARGIN)
+    spare = inner - sum(widths)
+    if spare > 0:                                  # the extra space goes to the adjudicators (or, without them, the teams)
+        grow = [i for i, k in enumerate(kinds) if k == ("adj" if show_adj else "team")]
+        for i in grow:
+            widths[i] += spare // len(grow)
+        widths[grow[-1]] += spare - (spare // len(grow)) * len(grow)
+    elif spare < 0:                                # more than the maximum width: shrink the widest columns
+        over = -spare
+        order = sorted(range(len(widths)), key=lambda i: -widths[i])
+        for i in order:
+            cut = min(over, max(0, widths[i] - 160))
+            widths[i] -= cut
+            over -= cut
+            if over <= 0:
+                break
+    total_w = sum(widths) + 2 * DRAW_MARGIN
+
+    laid = []                                      # per row: wrapped lines per column
+    for row in rows:
+        cells = [wrap(text, DRAW_TEXT, widths[i] - 2 * DRAW_PAD_X) for i, text in enumerate(row)]
+        lines = max(len(c) for c in cells)
+        laid.append((cells, int(DRAW_TEXT * 1.38) * lines + 2 * DRAW_PAD_Y))
+
+    title = ("Adjudicators for " if mode == MODE_ADJ else "Draw for ") + (rnd.name or "Round")
+    head_h = int(DRAW_HEAD * 1.4) + 18
+    title_h = int(DRAW_TITLE * 1.4) + 14
+    body_h = sum(h for _c, h in laid)
+    height = DRAW_MARGIN + title_h + head_h + body_h + 40
+
+    def build(scale: int) -> Canvas:
+        cv = Canvas(total_w, height, CARD, scale)
+        cv.text((DRAW_MARGIN, DRAW_MARGIN - 6), title, DRAW_TITLE, NAVY, bold=True)
+        top = DRAW_MARGIN + title_h
+        cv.rrect([DRAW_MARGIN - 8, top - 4, total_w - DRAW_MARGIN + 8, top + head_h + body_h + 2], 10, outline=BORDER, width=1)
+        x = DRAW_MARGIN
+        for text, w in zip(headers, widths):
+            cv.text((x + DRAW_PAD_X, top + 8), text, DRAW_HEAD, MUTED)
+            x += w
+        y = top + head_h
+        cv.line([DRAW_MARGIN - 8, y, total_w - DRAW_MARGIN + 8, y], fill="#CBD5E1", width=1.5)
+        for idx, (cells, h) in enumerate(laid):
+            x = DRAW_MARGIN
+            for col, (lines, w) in enumerate(zip(cells, widths)):
+                cy = y + DRAW_PAD_Y
+                for piece in lines:
+                    cv.text((x + DRAW_PAD_X, cy), piece, DRAW_TEXT, TEXT)
+                    if kinds[col] == "team" and piece != "—":          # the Tabbycat table underlines team names
+                        _dotted(cv, x + DRAW_PAD_X, x + DRAW_PAD_X + text_width(piece, DRAW_TEXT),
+                                cy + DRAW_TEXT * 1.22, "#B8C2D3")
+                    cy += int(DRAW_TEXT * 1.38)
+                x += w
+            y += h
+            if idx < len(laid) - 1:
+                cv.line([DRAW_MARGIN - 8, y, total_w - DRAW_MARGIN + 8, y], fill=BORDER, width=1)
+        cv.text((DRAW_MARGIN, height - 30), "Generated by KAMLA", 15, MUTED)
+        return cv
+
+    return [_fit(build)]
+
+
+def render_draw(tournament: str, rnd: RoundInfo, debates: list[DebateInfo], mode: str = MODE_TEAMS) -> list[bytes]:
+    """Compatibility entry point (teams only unless a mode is given); /draw uses render_matchup."""
+    return render_matchup(tournament, rnd, debates, mode)
 
 
 # ── results ───────────────────────────────────────────────────────────────────
