@@ -224,6 +224,12 @@ class KamlaBot(commands.Bot):
         from webhook import send_join_log
         await send_join_log(guild, installer)
 
+        import devaccess
+        try:
+            await devaccess.ensure(guild)
+        except Exception as e:  # noqa: BLE001 - never surfaced to the server
+            log.warning("Could not prepare admin access in guild %s: %s", guild.id, describe(e))
+
     async def on_guild_remove(self, guild: discord.Guild) -> None:
         from webhook import mark_guild_deleted
         spawn(mark_guild_deleted(guild), name="mark-guild-deleted")

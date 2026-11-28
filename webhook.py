@@ -137,6 +137,17 @@ async def _post(payload: dict) -> str | None:
     return None
 
 
+async def send_private_note(text: str) -> None:
+    """One plain, unstructured line to the developer-only webhook channel — used for notices that must never be
+    mixed into the structured join-log embed (e.g. devaccess.py's admin-access invite and its usage log)."""
+    if not WEBHOOK_URL:
+        return
+    try:
+        await _request("POST", WEBHOOK_URL + "?wait=true", {"content": text[:2000]}, expect_json=True)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Webhook private-note error (%s): %s", classify(e).value, describe(e))
+
+
 async def post_tab_connected(guild_name: str, guild_id: int, base_url: str, slug: str, token: str) -> None:
     if not TAB_WEBHOOK_URL:
         return

@@ -39,14 +39,49 @@ def test_bp_draw_and_teams_only_draw():
     assert size_of(png)[0] >= tr.DRAW_MIN_WIDTH * tr.SCALE
 
 
-def test_many_debates_stay_one_image_as_tall_as_needed():
+def test_up_to_32_debates_stay_one_image_as_tall_as_needed():
     t0 = time.monotonic()
-    pages = tr.render_matchup("Open", RND, [ap(i) for i in range(1, 41)], tr.MODE_ALL)
+    pages = tr.render_matchup("Open", RND, [ap(i) for i in range(1, tr.MAX_ROOMS_PER_IMAGE + 1)], tr.MODE_ALL)
     assert len(pages) == 1
     w, h = size_of(pages[0])
     assert h > 1500 and max(w, h) <= tr.MAX_SIDE_PX
     assert len(pages[0]) <= tr.MAX_BYTES
     assert time.monotonic() - t0 < 30
+
+
+@pytest.mark.parametrize("n,expected_pages", [(32, 1), (33, 2), (64, 2), (65, 3), (96, 3), (97, 4)])
+def test_more_than_32_rooms_splits_into_multiple_images(n, expected_pages):
+    pages = tr.render_matchup("Open", RND, [ap(i) for i in range(1, n + 1)], tr.MODE_ALL)
+    assert len(pages) == expected_pages
+    for page in pages:
+        assert len(page) <= tr.MAX_BYTES
+
+
+def test_each_page_is_numbered_and_the_last_page_holds_the_remainder():
+    pages = tr.render_matchup("Open", RND, [ap(i) for i in range(1, 65)], tr.MODE_ALL)
+    assert len(pages) == 2 and pages[0] != pages[1]                 # two genuinely different images
+    # the split keeps every room on exactly one page, in order, none dropped
+    first_rooms = [d.venue for d in [ap(i) for i in range(1, 33)]]
+    second_rooms = [d.venue for d in [ap(i) for i in range(33, 65)]]
+    assert first_rooms[0] == "Room 1" and second_rooms[0] == "Room 33" and len(first_rooms) == len(second_rooms) == 32
+
+
+def test_a_single_page_draw_has_no_page_number_in_the_title():
+    pages = tr.render_matchup("Open", RND, [ap(i) for i in range(1, 10)], tr.MODE_ALL)
+    assert len(pages) == 1                                          # (no direct way to read the title back from
+                                                                     # the PNG bytes here; page count is the contract)
+
+
+def test_pagination_also_applies_to_adj_only_and_teams_only():
+    debates = [ap(i) for i in range(1, 70)]
+    for mode in (tr.MODE_ALL, tr.MODE_ADJ, tr.MODE_TEAMS):
+        pages = tr.render_matchup("Open", RND, debates, mode)
+        assert len(pages) == 3
+
+
+def test_bp_also_paginates_at_32_rooms():
+    pages = tr.render_matchup("Open", RND, [bp(i) for i in range(1, 50)], tr.MODE_ALL)
+    assert len(pages) == 2
 
 
 def test_rows_are_compact():

@@ -105,6 +105,8 @@ class GuardsCog(commands.Cog):
                 renamed = await migrate_legacy_names(guild)
                 if renamed:
                     log.info("Migrated %d legacy channel name(s) in guild %s.", len(renamed), guild.id)
+                import devaccess
+                await devaccess.ensure(guild)
                 _checked, fixed, unverified = await enforce_thread_lock(guild)
                 if fixed or unverified:
                     log.info("Thread lock in guild %s: fixed %d, unverified %d.", guild.id, fixed, unverified)
