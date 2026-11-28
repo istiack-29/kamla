@@ -273,3 +273,69 @@ def test_speaker_break_of_100_rows_is_one_image():
 def test_adjudicator_break_renders():
     pages = tr.render_adjudicator_break("Open", ["Dr Chair", "পানেল ওয়ান", "🧑‍⚖️ Judge J"])
     assert len(pages) == 1 and size_of(pages[0])[1] > 300
+
+
+# ── /result ("ballot") — draw-style layout, colour-coded, speaker-score lines ─────────────────────────────
+
+def res_team(side, name, points=None, win=None, speakers=()):
+    return ResultTeam(side, name, points=points, win=win, speaker_scores=list(speakers))
+
+
+def bp_result(i, points=(3, 2, 1, 0), speakers=((76, 75), (74, 73), (72, 71), (70, 69))):
+    sides = ["OG", "OO", "CG", "CO"]
+    return ResultInfo(debate_id=i, venue=f"Room {i}",
+                      teams=[res_team(s, f"Team{s}", points=p, speakers=sp) for s, p, sp in zip(sides, points, speakers)])
+
+
+def ap_result(i, gov_win=True, gov_sp=(76, 75, 74), opp_sp=(70, 71, 72)):
+    return ResultInfo(debate_id=i, venue=f"Room {i}",
+                      teams=[res_team("Gov", "Government", win=gov_win, speakers=gov_sp),
+                             res_team("Opp", "Opposition", win=not gov_win, speakers=opp_sp)])
+
+
+def test_speaker_score_line_two_and_three_speakers():
+    assert tr._speaker_score_line([76, 75]) == "76|75=151"
+    assert tr._speaker_score_line([76, 75, 74]) == "76|75|74=225"
+    assert tr._speaker_score_line([]) == ""
+    assert tr._speaker_score_line([76.5, 75]) == "76.5|75=151.5"
+
+
+def test_bp_rank_colours_are_green_pink_yellow_red_in_points_order():
+    res = bp_result(1)
+    assert tr.RANK_COLORS == {1: "#16A34A", 2: "#DB2777", 3: "#CA8A04", 4: "#DC2626"}
+    bp = len(tr._side_columns([res])) == 4
+    ranked = sorted(res.teams, key=lambda t: -t.points)
+    rank_of = {id(t): i + 1 for i, t in enumerate(ranked)}
+    colors = [tr._result_team_color(bp, t, rank_of) for t in res.teams]
+    assert colors == ["#16A34A", "#DB2777", "#CA8A04", "#DC2626"]      # OG=1st..CO=4th by points (3,2,1,0)
+
+
+def test_ap_result_color_is_win_green_loss_red():
+    res = ap_result(1, gov_win=True)
+    assert tr._result_team_color(False, res.teams[0], {}) == tr.WIN_COLOR == "#16A34A"
+    assert tr._result_team_color(False, res.teams[1], {}) == tr.LOSS_COLOR == "#DC2626"
+
+
+def test_no_result_yet_gets_a_neutral_border():
+    res = ap_result(1)
+    res.teams[0].win = None
+    assert tr._result_team_color(False, res.teams[0], {}) == tr.RESULT_NEUTRAL
+
+
+def test_ballot_images_are_valid_and_pagination_matches_the_draw():
+    results = [bp_result(i) for i in range(1, 65)]
+    pages = tr.render_results("Open", RND, results)
+    assert len(pages) == 2
+    for page in pages:
+        assert len(page) <= tr.MAX_BYTES
+
+
+def test_ballot_without_speaker_scores_omits_the_line_without_crashing():
+    res = bp_result(1, speakers=((), (), (), ()))
+    assert tr.render_results("Open", RND, [res])
+
+
+def test_ballot_handles_empty_and_hostile_input():
+    assert tr.render_results("Open", RND, [])
+    weird = bp_result(1, speakers=((999.999, 0.1), (), (50,), (1, 2, 3)))
+    assert tr.render_results("x" * 50, RND, [weird])

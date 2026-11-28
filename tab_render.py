@@ -413,14 +413,17 @@ def _layout_rows(columns: list[Column], rows: list[list[Cell]], inner_w: int) ->
     return widths, laid
 
 
-def _paginate(laid: list[_LaidRow]) -> list[list[_LaidRow]]:
-    """One page unless MAX_PAGE_H is set (it is not by default: a table is as tall as it needs to be)."""
-    if MAX_PAGE_H is None:
+def _paginate(laid: list[_LaidRow], max_rows: Optional[int] = None) -> list[list[_LaidRow]]:
+    """One page, unless MAX_PAGE_H (a height budget, off by default) or `max_rows` (a row-count cap, used by
+    render_results so /result never grows past ROOMS_PER_RESULT_PAGE rooms per image) says to split."""
+    if MAX_PAGE_H is None and max_rows is None:
         return [laid]
-    budget = MAX_PAGE_H - HEADER_H - COLHEAD_H - FOOTER_H - 2 * MARGIN
+    budget = (MAX_PAGE_H - HEADER_H - COLHEAD_H - FOOTER_H - 2 * MARGIN) if MAX_PAGE_H is not None else None
     pages, cur, used = [], [], 0
     for row in laid:
-        if cur and used + row.height > budget:
+        over_height = budget is not None and cur and used + row.height > budget
+        over_rows = max_rows is not None and len(cur) >= max_rows
+        if cur and (over_height or over_rows):
             pages.append(cur)
             cur, used = [], 0
         cur.append(row)
@@ -445,10 +448,11 @@ def _footer(c: Canvas, width: int, y: int, page: int, pages: int) -> None:
         c.text((width - MARGIN - 6, y + 18), f"Page {page} / {pages}", 24, MUTED, anchor_right=True)
 
 
-def render_table(kicker: str, title: str, subtitle: str, columns: list[Column], rows: list[list[Cell]]) -> list[bytes]:
+def render_table(kicker: str, title: str, subtitle: str, columns: list[Column], rows: list[list[Cell]],
+                 max_rows: Optional[int] = None) -> list[bytes]:
     inner_w = WIDTH - 2 * MARGIN
     widths, laid = _layout_rows(columns, rows, inner_w)
-    pages = _paginate(laid)
+    pages = _paginate(laid, max_rows)
     images = []
     for number, page_rows in enumerate(pages, 1):
         body_h = sum(r.height for r in page_rows)
@@ -686,38 +690,154 @@ def _fmt_score(score: Optional[float]) -> str:
     return f"{score:.1f}".rstrip("0").rstrip(".") if abs(score - round(score)) > 1e-9 else str(int(round(score)))
 
 
-def render_results(tournament: str, rnd: RoundInfo, results: list[ResultInfo]) -> list[bytes]:
-    n = max((len(r.teams) for r in results), default=2)
-    bp = n == 4
-    sides = ["OG", "OO", "CG", "CO"] if bp else ["Gov", "Opp"] if n == 2 else [f"Team {i + 1}" for i in range(n)]
-    columns = [Column("Venue", 1.0)] + [Column(s, 2.0, SIDE_COLORS.get(s, NAVY_2)) for s in sides]
-    rows = []
+ROOMS_PER_RESULT_PAGE = 32      # same cap as the draw: /result never grows past this many rooms in one image
+
+
+RANK_COLORS = {1: "#16A34A", 2: "#DB2777", 3: "#CA8A04", 4: "#DC2626"}       # 1st green, 2nd pink, 3rd yellow/amber, 4th red
+WIN_COLOR, LOSS_COLOR = "#16A34A", "#DC2626"
+RESULT_NEUTRAL = BORDER        # no result yet for this team: a plain, uncoloured border
+SCORE_SIZE = 19                # the speaker-score line under the team name — smaller than the name itself
+
+
+def _speaker_score_line(scores: list) -> str:
+    """'76|75|74=225' (AP, 3 speakers) / '76|75=151' (BP, 2 speakers) — '' when Tabbycat gave no per-speaker
+    scores for this team (an older or consensus-only ballot), in which case the line is simply left out."""
+    if not scores:
+        return ""
+    def fmt(v: float) -> str:
+        return f"{v:g}"
+    return "|".join(fmt(v) for v in scores) + f"={fmt(sum(scores))}"
+
+
+def _result_team_color(bp: bool, team, rank_of: dict) -> str:
+    if bp:
+        return RANK_COLORS.get(rank_of.get(id(team)), RESULT_NEUTRAL)
+    if team.win is None:
+        return RESULT_NEUTRAL
+    return WIN_COLOR if team.win else LOSS_COLOR
+
+
+def _render_results_page(tournament: str, rnd: RoundInfo, results: list[ResultInfo], sides: list, page: int = 1,
+                         total_pages: int = 1) -> bytes:
+    """One results image, at most ROOMS_PER_RESULT_PAGE rooms — the same wide, compact table as the draw
+    (render_matchup), with each team's cell bordered and left-accented in its result colour and, under the
+    team name, its speaker-score line when Tabbycat provided one."""
+    bp = len(sides) == 4
+    headers = ["Room"] + [label for _k, label in sides]
+
+    raw_rows = []                  # (venue, [(name, score_line, color)])
     for res in results:
         by_side = {t.side: t for t in res.teams}
-        ranked = sorted([t for t in res.teams if t.points is not None], key=lambda t: -t.points)
-        rank_of = {id(t): i + 1 for i, t in enumerate(ranked)} if bp else {}
-        row = [cell(res.venue or "—", 28, NAVY, bold=True)]
-        for i, s in enumerate(sides):
-            t = by_side.get(s) or (res.teams[i] if s.startswith("Team") and i < len(res.teams) else None)
+        ranked = sorted([t for t in res.teams if t.points is not None], key=lambda t: -t.points) if bp else []
+        rank_of = {id(t): i + 1 for i, t in enumerate(ranked)}
+        cells = []
+        for i, (key, _label) in enumerate(sides):
+            t = by_side.get(key) or (res.teams[i] if key.startswith("Team") and i < len(res.teams) else None)
             if t is None:
-                row.append(cell("—"))
-                continue
-            win = bool(t.win) if t.win is not None else (rank_of.get(id(t)) == 1)
-            lines = [Line(t.name, 28, TEXT, bold=win)]
-            bits = []
-            if bp and id(t) in rank_of:
-                bits.append(_ORDINALS.get(rank_of[id(t)], f"{rank_of[id(t)]}th"))
-            elif t.win is not None:
-                bits.append("Win" if t.win else "Loss")
-            if t.points is not None and bp:
-                bits.append(f"{t.points} pts")
-            if t.score is not None:
-                bits.append(_fmt_score(t.score))
-            if bits:
-                lines.append(Line("  ·  ".join(bits), 24, GREEN if win else MUTED, bold=win))
-            row.append(lines)
-        rows.append(row)
-    return render_table(tournament or "Tournament", f"{rnd.name}  ·  Results", f"{len(results)} debates", columns, rows)
+                cells.append(((t.name if t else "—") or "—", "", RESULT_NEUTRAL))
+            else:
+                cells.append((t.name or "—", _speaker_score_line(t.speaker_scores), _result_team_color(bp, t, rank_of)))
+        raw_rows.append(((res.venue or "—").strip(), cells))
+
+    # column widths: room text, team names, and the (often wide) speaker-score line all count toward the width
+    widths = [int(min(text_width(headers[0], DRAW_HEAD) + 2 * DRAW_PAD_X + 6, DRAW_COL_CAP.get("room", 10_000)))
+              for _ in [0]]
+    widths[0] = int(max(widths[0], max((text_width(v, DRAW_TEXT) for v, _c in raw_rows), default=0) + 2 * DRAW_PAD_X + 6))
+    for i in range(len(sides)):
+        longest = max([text_width(headers[i + 1], DRAW_HEAD)]
+                     + [text_width(cells[i][0], DRAW_TEXT) for _v, cells in raw_rows]
+                     + [text_width(cells[i][1], SCORE_SIZE) for _v, cells in raw_rows if cells[i][1]])
+        widths.append(int(min(longest + 2 * DRAW_PAD_X + 10, DRAW_COL_CAP.get("team", 10_000))))
+    inner = max(DRAW_MIN_WIDTH - 2 * DRAW_MARGIN, sum(widths))
+    inner = min(inner, DRAW_MAX_WIDTH - 2 * DRAW_MARGIN)
+    spare = inner - sum(widths)
+    if spare > 0:
+        grow = list(range(1, len(widths)))
+        for i in grow:
+            widths[i] += spare // len(grow)
+        widths[grow[-1]] += spare - (spare // len(grow)) * len(grow)
+    elif spare < 0:
+        over = -spare
+        order = sorted(range(len(widths)), key=lambda i: -widths[i])
+        for i in order:
+            cut = min(over, max(0, widths[i] - 160))
+            widths[i] -= cut
+            over -= cut
+            if over <= 0:
+                break
+    total_w = sum(widths) + 2 * DRAW_MARGIN
+
+    laid = []                      # per row: (venue_lines, [ (name_lines, score_line, color) ]), row height
+    name_w = [w - 2 * DRAW_PAD_X - 6 for w in widths[1:]]
+    for venue, cells in raw_rows:
+        venue_lines = wrap(venue, DRAW_TEXT, widths[0] - 2 * DRAW_PAD_X)
+        laid_cells = []
+        max_lines = len(venue_lines)
+        for (name, score_line, color), w in zip(cells, name_w):
+            name_lines = wrap(name, DRAW_TEXT, w)
+            laid_cells.append((name_lines, score_line, color))
+            max_lines = max(max_lines, len(name_lines) + (1 if score_line else 0))
+        row_h = int(DRAW_TEXT * 1.38) * max_lines + 2 * DRAW_PAD_Y + 6       # +6: room for the colour border
+        laid.append((venue_lines, laid_cells, row_h))
+
+    title = f"{rnd.name}  ·  Results"
+    if total_pages > 1:
+        title += f"  ·  Page {page} of {total_pages}"
+    head_h = int(DRAW_HEAD * 1.4) + 18
+    title_h = int(DRAW_TITLE * 1.4) + 14
+    body_h = sum(h for _v, _c, h in laid)
+    height = DRAW_MARGIN + title_h + head_h + body_h + 40
+
+    def build(scale: int) -> Canvas:
+        cv = Canvas(total_w, height, CARD, scale)
+        cv.text((DRAW_MARGIN, DRAW_MARGIN - 6), title, DRAW_TITLE, NAVY, bold=True)
+        top = DRAW_MARGIN + title_h
+        cv.rrect([DRAW_MARGIN - 8, top - 4, total_w - DRAW_MARGIN + 8, top + head_h + body_h + 2], 10, outline=BORDER, width=1)
+        x = DRAW_MARGIN
+        for text, w in zip(headers, widths):
+            cv.text((x + DRAW_PAD_X, top + 8), text, DRAW_HEAD, MUTED)
+            x += w
+        y = top + head_h
+        cv.line([DRAW_MARGIN - 8, y, total_w - DRAW_MARGIN + 8, y], fill="#CBD5E1", width=1.5)
+        for idx, (venue_lines, cells, h) in enumerate(laid):
+            x = DRAW_MARGIN
+            cy = y + DRAW_PAD_Y + 3
+            for piece in venue_lines:
+                cv.text((x + DRAW_PAD_X, cy), piece, DRAW_TEXT, NAVY, bold=True)
+                cy += int(DRAW_TEXT * 1.38)
+            x += widths[0]
+            for (name_lines, score_line, color), w in zip(cells, widths[1:]):
+                box = [x + 3, y + 3, x + w - 3, y + h - 3]
+                cv.rrect(box, 6, outline=color, width=1)
+                cv.rect([box[0], box[1] + 2, box[0] + 3, box[3] - 2], fill=color)      # left accent bar
+                cy = y + DRAW_PAD_Y + 3
+                for piece in name_lines:
+                    cv.text((x + DRAW_PAD_X + 6, cy), piece, DRAW_TEXT, TEXT, bold=True)
+                    cy += int(DRAW_TEXT * 1.38)
+                if score_line:
+                    cv.text((x + DRAW_PAD_X + 6, cy), score_line, SCORE_SIZE, MUTED)
+                x += w
+            y += h
+            if idx < len(laid) - 1:
+                cv.line([DRAW_MARGIN - 8, y, total_w - DRAW_MARGIN + 8, y], fill=BORDER, width=1)
+        cv.text((DRAW_MARGIN, height - 30), "Generated by KAMLA", 15, MUTED)
+        return cv
+
+    return _fit(build)
+
+
+def render_results(tournament: str, rnd: RoundInfo, results: list[ResultInfo]) -> list[bytes]:
+    """The /result ("ballot") image(s) — the same wide, paginated table style as the draw (render_matchup),
+    at most ROOMS_PER_RESULT_PAGE rooms per image. Each team's cell is bordered and left-accented in its
+    result colour: for BP, green/pink/yellow/red for 1st/2nd/3rd/4th in that debate; for AP, green for a win
+    and red for a loss. Under the team name, its speaker-score line (e.g. "76|75|74=225") when available."""
+    sides = _side_columns(results) if results else [("Team 1", "Team 1"), ("Team 2", "Team 2")]
+    if not results:
+        return [_render_results_page(tournament, rnd, results, sides)]
+    chunks = [results[i:i + ROOMS_PER_RESULT_PAGE] for i in range(0, len(results), ROOMS_PER_RESULT_PAGE)]
+    total = len(chunks)
+    return [_render_results_page(tournament, rnd, chunk, sides, page=i, total_pages=total)
+            for i, chunk in enumerate(chunks, 1)]
 
 
 # ── break ─────────────────────────────────────────────────────────────────────

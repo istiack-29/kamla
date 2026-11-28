@@ -213,6 +213,8 @@ class ResultTeam:
     points: Optional[int] = None
     win: Optional[bool] = None
     score: Optional[float] = None
+    speaker_scores: list = field(default_factory=list)   # per-speaker totals, in speaking order (best effort —
+                                                          # empty when Tabbycat's ballot JSON carries no speeches)
 
 
 @dataclass
@@ -712,9 +714,26 @@ def pick_confirmed_ballot(ballots: Any) -> Optional[dict]:
     return max(good, key=lambda b: b.get("version") or 0) if good else None
 
 
+def _speaker_totals(entries: list[dict]) -> list[float]:
+    """Per-speech-position totals, averaged across every adjudicator sheet that scored this team — the same
+    averaging summarise_sheets already applies to the team's overall score. Best effort: Tabbycat's ballot JSON
+    does not always carry individual speeches (e.g. a pure consensus result some tournaments submit without
+    them), in which case this returns [] and the caller simply shows no speaker-score line."""
+    by_position: dict[int, list[float]] = {}
+    for entry in entries:
+        for i, speech in enumerate(entry.get("speeches") or []):
+            score = speech.get("score") if isinstance(speech, dict) else None
+            if score is not None:
+                by_position.setdefault(i, []).append(float(score))
+    if not by_position:
+        return []
+    return [round(sum(v) / len(v), 1) for _i, v in sorted(by_position.items())]
+
+
 def summarise_sheets(sheets: list, team_names: dict[str, str], key, n_teams: int) -> list[ResultTeam]:
     """One sheet (consensus / single adjudicator) is used as is. With several sheets, wins are decided by
-    majority and scores are averaged, so the picture matches what the tab shows overall."""
+    majority and scores (team totals and, where present, individual speaker totals) are averaged, so the
+    picture matches what the tab shows overall."""
     if not sheets:
         return []
     per_side: dict[Any, list[dict]] = {}
@@ -739,5 +758,6 @@ def summarise_sheets(sheets: list, team_names: dict[str, str], key, n_teams: int
             points=round(sum(points) / len(points)) if points else None,
             win=(sum(1 for w in wins if w) * 2 > len(wins)) if wins else None,
             score=(sum(scores) / len(scores)) if scores else None,
+            speaker_scores=_speaker_totals(entries),
         ))
     return teams
